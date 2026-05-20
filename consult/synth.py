@@ -54,7 +54,12 @@ def _resolve_rubric(rubric: str | None) -> str:
     # For the default "consensus" rubric, that means the package install is
     # broken — refuse to ship the literal word "consensus" to the synth model.
     if rubric == "consensus" and resolved == "consensus":
-        raise FileNotFoundError(
+        # RuntimeError (not FileNotFoundError) — the latter is reserved by
+        # `server.handle_call_tool` for `run_not_found`, so a missing rubric
+        # would otherwise surface as a misleading "the run_id is bad". A
+        # missing default rubric is an install-time defect; INTERNAL_ERROR
+        # is the right category for that.
+        raise RuntimeError(
             "consult/config/rubrics/consensus.md is missing — the package "
             "install is broken. Reinstall or restore the rubrics directory."
         )

@@ -3985,3 +3985,109 @@ async def test_consult_handler_propagates_cost_known_from_handle(tmp_path, monke
 
     result = await handlers.consult({"prompt": "p", "tier": "quick"})
     assert result["cost_known"] is False
+
+
+# ---- Iter 2 refine-loop regression locks -----------------------------------
+
+
+def test_make_slug_blinded_preserves_round_suffix():
+    """Blinded refine relies on `_make_slug` honouring `.r<n>` even when it
+    rewrites the visible portion to a greek slug. Pre-fix the suffix was
+    dropped and per-round artifacts overwrote each other on disk.
+    """
+    from consult.runner import _make_slug
+
+    # Round-suffixed spec (refine._suffix_specs produces these).
+    s = ModelSpec(model="claude-haiku", slug="claude-haiku-0.r2")
+    blinded = _make_slug(s, 0, blinded=True)
+    assert blinded == "panelist-alpha.r2"
+    # No `.r<n>` ⇒ plain greek slug.
+    s2 = ModelSpec(model="claude-haiku", slug="claude-haiku-0")
+    assert _make_slug(s2, 0, blinded=True) == "panelist-alpha"
+
+
+def test_make_slug_sanitises_colons_in_raw_litellm_ids():
+    """OpenRouter model IDs like `...:free` must not crash the slug-derive
+    path. Pre-fix the colon flowed into the slug and the safe-id validator
+    in artifacts.response_text rejected the path build.
+    """
+    from consult.runner import _make_slug
+
+    spec = ModelSpec(model="openrouter/meta-llama/llama-3.1-8b:free")
+    slug = _make_slug(spec, 0, blinded=False)
+    # No colon, valid leading alphanumeric, slug regex accepts it.
+    assert ":" not in slug
+    assert slug == "llama-3.1-8b-free"
+
+
+def test_refine_suffix_specs_sanitises_model_derived_base():
+    """refine._suffix_specs derives slugs from spec.model when slug is
+    None. A model id with a colon would otherwise build a ModelSpec slug
+    that fails the field validator at construction time.
+    """
+    out = refine_mod._suffix_specs(
+        [ModelSpec(model="openrouter/meta-llama/llama-3.1-8b:free")],
+        round_num=1,
+    )
+    assert out[0].slug == "llama-3.1-8b-free-0.r1"
+
+
+async def test_sequence_partial_fanout_rolls_cost_into_total(tmp_path, monkeypatch):
+    """A step whose fanout returns partial=True (rate-limited, zero-usable,
+    or cap-exceeded) must still contribute its `handle.cost_usd` to the
+    SequenceResult total. Pre-fix the cost was silently dropped on break.
+    """
+    from consult import capsule as capsule_mod
+    from consult import runner as runner_mod
+    from consult import sequence as sequence_mod
+    from consult import synth as synth_mod
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    monkeypatch.setattr(runner_mod, "estimate_cost", lambda specs, prompt: (0.0, True))
+
+    async def fake_fanout(prompt, specs, **kwargs):
+        paths = artifacts.create_run()
+        return RunHandle(
+            run_id=paths.run_id,
+            artifacts_dir=str(paths.root),
+            manifest=[],
+            cost_usd=0.17,
+            cost_known=False,
+            wall_ms=0,
+            partial=True,
+            partial_reason="zero usable panellists (2 returned: TIMEOUT)",
+        )
+
+    async def fake_annotate(handle, **kwargs):
+        return handle
+
+    async def fake_synth(*args, **kwargs):
+        return synth_mod.SynthResult(text="x")
+
+    monkeypatch.setattr(runner_mod, "fanout", fake_fanout)
+    monkeypatch.setattr(capsule_mod, "annotate", fake_annotate)
+    monkeypatch.setattr(synth_mod, "synthesise", fake_synth)
+
+    result = await sequence_mod.sequence(
+        ["q1", "q2"], [ModelSpec(model="claude-haiku")],
+    )
+    assert result.partial is True
+    # The 0.17 from the partial fanout must show up — not the pre-fix 0.0.
+    assert result.cost_usd == pytest.approx(0.17)
+    assert result.cost_known is False
+
+
+def test_missing_default_rubric_raises_runtime_not_filenotfound(tmp_path, monkeypatch):
+    """A missing `consensus.md` (broken install) must NOT raise
+    FileNotFoundError — that exception class is reserved for run-not-found
+    in `server.handle_call_tool`, and a broken install was getting
+    surfaced to clients as a confusing "run_id not found".
+    """
+    from consult import synth as synth_mod
+
+    # Make `resolve_rubric("consensus")` return the literal sentinel so the
+    # broken-install branch trips.
+    monkeypatch.setattr(synth_mod.registry, "resolve_rubric", lambda name: "consensus")
+    with pytest.raises(RuntimeError) as exc:
+        synth_mod._resolve_rubric(None)
+    assert "broken" in str(exc.value).lower()

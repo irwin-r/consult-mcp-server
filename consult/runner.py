@@ -113,6 +113,27 @@ def _build_per_slug_prompt(base_prompt: str, stance_prompt: str) -> str:
 
 _MODEL_COUNT_SUFFIX = re.compile(r"^(.+):(\d+)$")
 
+# Raw LiteLLM IDs can legitimately contain characters the slug regex
+# rejects — e.g. OpenRouter's `:free` suffix. Sanitise model-derived slugs
+# so a valid model alias never crashes the path-build downstream. The
+# user-supplied slug path is unchanged: that goes through ModelSpec's
+# field_validator which fails fast at the input boundary.
+_SLUG_BAD_CHARS_RE = re.compile(r"[^A-Za-z0-9._-]+")
+# refine `_suffix_specs` writes `.r<n>` suffixes onto slugs; recognise
+# the same shape here so blinded mode can preserve per-round identity.
+_ROUND_SUFFIX_RE = re.compile(r"\.r\d+$")
+
+
+def _sanitise_derived_slug(base: str) -> str:
+    """Coerce a model-derived slug fragment into the safe-id character set.
+
+    Multiple bad characters in a row collapse to a single `-` and any
+    leading/trailing `-`/`.` are stripped so the result is also a legal
+    leading character (the slug regex anchors on an alphanumeric).
+    """
+    out = _SLUG_BAD_CHARS_RE.sub("-", base)
+    return out.strip("-.")
+
 
 def expand_specs(specs: list[ModelSpec]) -> list[ModelSpec]:
     """Expand `model:N` syntax into N copies of the spec.
@@ -324,11 +345,22 @@ def _make_slug(spec: ModelSpec, idx: int, blinded: bool) -> str:
             "lambda",
             "mu",
         ]
-        return f"panelist-{greek[idx]}" if idx < len(greek) else f"panelist-{idx}"
+        base = f"panelist-{greek[idx]}" if idx < len(greek) else f"panelist-{idx}"
+        # Preserve refine's `.r<n>` round suffix even when blinded so the
+        # round-N artifact doesn't overwrite round-(N-1)'s. Without this,
+        # blinded refine writes every round to the same `panelist-alpha.txt`
+        # file and the per-round transcript is destroyed.
+        if spec.slug:
+            m = _ROUND_SUFFIX_RE.search(spec.slug)
+            if m:
+                base = f"{base}{m.group(0)}"
+        return base
     if spec.slug:
         return spec.slug
-    # Derive a stable, readable slug from the alias/id
-    base = spec.model.split("/")[-1].lower()
+    # Derive a stable, readable slug from the alias/id. Raw LiteLLM IDs may
+    # contain characters the safe-id regex rejects (e.g. `:free` on
+    # OpenRouter); sanitise so a valid model never crashes the path build.
+    base = _sanitise_derived_slug(spec.model.split("/")[-1].lower())
     return f"{base}-{idx}" if idx > 0 else base
 
 

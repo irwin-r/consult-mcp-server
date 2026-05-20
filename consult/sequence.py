@@ -176,6 +176,13 @@ async def sequence(
             capsule_kind=capsule_kind,
         )
         if handle.partial or not handle.manifest:
+            # Roll the partial fanout's spend into the running total before
+            # breaking — a zero-usable-panel fanout may have billed for
+            # timeouts. Mirrors the refine iter1 fix; without this the
+            # SequenceResult silently understates spend on the break.
+            cumulative_cost += handle.cost_usd
+            if not handle.cost_known:
+                cost_all_known = False
             partial_reason = (
                 f"step {i} fanout returned partial: {handle.partial_reason}"
             )

@@ -366,7 +366,11 @@ def _suffix_specs(specs: list[ModelSpec], round_num: int) -> list[ModelSpec]:
     """
     out = []
     for i, s in enumerate(specs):
-        base = s.slug or s.model.split("/")[-1].lower()
+        # Sanitise model-derived bases — a raw LiteLLM ID like
+        # `openrouter/meta-llama/llama-3.1-8b:free` would otherwise carry
+        # the `:` straight into the slug and trip ModelSpec's safe-id
+        # field validator. User-supplied slugs are already constrained.
+        base = s.slug or runner._sanitise_derived_slug(s.model.split("/")[-1].lower())
         out.append(
             ModelSpec(model=s.model, stance=s.stance, slug=f"{base}-{i}.r{round_num}")
         )
@@ -660,7 +664,11 @@ async def refine(
             round=round_num, score=verdict.score,
         ))
         verdicts.append(verdict)
-        if verdict.cost_usd:
+        # `is not None` rather than truthy: a successful arbiter call that
+        # returned a $0.00 cost is semantically different from no-cost-known.
+        # Functionally equivalent for zero but reads correctly when the
+        # invariant is "None ⇒ unknown".
+        if verdict.cost_usd is not None:
             cumulative_cost += verdict.cost_usd
         # An arbiter pricing miss must propagate to the top-level cost_known.
         # Previously only the truthy-cost branch fed into the totals — an
