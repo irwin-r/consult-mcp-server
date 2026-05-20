@@ -137,6 +137,56 @@ def test_refinement_prompt_includes_gaps_and_focus():
 
 
 @pytest.mark.asyncio
+async def test_refine_continuation_prepends_prior_synthesis(tmp_path, monkeypatch):
+    """A valid continuation_id loads the prior run's synthesis.md and
+    prepends it as 'Prior consultation summary' before the follow-up.
+    """
+    from consult.refine import _apply_continuation
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    prior = artifacts.create_run()
+    (prior.root / "synthesis.md").write_text("ANSWER: pick DuckDB.")
+
+    result = _apply_continuation("Now what about Polars for ETL?", prior.run_id)
+    assert "Prior consultation summary" in result
+    assert "ANSWER: pick DuckDB." in result
+    assert "Follow-up question" in result
+    assert "Now what about Polars for ETL?" in result
+
+
+def test_refine_continuation_none_or_empty_is_passthrough(tmp_path, monkeypatch):
+    """No continuation_id (or empty string) leaves the prompt untouched."""
+    from consult.refine import _apply_continuation
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    assert _apply_continuation("hello", None) == "hello"
+    assert _apply_continuation("hello", "") == "hello"
+
+
+def test_refine_continuation_unknown_id_raises(tmp_path, monkeypatch):
+    """An unknown continuation_id must raise — silently dropping the prior
+    context would leave the caller thinking the new round had it.
+    """
+    from consult.refine import _apply_continuation
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    with pytest.raises(ValueError, match="continuation_id not found"):
+        _apply_continuation("hello", "20990101-000000-99999")
+
+
+def test_refine_continuation_missing_synthesis_raises(tmp_path, monkeypatch):
+    """A run that exists but has no synthesis.md (e.g. dry-run, cap-aborted)
+    can't be a continuation source — fail clearly rather than prepend empty.
+    """
+    from consult.refine import _apply_continuation
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    prior = artifacts.create_run()  # no synthesis.md written
+    with pytest.raises(ValueError, match="no synthesis.md"):
+        _apply_continuation("hello", prior.run_id)
+
+
+@pytest.mark.asyncio
 async def test_refine_validates_max_rounds():
     with pytest.raises(ValueError, match="max_rounds"):
         await refine_mod.refine("q", [ModelSpec(model="claude-haiku")], max_rounds=5)

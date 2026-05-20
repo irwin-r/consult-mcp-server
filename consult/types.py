@@ -195,6 +195,10 @@ class RefineResult(BaseModel):
     wall_ms: int = Field(..., ge=0)
     partial: bool = False
     partial_reason: str | None = None
+    # The prior run_id this refine continues from. None for a fresh refine;
+    # set when the caller passed `continuation_id` so the lineage is visible
+    # in the result without requiring the client to track it separately.
+    continuation_of: str | None = None
 
     @model_validator(mode="after")
     def _validate_partial(self) -> RefineResult:

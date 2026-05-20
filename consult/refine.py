@@ -261,6 +261,35 @@ def _suffix_specs(specs: list[ModelSpec], round_num: int) -> list[ModelSpec]:
     return out
 
 
+def _apply_continuation(prompt: str, continuation_id: str | None) -> str:
+    """Prepend the prior run's synthesis to `prompt` when continuing.
+
+    Raises `ValueError` with a clear message on a missing run dir or missing
+    `synthesis.md` — a typo in `continuation_id` must not silently drop the
+    prior context (caller would think the new round had it, but it wouldn't).
+    Empty string is treated the same as None.
+    """
+    if not continuation_id:
+        return prompt
+    try:
+        prior_paths = artifacts.load_run(continuation_id)
+    except FileNotFoundError as e:
+        raise ValueError(f"continuation_id not found: {continuation_id}") from e
+    synth_path = prior_paths.root / "synthesis.md"
+    if not synth_path.exists():
+        raise ValueError(
+            f"continuation_id {continuation_id} has no synthesis.md "
+            "(was the prior run partial, dry-run, or pre-synth?)"
+        )
+    prior = synth_path.read_text()
+    return (
+        "## Prior consultation summary\n\n"
+        f"{prior}\n\n---\n\n"
+        "## Follow-up question\n\n"
+        f"{prompt}"
+    )
+
+
 async def refine(
     prompt: str,
     specs: list[ModelSpec],
@@ -271,12 +300,14 @@ async def refine(
     blinded: bool = False,
     max_run_usd: float | None = None,
     synthesiser: str | None = None,
+    continuation_id: str | None = None,
 ) -> RefineResult:
     if max_rounds < 1 or max_rounds > 3:
         raise ValueError("max_rounds must be between 1 and 3 (hard cap from v1.1 spec)")
     if not 0.0 <= threshold <= 1.0:
         raise ValueError("threshold must be in [0.0, 1.0]")
 
+    prompt = _apply_continuation(prompt, continuation_id)
     arbiter_alias = arbiter or registry.default_synthesiser()
     synth_alias = synthesiser or arbiter_alias
 
@@ -365,4 +396,5 @@ async def refine(
         wall_ms=wall_ms,
         partial=partial_reason is not None,
         partial_reason=partial_reason,
+        continuation_of=continuation_id or None,
     )

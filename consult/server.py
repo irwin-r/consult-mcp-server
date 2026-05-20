@@ -149,6 +149,14 @@ _REFINE_SCHEMA = {
             "type": "string",
             "description": "Final synthesis model. Defaults to the arbiter.",
         },
+        "continuation_id": {
+            "type": "string",
+            "description": (
+                "Optional run_id of a prior refine to continue. The earlier "
+                "synthesis.md is prepended to this prompt as 'Prior consultation "
+                "summary' before the new round runs. Unknown IDs raise an error."
+            ),
+        },
     },
 }
 
@@ -334,6 +342,7 @@ async def _handle_refine(args: dict[str, Any]) -> list[TextContent]:
         blinded=args.get("blinded", False),
         max_run_usd=args.get("max_run_usd"),
         synthesiser=args.get("synthesiser"),
+        continuation_id=args.get("continuation_id"),
     )
     return _text_result(result.model_dump())
 
