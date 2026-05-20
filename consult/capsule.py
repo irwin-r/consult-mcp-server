@@ -89,16 +89,26 @@ async def _extract_one(
     # Gemini responseSchema). On providers that don't support it,
     # litellm.drop_params silently drops the param and we fall back to the
     # prompt + regex JSON recovery below.
+    #
+    # Temperature: most providers want temperature=0.0 for deterministic JSON
+    # extraction. Gemini-3 specifically warns that temperature < 1.0 "can
+    # cause infinite loops, degraded reasoning, and failure on complex tasks"
+    # and recommends omitting the parameter — so for Gemini we leave it
+    # unset and trust the provider default. Detect by substring so the
+    # openrouter-routed Gemini path (`openrouter/google/gemini-...`) is
+    # caught alongside the direct `gemini/...` path.
     prompt = _CAPSULE_PROMPT + body
+    kwargs: dict[str, Any] = {
+        "model": extractor_id,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 800,
+        "response_format": Capsule,
+    }
+    if "gemini" not in extractor_id.lower():
+        kwargs["temperature"] = 0.0
     try:
         resp = await asyncio.wait_for(
-            litellm.acompletion(
-                model=extractor_id,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=800,
-                temperature=0.0,
-                response_format=Capsule,
-            ),
+            litellm.acompletion(**kwargs),
             timeout=timeout,
         )
     except Exception as e:

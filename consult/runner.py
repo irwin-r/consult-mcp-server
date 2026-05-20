@@ -51,6 +51,12 @@ litellm.drop_params = True
 # silences the noisy trailer so a single pricing-table miss doesn't
 # drown the rest of the log.
 litellm.suppress_debug_info = True
+# LiteLLM attaches its own coloured handler to the "LiteLLM" logger AND
+# lets it propagate to root. When a caller (test harness, dogfood
+# script, MCP host) configures the root logger at INFO or below, every
+# LiteLLM line prints twice — once via the coloured handler, once via
+# root. Stop the propagation so callers see exactly one copy.
+logging.getLogger("LiteLLM").propagate = False
 
 # CONTRACT: capsule.py:_CONFIDENCE and the capsule extractor prompt depend on
 # these exact line prefixes (`CONFIDENCE:` and `KEY_REASON:`). Don't rename

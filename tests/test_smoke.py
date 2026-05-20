@@ -516,6 +516,61 @@ async def test_sequence_rejects_empty_inputs():
         await sequence_mod.sequence(["q"], [])
 
 
+def test_litellm_logger_does_not_propagate_to_root():
+    """LiteLLM's logger must not propagate, otherwise callers that enable
+    a root handler (basicConfig at INFO etc.) see every line twice — once
+    via LiteLLM's own coloured handler, once via root. The disable lives
+    in consult/runner.py at module level so import is enough to set it.
+    """
+    import logging
+
+    # Importing the package runs runner.py at module load (via consult.server
+    # → consult.runner), which disables propagation. Confirm the effect.
+    import consult.runner  # noqa: F401
+
+    assert logging.getLogger("LiteLLM").propagate is False
+
+
+@pytest.mark.asyncio
+async def test_capsule_extractor_omits_temperature_for_gemini(monkeypatch):
+    """Gemini-3 emits a warning + can loop when temperature < 1.0. The
+    extractor must omit the param entirely for any gemini-routed model
+    (direct or via openrouter) while keeping it for everyone else.
+    """
+    import litellm
+
+    from consult import capsule as capsule_mod
+
+    captured: list[dict[str, Any]] = []
+
+    async def fake_completion(**kwargs):
+        captured.append(kwargs)
+        # Return a shape capsule._extract_one can parse cleanly
+        class _Resp:
+            def __init__(self):
+                self.choices = [type("Msg", (), {"message": type("M", (), {"content": '{"position": "x"}'})()})()]
+            def model_dump(self):
+                return {}
+        return _Resp()
+
+    monkeypatch.setattr(litellm, "acompletion", fake_completion)
+    monkeypatch.setattr(
+        litellm, "completion_cost", lambda completion_response: 0.0
+    )
+
+    # Gemini direct
+    await capsule_mod._extract_one("hello body", "gemini/gemini-3.1-pro", 30)
+    # Gemini via openrouter
+    await capsule_mod._extract_one("hello body", "openrouter/google/gemini-3-pro", 30)
+    # Anthropic — should still get temperature=0.0
+    await capsule_mod._extract_one("hello body", "anthropic/claude-haiku-4-5", 30)
+
+    assert len(captured) == 3
+    assert "temperature" not in captured[0]  # gemini direct
+    assert "temperature" not in captured[1]  # gemini via openrouter
+    assert captured[2]["temperature"] == 0.0  # anthropic keeps it
+
+
 def test_capsule_extract_json_recovers_prose_and_fences():
     """The capsule contract depends on this — one regex change breaks all callers."""
     from consult.capsule import _extract_json

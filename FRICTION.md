@@ -50,17 +50,18 @@ score 0.20 and no convergence — and the script had no idea why.
   way to learn why. RESOLVED: added the three fields + partial-coupling validator
   to `RefineResult` (types.py), matching the existing `RunHandle` pattern. Now the
   refusal reason actually round-trips to the caller.
-- [ux] **Gemini-3 emits a temperature warning** on every capsule-extractor call:
-  *"Setting temperature < 1.0 for Gemini 3 models can cause infinite loops,
-  degraded reasoning performance, and failure on complex tasks."* We pass
-  `temperature=0.0` in `capsule._extract_one` (capsule.py:101) for determinism.
-  Gemini-3 specifically dislikes that. Open: provider-aware temperature override,
-  or drop the explicit `temperature=0.0` and trust the model.
-- [ux] **Double-logging when client enables basicConfig(level=INFO)**. LiteLLM has
-  its own coloured logger AND propagates to the Python root logger, so every
-  `LiteLLM completion()` info line and warning prints twice when the calling code
-  configures the root logger. Not our bug, but pollutes any caller-side script.
-  Workaround: `logging.getLogger("LiteLLM").propagate = False`.
+- [ux] ~~**Gemini-3 emits a temperature warning** on every capsule-extractor call~~ —
+  RESOLVED: `capsule._extract_one` now omits `temperature` entirely when the
+  extractor's `litellm_id` contains "gemini" (substring match catches both
+  direct `gemini/...` and `openrouter/google/gemini-...`). Other providers
+  still get `temperature=0.0` for deterministic JSON output. Per Google's
+  own guidance, Gemini-3 defaults to 1.0 and clamping it lower can produce
+  infinite loops on complex tasks.
+- [ux] ~~**Double-logging when client enables basicConfig(level=INFO)**~~ —
+  RESOLVED: `consult/runner.py` (module-level, runs at first import) sets
+  `logging.getLogger("LiteLLM").propagate = False`. LiteLLM's own coloured
+  handler still prints; the duplicate via root is suppressed. Effect is
+  global to the process — any caller of consult-* picks it up automatically.
 - [env] **Repeated OpenAI rate-limits on `gpt-codex` + `gpt-mini`** across runs —
   same shared OpenAI bucket in `.env`. Two of five panellists fail every time
   on `code` tier. Either rotate keys or accept that the panel is effectively 3/5
