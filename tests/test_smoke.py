@@ -4429,6 +4429,59 @@ async def test_consult_rejects_typo_synthesiser_before_fanout(tmp_path, monkeypa
     assert fanout_calls["n"] == 0
 
 
+async def test_fanout_writes_manifest_on_dry_run(tmp_path, monkeypatch):
+    """A dry_run still creates a run dir; downstream tools (consult-view,
+    synthesise) expect `manifest.json` to be present.
+    """
+    from consult import runner as runner_mod
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    handle = await runner_mod.fanout(
+        "x", [ModelSpec(model="claude-haiku")], dry_run=True,
+    )
+    paths = artifacts.load_run(handle.run_id)
+    assert paths.manifest_json.exists()
+
+
+async def test_fanout_writes_manifest_on_cap_exceeded(tmp_path, monkeypatch):
+    """A cap-exceeded early return must also persist the manifest so the
+    run dir is not corrupted."""
+    from consult import runner as runner_mod
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    monkeypatch.setattr(runner_mod, "estimate_cost", lambda specs, prompt: (10.0, True))
+    handle = await runner_mod.fanout(
+        "x", [ModelSpec(model="claude-haiku")], max_run_usd=1.0,
+    )
+    assert handle.partial is True
+    assert "exceeds cap" in (handle.partial_reason or "")
+    paths = artifacts.load_run(handle.run_id)
+    assert paths.manifest_json.exists()
+
+
+async def test_fanout_rejects_empty_specs(tmp_path, monkeypatch):
+    """Library callers bypassing the MCP minItems=1 schema must still get a
+    clear error, not a bizarre empty run dir.
+    """
+    from consult import runner as runner_mod
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    with pytest.raises(ValueError) as exc:
+        await runner_mod.fanout("x", [])
+    assert "at least one" in str(exc.value)
+
+
+def test_provider_concurrency_floors_at_one(monkeypatch):
+    """A typo like `CONSULT_PROVIDER_CONCURRENCY=openai:0` must not produce
+    a Semaphore(0); that blocks the first acquire indefinitely and bypasses
+    the per-call timeout. Floor to 1.
+    """
+    monkeypatch.setenv("CONSULT_PROVIDER_CONCURRENCY", "openai:0,zzz:-3")
+    out = registry.provider_concurrency()
+    assert out["openai"] >= 1
+    assert out["zzz"] >= 1
+
+
 async def test_synth_defensive_extraction_on_unexpected_shape(tmp_path, monkeypatch):
     """A non-conformant provider response must surface the unavailable
     sentinel, not AttributeError/IndexError straight out of `synthesise`.

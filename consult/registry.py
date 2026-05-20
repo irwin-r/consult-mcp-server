@@ -136,11 +136,17 @@ def provider_concurrency() -> dict[str, int]:
     `openai` defaults to 2 because the FRICTION log records OpenAI rate-limits
     on every panel run from a shared key; the other providers haven't shown
     the same pattern and default to 5.
+
+    Any non-positive value (env typo of `openai:0`, negative number) is
+    floored to 1: a Semaphore(0) blocks the first acquire forever, which
+    would silently hang every panellist for that provider past the per-call
+    timeout. Floor=1 surfaces as "everything serialised through that
+    provider" — slow, but not a deadlock.
     """
     cfg_caps = models_config().get("defaults", {}).get("concurrency", {})
     out: dict[str, int] = {"default": 5}
     for k, v in cfg_caps.items():
-        out[k] = int(v)
+        out[k] = max(1, int(v))
     env = os.environ.get("CONSULT_PROVIDER_CONCURRENCY")
     if env:
         for pair in env.split(","):
@@ -148,7 +154,7 @@ def provider_concurrency() -> dict[str, int]:
                 continue
             provider, limit = pair.split(":", 1)
             try:
-                out[provider.strip()] = int(limit)
+                out[provider.strip()] = max(1, int(limit))
             except ValueError:
                 continue
     return out

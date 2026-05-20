@@ -694,6 +694,13 @@ async def fanout(
     # Resolve `model:N` sugar BEFORE estimate_cost so the cap reflects the
     # real panel size, not the pre-expansion request count.
     specs = expand_specs(specs)
+    # An empty panel would create a bizarre run dir, fan out to zero
+    # panellists, and return a manifest=[] handle that downstream tools
+    # treat as "all panellists rate-limited". The MCP schema enforces
+    # `minItems: 1` for callers going through the wire, but library
+    # callers (sequence, refine, custom drivers) need their own gate.
+    if not specs:
+        raise ValueError("fanout requires at least one model spec")
     # Env-var override for streaming — lets a user enable streaming across
     # every fanout (incl. the ones nested inside consult/refine/sequence)
     # without changing the tool-call surface.
@@ -734,7 +741,7 @@ async def fanout(
         # portion; the actual run could cost more. Surface that so the cap
         # message isn't misleading low. Mirrors the dry_run branch below.
         suffix = "" if all_known else " (known-priced portion only; some unknown)"
-        return RunHandle(
+        handle = RunHandle(
             run_id=paths.run_id,
             artifacts_dir=str(paths.root),
             manifest=[],
@@ -747,9 +754,14 @@ async def fanout(
             ),
             blinded=blinded,
         )
+        # Write the manifest even on the early-return paths so
+        # `consult-view` / `consult-ledger` / `synth.synthesise` don't
+        # crash with FileNotFoundError on a cap-rejected or dry-run dir.
+        artifacts.write_manifest(paths, handle.model_dump())
+        return handle
     if dry_run:
         suffix = "" if all_known else " (some prices unknown — actual cost may differ)"
-        return RunHandle(
+        handle = RunHandle(
             run_id=paths.run_id,
             artifacts_dir=str(paths.root),
             manifest=[],
@@ -760,6 +772,8 @@ async def fanout(
             partial_reason=f"dry_run: estimated cost ${estimate:.4f}{suffix}",
             blinded=blinded,
         )
+        artifacts.write_manifest(paths, handle.model_dump())
+        return handle
 
     # Build slugs + prompts
     slugs = [_make_slug(s, i, blinded) for i, s in enumerate(specs)]
