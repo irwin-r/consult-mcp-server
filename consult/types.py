@@ -23,7 +23,7 @@ class Status(str, Enum):
 class ModelSpec(BaseModel):
     """One panellist slot. Either `model` alone, or with a stance."""
 
-    model: str = Field(..., description="Registry alias (e.g. 'gpt-5-pro') or LiteLLM ID")
+    model: str = Field(..., description="Registry alias (e.g. 'gpt-pro') or LiteLLM ID")
     stance: str | None = Field(None, description="Stance key from stances.json or a custom prompt")
     slug: str | None = Field(
         None, description="Override slug. Otherwise derived from model + index."

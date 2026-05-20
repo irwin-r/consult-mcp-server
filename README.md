@@ -27,6 +27,20 @@ Four tools:
 
 Plus MCP resources at `consult://runs/<id>/responses/<slug>` for direct body access.
 
+## Models & tiers
+
+Aliases are `<family>-<tier>` — version-neutral. The registry maps each alias to the current best model in that slot; the exact resolved ID is captured per run in `registry_snapshot.json` for reproducibility. Pass a raw LiteLLM ID (e.g. `openai/gpt-5.5-pro`) to bypass the registry.
+
+| Tier | Models | Use |
+|---|---|---|
+| `nano` (3) | `claude-haiku`, `gemini-flash`, `gpt-instant` | sub-$0.05 panels for smoke tests / trivia |
+| `quick` (5) | `claude-haiku`, `gemini-pro`, `grok`, `qwen-max`, `kimi` | ~30s snap second opinions |
+| `standard` (10) | `claude-opus`, `claude-sonnet`, `gpt-pro`, `gpt`, `gemini-pro`, `grok`, `qwen-max`, `kimi`, `glm`, `llama` | normal decisions |
+| `deep` (14) | standard + `mistral`, `deepseek`, `mimo`, `sonar-pro` | high-stakes; includes Perplexity for web search |
+| `code` (5) | `claude-opus`, `gpt-codex`, `gpt-coder-mini`, `gemini-pro`, `deepseek` | code-heavy questions |
+
+Specialist single-model aliases also available: `gpt-codex` (latest OpenAI codex), `sonar-pro` (web search), `gpt-coder-mini` (fast coding).
+
 ## The manifest capsule
 
 Each panellist returns ~200 structured tokens, extracted by a cheap model (`claude-haiku` by default):
@@ -103,7 +117,7 @@ A copy lives in `claude_config_example.json`.
 The hero tool runs ~8 panellists in parallel, drops the synthesiser from the panel, extracts capsules, and synthesises via Gemini 3.1 Pro.
 
 ```text
-> panel: models=[{model:"gpt-5-pro"},{model:"claude-opus",stance:"contrarian"},{model:"gemini-pro"}], prompt="..."
+> panel: models=[{model:"gpt-pro"},{model:"claude-opus",stance:"contrarian"},{model:"gemini-pro"}], prompt="..."
 ```
 
 Lower-level — returns the manifest, you synthesise yourself.
