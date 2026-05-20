@@ -16,16 +16,19 @@ Existing options each fall short:
 
 ## Surface
 
-Four tools:
+Five tools:
 
 | Tool | When |
 |---|---|
 | `panel(prompt, models, blinded?, ...)` → manifest | Parent wants to synthesise itself from rich capsules |
 | `synthesise(run_id, by_model?)` → markdown | Collapse a prior run via a flagship |
 | `consult(prompt, tier?, roles?)` → synthesis + manifest | "Just give me the answer" |
-| `refine(prompt, models, arbiter, threshold, max_rounds)` → result + verdicts | Iterate to consensus; arbiter scores sufficiency per round |
+| `refine(prompt, models, arbiter, threshold, max_rounds, continuation_id?)` → result + verdicts | Iterate to consensus; arbiter scores sufficiency per round. `continuation_id` chains a follow-up onto a prior run. |
+| `sequence(prompts, models)` → per-step results + final synth | Chain a list of prompts where each step's synthesis is prepended to the next. Multi-stage research, plan-then-execute. |
 
-Plus MCP resources at `consult://runs/<id>/responses/<slug>` for direct body access.
+Plus MCP resources at `consult://runs/<id>/responses/<slug>` for direct body access, and live progress via `notifications/progress` (when the client sends a `progressToken`) or a tailable JSONL log at `<run>/_progress.log`.
+
+Multi-instance panellists via `model:N` syntax — e.g. `claude-haiku:3` requests 3 parallel instances of the same model for stochastic averaging.
 
 ## Models & tiers
 
@@ -122,6 +125,97 @@ The hero tool runs ~8 panellists in parallel, drops the synthesiser from the pan
 
 Lower-level — returns the manifest, you synthesise yourself.
 
+## End-to-end walkthrough
+
+A complete tour through the v1 surface. Assumes the install above is done and at least one provider key is in `.env`.
+
+### 1. Smoke-test the install (no API spend)
+
+A dry-run verifies config + cost-estimation without any model calls:
+
+```bash
+.venv/bin/python -c "
+import asyncio
+from consult.runner import fanout
+from consult.types import ModelSpec
+async def go():
+    h = await fanout('hello', [ModelSpec(model='claude-haiku')], dry_run=True)
+    print('partial:', h.partial, '| reason:', h.partial_reason)
+asyncio.run(go())
+"
+# partial: True | reason: dry_run: estimated cost $0.0001
+```
+
+### 2. First real consult (~$0.10–0.20 on the `code` tier)
+
+From any MCP client connected to consult:
+
+```text
+> consult: prompt="Polars vs DuckDB for 10GB Parquet timeseries?", tier=code
+```
+
+Runs the panel in parallel, extracts ~200-token capsules, and synthesises. Returns `{run_id, synthesis, manifest, cost_usd, synthesiser, ...}`.
+
+### 3. Inspect a panellist's full body
+
+The manifest has resource URIs for every panellist:
+
+```text
+> read resource: consult://runs/<run_id>/responses/claude-opus
+```
+
+### 4. Tail progress in real time
+
+While a long refine runs, in a second terminal:
+
+```bash
+tail -f ~/.consult/runs/<run_id>/_progress.log
+# {"ts":"...","kind":"panellist","slug":"claude-opus","status":"OK","latency_ms":35420}
+# {"ts":"...","kind":"capsule","slug":"claude-opus"}
+```
+
+MCP clients that send a `progressToken` get the same events as `notifications/progress` — no log-tailing required.
+
+### 5. Follow up via `continuation_id`
+
+```text
+> refine: prompt="OK now what about Iceberg vs Delta on top of that?", continuation_id="<prior run_id>", models=[{model:"claude-opus"},{model:"deepseek"}]
+```
+
+The prior run's synthesis is prepended as "Prior consultation summary" context so the next panel knows where the discussion has been.
+
+### 6. Multi-step research with `sequence`
+
+```text
+> sequence:
+    prompts=[
+      "Decompose 'how should we scale our event pipeline?' into 4 sub-questions",
+      "Answer sub-question 1: throughput requirements",
+      "Answer sub-question 2: ordering guarantees",
+      "Synthesise the final recommendation across the prior steps"
+    ],
+    models=[{model:"claude-opus"},{model:"gpt-pro"}]
+```
+
+Each step's synthesis feeds the next step's prompt. Returns per-step run_ids + the final synthesis.
+
+### 7. Stochastic averaging with `model:N`
+
+```text
+> panel: models=[{model:"claude-haiku:3"},{model:"gpt-mini:3"}], prompt="..."
+```
+
+Six panellists total — three runs each of two cheap models. Useful for measuring response variance on prompts where temperature matters.
+
+### 8. Check today's spend
+
+```bash
+.venv/bin/consult-ledger today
+# {"date":"2026-05-20","total_usd":2.36,"total_known":false,"runs":[...]}
+```
+
+`total_known: false` means at least one panellist had pricing missing from the LiteLLM table — the displayed total is a lower bound. Pass any `YYYY-MM-DD` to ledger past days.
+
 ## What's in scope for v1
 
 - 4 tools: `panel`, `synthesise`, `consult`, `refine`
@@ -134,35 +228,51 @@ Lower-level — returns the manifest, you synthesise yourself.
 - Parametric `usable()` viability check
 - Status enum: OK / TRUNCATED / MALFORMED / EMPTY / REFUSED / CONTENT_FILTERED / RATE_LIMITED / TIMEOUT / ERROR
 
-## Cut from v1 (defer to v2)
+## Landed since v1
 
-- `sequence` (chained models)
+- `sequence` tool (chained multi-step consultations with shared context)
+- MCP `notifications/progress` + JSONL `_progress.log` fallback
+- Daily cost ledger (`consult-ledger` CLI + `consult/ledger.py`)
+- Continuation IDs for `refine` (chain a follow-up onto a prior run)
+- `model:N` multi-instance syntax
+- GitHub Actions CI on Python 3.11/3.12/3.13
+- Anthropic prompt caching (`cache_control: ephemeral`) on fanout + synth
+- Schema-enforced capsule extraction via `response_format=Capsule`
+- LiteLLM stderr-noise suppression (`suppress_debug_info=True`)
+- `RunResult.synthesiser`, `RefineResult.partial_reason` / `continuation_of` surfaced to callers
+- Per-panellist `Status.ERROR` isolation when a single alias is unknown
+
+## Still deferred
+
 - Auto-retry on token exhaustion (cost bomb — return TRUNCATED, let the parent decide)
-- Streaming progress notifications
-- Daily cost ledger
-- Continuation IDs for per-panellist follow-up
-- `model:count` multi-instance
 - Startup registry validation against provider `/models`
+- PyPI publish (needs explicit user authorisation)
 
 ## Layout
 
 ```
 consult/
-  server.py        # MCP wiring
-  __main__.py      # entry point
-  runner.py        # asyncio.gather + LiteLLM fanout
+  server.py        # MCP wiring (panel, synthesise, consult, refine, sequence)
+  __main__.py      # consult-mcp entry point
+  runner.py        # asyncio.gather + LiteLLM fanout + progress log
   capsule.py       # post-fanout structured extraction
   synth.py         # flagship synthesiser pass
-  refine.py        # iterative arbiter-driven loop (max 3 rounds)
+  refine.py        # iterative arbiter-driven loop (max 3 rounds) + continuation
+  sequence.py      # chained multi-step consultations
+  ledger.py        # daily cost ledger (consult-ledger entry point)
   registry.py      # models.json + stances.json loader
   artifacts.py     # ~/.consult/runs/<id>/ layout + resource URIs
   status.py        # LiteLLM response → Status
   types.py         # Pydantic models
-config/
-  models.json      # default model registry
-  stances.json     # default persona prompts
+  config/
+    models.json    # default model registry
+    stances.json   # default persona prompts
 tests/
-  test_smoke.py    # offline + live tests
+  test_smoke.py    # offline + live tests (40 offline)
+.github/
+  workflows/
+    tests.yml      # CI: pytest on 3.11 / 3.12 / 3.13
+FRICTION.md         # dogfooding log
 ```
 
 ## Testing
