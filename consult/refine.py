@@ -15,11 +15,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 
 import litellm
 
-from . import artifacts, capsule, registry, runner, synth
+from . import artifacts, capsule, context, registry, runner, synth
 from . import progress as progress_mod
 from .jsonparse import extract_json
 from .types import (
@@ -47,6 +48,9 @@ weaker evidence than consensus from a full panel.
 
 Round {round_num} panel capsules:
 {capsules}
+
+How positions changed since the prior round:
+{position_diff}
 
 Return EXACTLY this JSON object (no commentary, no markdown fences):
 
@@ -111,6 +115,62 @@ def _format_positions(manifest: list[ManifestEntry]) -> str:
     return "\n".join(lines) or "(none extracted)"
 
 
+_ROUND_SUFFIX_RE = re.compile(r"\.r\d+$")
+
+
+def _base_slug(slug: str) -> str:
+    """Strip the `.r<n>` round suffix so a panellist matches across rounds."""
+    return _ROUND_SUFFIX_RE.sub("", slug)
+
+
+def _format_position_diff(
+    prior: list[ManifestEntry] | None,
+    current: list[ManifestEntry],
+) -> str:
+    """Per-panellist position changes between rounds, by base slug.
+
+    Sized for the arbiter (NOT bodies — bodies would dilute the arbiter's
+    attention per the v2 review). Shows what each panellist's stance was
+    before vs after, so the arbiter can score whether the round actually
+    moved the needle.
+    """
+    if not prior:
+        return "(first round — no prior to diff against)"
+
+    def _by_base(manifest: list[ManifestEntry]) -> dict[str, ManifestEntry]:
+        return {
+            _base_slug(m.slug): m
+            for m in manifest
+            if m.capsule and m.status in (Status.OK, Status.TRUNCATED)
+        }
+
+    prior_by_base = _by_base(prior)
+    current_by_base = _by_base(current)
+
+    lines: list[str] = []
+    for base, cur in current_by_base.items():
+        assert cur.capsule is not None  # _by_base filters None capsules
+        old = prior_by_base.get(base)
+        if old and old.capsule:
+            if old.capsule.position == cur.capsule.position:
+                lines.append(f"- {base}: unchanged — {cur.capsule.position}")
+            else:
+                lines.append(
+                    f"- {base}:\n"
+                    f"    before: {old.capsule.position}\n"
+                    f"    after:  {cur.capsule.position}"
+                )
+        else:
+            lines.append(f"- {base} (new this round): {cur.capsule.position}")
+    # Surface panellists that dropped out this round — their disappearance
+    # is signal the arbiter should weigh ("3 of 5 now agree, but 2 of 5
+    # are missing this round so consensus is weaker than it looks").
+    for base, old in prior_by_base.items():
+        if base not in current_by_base and old.capsule:
+            lines.append(f"- {base} (dropped this round, last position): {old.capsule.position}")
+    return "\n".join(lines) or "(no comparable positions)"
+
+
 def _build_refinement_prompt(
     question: str, round_num: int, prior_manifest: list[ManifestEntry], verdict: ArbiterVerdict
 ) -> str:
@@ -124,7 +184,11 @@ def _build_refinement_prompt(
 
 
 async def _ask_arbiter(
-    question: str, round_num: int, manifest: list[ManifestEntry], arbiter_alias: str
+    question: str,
+    round_num: int,
+    manifest: list[ManifestEntry],
+    arbiter_alias: str,
+    prior_manifest: list[ManifestEntry] | None = None,
 ) -> ArbiterVerdict:
     entry = registry.resolve_model(arbiter_alias)
     litellm_id = entry["litellm_id"]
@@ -140,6 +204,7 @@ async def _ask_arbiter(
         question=question,
         round_num=round_num,
         capsules=_format_capsules(manifest),
+        position_diff=_format_position_diff(prior_manifest, manifest),
         usable_count=usable_count,
         total_count=len(manifest),
         health_breakdown=health_breakdown,
@@ -242,12 +307,20 @@ def _suffix_specs(specs: list[ModelSpec], round_num: int) -> list[ModelSpec]:
 
 
 def _apply_continuation(prompt: str, continuation_id: str | None) -> str:
-    """Prepend the prior run's synthesis to `prompt` when continuing.
+    """Prepend the prior run's original question + synthesis to `prompt`.
 
-    Raises `ValueError` with a clear message on a missing run dir or missing
-    `synthesis.md` — a typo in `continuation_id` must not silently drop the
-    prior context (caller would think the new round had it, but it wouldn't).
-    Empty string is treated the same as None.
+    Order: stable prefix (prior question + prior synthesis) first, then the
+    new (volatile) question last. Anthropic + OpenAI prompt caches key on
+    leading bytes, so this ordering means every panellist in this turn
+    reuses the cache from the first panellist. Including the prior question
+    (not just the synthesis) restores fidelity — without it, the new panel
+    would only see a summary of what was asked previously, not the source
+    material.
+
+    Raises `ValueError` on a missing run dir or missing `synthesis.md` — a
+    typo in `continuation_id` must not silently drop the prior context
+    (caller would think the new round had it, but it wouldn't). Empty
+    string is treated the same as None.
     """
     if not continuation_id:
         return prompt
@@ -261,10 +334,24 @@ def _apply_continuation(prompt: str, continuation_id: str | None) -> str:
             f"continuation_id {continuation_id} has no synthesis.md "
             "(was the prior run partial, dry-run, or pre-synth?)"
         )
-    prior = synth_path.read_text()
+
+    # Load the prior question — prefer the bundle (canonical post-Phase 1)
+    # and fall back to prompt.txt for legacy runs created before contexts
+    # were a thing.
+    prior_bundle = context.load_or_none(prior_paths)
+    if prior_bundle is not None:
+        prior_question = prior_bundle.prompt
+    elif prior_paths.prompt_txt.exists():
+        prior_question = prior_paths.prompt_txt.read_text()
+    else:
+        prior_question = "(prior question unavailable)"
+
+    prior_synth = synth_path.read_text()
     return (
-        "## Prior consultation summary\n\n"
-        f"{prior}\n\n---\n\n"
+        "## Prior consultation — original question\n\n"
+        f"{prior_question}\n\n"
+        "## Prior consultation — synthesis\n\n"
+        f"{prior_synth}\n\n---\n\n"
         "## Follow-up question\n\n"
         f"{prompt}"
     )
@@ -281,10 +368,12 @@ async def refine(
     max_run_usd: float | None = None,
     synthesiser: str | None = None,
     continuation_id: str | None = None,
+    rubric: str | None = None,
+    capsule_kind: str = "decision",
     on_progress: runner.ProgressCallback | None = None,
 ) -> RefineResult:
-    if max_rounds < 1 or max_rounds > 3:
-        raise ValueError("max_rounds must be between 1 and 3 (hard cap from v1.1 spec)")
+    if max_rounds < 1 or max_rounds > 5:
+        raise ValueError("max_rounds must be between 1 and 5")
     if not 0.0 <= threshold <= 1.0:
         raise ValueError("threshold must be in [0.0, 1.0]")
 
@@ -298,6 +387,10 @@ async def refine(
     paths = artifacts.create_run()
     paths.prompt_txt.write_text(prompt)
     paths.registry_snapshot.write_text(json.dumps(registry.models_config(), indent=2))
+    # Per-run context bundle. Refine creates its own run dir then calls
+    # `runner.fanout` with `existing_paths=` so we own the bundle write
+    # here — runner skips it when given an existing path.
+    context.write(paths, context.build(prompt, blinded=blinded))
     cap = max_run_usd if max_run_usd is not None else registry.default_max_run_usd()
 
     start = time.time()
@@ -339,6 +432,7 @@ async def refine(
         return cb
 
     round_prompt = prompt
+    prior_manifest: list[ManifestEntry] | None = None
     for round_num in range(1, max_rounds + 1):
         # Estimate next-round cost; refuse if it'd blow the cap.
         # If pricing is unknown for any spec, refuse conservatively past the
@@ -369,13 +463,16 @@ async def refine(
         handle = await capsule.annotate(
             handle,
             on_progress=make_phase_cb(round_base + panel_n),
+            kind=capsule_kind,
         )
         final_manifest = handle.manifest
         cumulative_cost += handle.cost_usd
         if not handle.cost_known:
             cost_all_known = False
 
-        verdict = await _ask_arbiter(prompt, round_num, handle.manifest, arbiter_alias)
+        verdict = await _ask_arbiter(
+            prompt, round_num, handle.manifest, arbiter_alias, prior_manifest
+        )
         progress_done = round_base + panel_n * 2 + 1
         await emit(progress_mod.ArbiterScored(
             done=progress_done, total=progress_total,
@@ -402,14 +499,25 @@ async def refine(
 
         if round_num < max_rounds:
             round_prompt = _build_refinement_prompt(prompt, round_num + 1, handle.manifest, verdict)
+        # Snapshot for the next round's arbiter position-diff. Updated
+        # after the verdict so an aborted round (parse failure above)
+        # leaves prior_manifest pointing at the last fully-scored round.
+        prior_manifest = handle.manifest
 
     # Synthesise from the final round
     if final_manifest:
         progress_done = progress_total - 1
         await emit(progress_mod.SynthStarted(done=progress_done, total=progress_total))
-        text = await synth.synthesise(paths.run_id, by_model=synth_alias)
+        text = await synth.synthesise(
+            paths.run_id, by_model=synth_alias, rubric=rubric
+        )
         progress_done = progress_total
         await emit(progress_mod.SynthCompleted(done=progress_done, total=progress_total))
+        # Persist the synthesiser so consult-view can badge it in the
+        # header; matches the consult handler. Refine writes the manifest
+        # once per round from `runner.fanout`, so this lands on the final
+        # version after the loop has stopped.
+        artifacts.augment_manifest(paths, synthesiser=synth_alias)
     else:
         text = "(no rounds completed — see partial_reason)"
 

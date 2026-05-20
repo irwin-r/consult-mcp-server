@@ -17,19 +17,20 @@ from typing import Any
 
 import litellm
 
-from . import artifacts, registry
+from . import artifacts, context, registry
 from .jsonparse import extract_json
 from .progress import CapsuleExtracted
 from .runner import ProgressCallback, _append_progress_log
-from .types import Capsule, ManifestEntry, RunHandle, Status
+from .types import AnyCapsule, Capsule, ManifestEntry, ResearchCapsule, ReviewCapsule, RunHandle, Status
 
 logger = logging.getLogger(__name__)
 
-_CAPSULE_PROMPT = """\
+_CAPSULE_PROMPT_HEAD_DECISION = """\
 You will be given one panellist's response from a multi-model consultation.
 Extract a structured capsule. Return EXACTLY a JSON object with these keys:
 
 {
+  "kind": "decision",
   "position": "one-line summary of stance/conclusion",
   "recommendation": "what the panellist recommends, one sentence",
   "key_points": ["...", "...", "..."],
@@ -47,29 +48,141 @@ Rules:
 - confidence: parse from a "CONFIDENCE:" line in the body if present, else null
 - Output JSON only, no commentary, no markdown fences.
 
-PANELLIST RESPONSE:
 """
+
+_CAPSULE_PROMPT_HEAD_REVIEW = """\
+You will be given one panellist's review of a code artefact (PR diff, file, or codebase).
+Extract a structured review capsule. Return EXACTLY a JSON object with these keys:
+
+{
+  "kind": "review",
+  "findings": [
+    {
+      "severity": "blocker | major | minor | nit | praise",
+      "file": "path/to/file.py or null",
+      "line_range": [42, 58] or null,
+      "category": "security | performance | correctness | style | maintainability | tests | docs",
+      "summary": "≤30 words",
+      "suggestion": "≤30 words on the specific change"
+    }
+  ],
+  "overall_verdict": "ship | changes_requested | discuss",
+  "confidence": 0.0
+}
+
+Rules:
+- findings: one per distinct issue the panellist raised. Praise items go in findings with severity="praise".
+- file: null if the finding is general, otherwise the path verbatim from the panellist
+- line_range: [start, end] when given; null otherwise. Use start=end for a single line.
+- summary and suggestion: ≤ 30 words each. Prefer concrete suggestions over vague hand-waving.
+- overall_verdict: the panellist's overall recommendation if stated; default "discuss".
+- confidence: parse from a "CONFIDENCE:" line in the body if present, else null
+- Output JSON only, no commentary, no markdown fences.
+
+"""
+
+_CAPSULE_PROMPT_HEAD_RESEARCH = """\
+You will be given one panellist's response to a research question.
+Extract a structured research capsule. Return EXACTLY a JSON object with these keys:
+
+{
+  "kind": "research",
+  "claims": ["..."],
+  "evidence": ["..."],
+  "uncertainties": ["..."],
+  "sources_cited": ["..."],
+  "confidence": 0.0
+}
+
+Rules:
+- claims: 2-5 entries, each ≤ 20 words. The panellist's main assertions.
+- evidence: 2-5 entries, each ≤ 30 words. What backs each claim (study, doc, first-principles reasoning, vendor claim).
+- uncertainties: 0-3 entries, each ≤ 20 words. Where the panellist is genuinely unsure.
+- sources_cited: 0-5 entries — URLs, papers, vendor docs the panellist named verbatim.
+- confidence: parse from a "CONFIDENCE:" line in the body if present, else null
+- Output JSON only, no commentary, no markdown fences.
+
+"""
+
+_HEAD_BY_KIND = {
+    "decision": _CAPSULE_PROMPT_HEAD_DECISION,
+    "review": _CAPSULE_PROMPT_HEAD_REVIEW,
+    "research": _CAPSULE_PROMPT_HEAD_RESEARCH,
+}
+
+_RESPONSE_FORMAT_BY_KIND: dict[str, type] = {
+    "decision": Capsule,
+    "review": ReviewCapsule,
+    "research": ResearchCapsule,
+}
+
+_EMPTY_BY_KIND: dict[str, type] = {
+    "decision": Capsule,
+    "review": ReviewCapsule,
+    "research": ResearchCapsule,
+}
+
+_CAPSULE_PROMPT_RESPONSE_MARKER = "PANELLIST RESPONSE:\n"
+
+
+def _build_capsule_prompt(
+    body: str, original_question: str | None, *, kind: str = "decision"
+) -> str:
+    """Construct the extractor prompt, optionally with original-question context.
+
+    Without the question, the extractor sees only the body and may flatten
+    precise references ("section 3.2", "lines 42-58") to abstract bullets
+    because it has no idea what they refer to. Including the question
+    grounds the extraction.
+
+    `kind` selects the extraction shape (decision/review/research). Unknown
+    kinds fall back to decision so a typo doesn't silently produce empty
+    capsules.
+    """
+    head = _HEAD_BY_KIND.get(kind, _CAPSULE_PROMPT_HEAD_DECISION)
+    parts: list[str] = [head]
+    if original_question:
+        parts.append(
+            "ORIGINAL QUESTION (context — extract claims from the response below, not from this):\n"
+        )
+        parts.append(original_question.strip())
+        parts.append("\n\n")
+    parts.append(_CAPSULE_PROMPT_RESPONSE_MARKER)
+    parts.append(body)
+    return "".join(parts)
 
 _CONFIDENCE = re.compile(r"^\s*CONFIDENCE\s*:\s*([0-9.]+)", re.M | re.I)
 
 
 async def _extract_one(
-    body: str, extractor_id: str, timeout: int
-) -> tuple[Capsule, float | None, bool]:
+    body: str,
+    extractor_id: str,
+    timeout: int,
+    original_question: str | None = None,
+    *,
+    kind: str = "decision",
+) -> tuple[AnyCapsule, float | None, bool]:
     """Returns (capsule, cost_usd, cost_known).
+
+    `kind` selects the capsule shape (decision/review/research) — pass
+    "review" for line-anchored PR review findings, "research" for
+    claims-and-evidence research briefs, or "decision" (default) for the
+    original general-purpose capsule.
 
     The extractor call and the cost lookup are kept in separate try blocks so
     that a price-table miss for the extractor model never discards a
     successfully extracted capsule. `cost_known=False` distinguishes "we don't
     know" from 0.0.
     """
+    capsule_cls: type = _RESPONSE_FORMAT_BY_KIND.get(kind, Capsule)
+
     if not body or not body.strip():
-        return Capsule(), None, True  # zero cost is known: we made no call
+        return capsule_cls(), None, True  # zero cost is known: we made no call
 
     # 1) Extraction call — exceptions here mean we couldn't build a capsule.
-    # `response_format=Capsule` asks LiteLLM to enforce the Pydantic schema on
-    # supporting providers (OpenAI strict mode, Anthropic tool-use emulation,
-    # Gemini responseSchema). On providers that don't support it,
+    # `response_format=<CapsuleClass>` asks LiteLLM to enforce the Pydantic
+    # schema on supporting providers (OpenAI strict mode, Anthropic tool-use
+    # emulation, Gemini responseSchema). On providers that don't support it,
     # litellm.drop_params silently drops the param and we fall back to the
     # prompt + regex JSON recovery below.
     #
@@ -80,12 +193,17 @@ async def _extract_one(
     # unset and trust the provider default. Detect by substring so the
     # openrouter-routed Gemini path (`openrouter/google/gemini-...`) is
     # caught alongside the direct `gemini/...` path.
-    prompt = _CAPSULE_PROMPT + body
+    # Trim overlong bodies to keep the cheap extractor's input bounded.
+    # The extractor only needs structure, not every word — head+tail
+    # truncation preserves the panellist's opening claims and closing
+    # recommendation while dropping bulk from the middle.
+    body = context.trim_capsule_body(body)
+    prompt = _build_capsule_prompt(body, original_question, kind=kind)
     kwargs: dict[str, Any] = {
         "model": extractor_id,
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": 800,
-        "response_format": Capsule,
+        "response_format": capsule_cls,
     }
     if "gemini" not in extractor_id.lower():
         kwargs["temperature"] = 0.0
@@ -100,7 +218,7 @@ async def _extract_one(
         )
         m = _CONFIDENCE.search(body)
         conf = float(m.group(1)) if m else None
-        return Capsule(confidence=conf), None, False
+        return capsule_cls(confidence=conf), None, False
 
     # 2) Capsule build — failures here are JSON shape or Pydantic validation
     try:
@@ -110,14 +228,16 @@ async def _extract_one(
             m = _CONFIDENCE.search(body)
             if m:
                 data["confidence"] = float(m.group(1))
-        capsule = Capsule(
-            **{k: v for k, v in data.items() if k in Capsule.model_fields}
+        # Filter to known fields so an extractor adding an extra key doesn't
+        # break the strict (`extra="forbid"`) Pydantic model.
+        capsule = capsule_cls(
+            **{k: v for k, v in data.items() if k in capsule_cls.model_fields}
         )
     except Exception as e:
         logger.warning("capsule JSON build failed for extractor=%s: %s", extractor_id, e)
         m = _CONFIDENCE.search(body)
         conf = float(m.group(1)) if m else None
-        capsule = Capsule(confidence=conf)
+        capsule = capsule_cls(confidence=conf)
 
     # 3) Cost lookup — never let a pricing miss discard a successful capsule
     try:
@@ -138,12 +258,18 @@ async def annotate(
     *,
     extractor: str | None = None,
     on_progress: ProgressCallback | None = None,
+    kind: str = "decision",
 ) -> RunHandle:
     """Populate `capsule` and `confidence` on each manifest entry in place.
 
     Returns the same handle for chainability. Cost from extraction is added to
     the handle's `cost_usd`. `on_progress(done, total, msg)` is invoked once
     per capsule as it lands; failures inside the callback are swallowed.
+
+    `kind` selects the capsule shape produced:
+    - `"decision"` (default) — the general-purpose position/recommendation capsule
+    - `"review"` — line-anchored Finding[] for code/PR review
+    - `"research"` — claims/evidence/uncertainties for research-question panels
     """
     ext_alias = extractor or registry.default_capsule_extractor()
     ext_entry = registry.resolve_model(ext_alias)
@@ -151,6 +277,12 @@ async def annotate(
     timeout = ext_entry.get("default_timeout_s", 60)
 
     paths = artifacts.load_run(handle.run_id)
+    # Load the per-run context bundle so the extractor sees the original
+    # question alongside the panellist body. Legacy runs without a bundle
+    # fall back to body-only extraction (pre-Phase-1 behaviour).
+    bundle = context.load_or_none(paths)
+    original_question = bundle.prompt_for_downstream() if bundle else None
+
     targets: list[ManifestEntry] = []
     bodies: list[str] = []
     for entry in handle.manifest:
@@ -165,9 +297,9 @@ async def annotate(
     total = len(targets)
     done = 0
 
-    async def _run(body: str, slug: str) -> tuple[Capsule, float | None, bool]:
+    async def _run(body: str, slug: str) -> tuple[AnyCapsule, float | None, bool]:
         nonlocal done
-        result = await _extract_one(body, ext_id, timeout)
+        result = await _extract_one(body, ext_id, timeout, original_question, kind=kind)
         done += 1
         event = CapsuleExtracted(done=done, total=total, slug=slug)
         _append_progress_log(paths.root, event)

@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import json
 import os
+import sys
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -172,20 +174,50 @@ def test_refinement_prompt_includes_gaps_and_focus():
 
 @pytest.mark.asyncio
 async def test_refine_continuation_prepends_prior_synthesis(tmp_path, monkeypatch):
-    """A valid continuation_id loads the prior run's synthesis.md and
-    prepends it as 'Prior consultation summary' before the follow-up.
+    """A valid continuation_id loads the prior run's question + synthesis and
+    prepends both as a stable prefix before the follow-up question. Including
+    the prior question (not just the synthesis) preserves fidelity — the new
+    panel needs to see what was actually asked previously, not only the
+    summary of the answer.
     """
     from consult.refine import _apply_continuation
 
     monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
     prior = artifacts.create_run()
+    prior.prompt_txt.write_text("Polars vs DuckDB for 10GB Parquet?")
     (prior.root / "synthesis.md").write_text("ANSWER: pick DuckDB.")
 
     result = _apply_continuation("Now what about Polars for ETL?", prior.run_id)
-    assert "Prior consultation summary" in result
+    # Stable prefix first
+    assert "Prior consultation — original question" in result
+    assert "Polars vs DuckDB for 10GB Parquet?" in result
+    assert "Prior consultation — synthesis" in result
     assert "ANSWER: pick DuckDB." in result
+    # Volatile new question last
     assert "Follow-up question" in result
     assert "Now what about Polars for ETL?" in result
+    # Cache-friendly ordering: prior content precedes the new question
+    assert result.index("ANSWER: pick DuckDB.") < result.index("Now what about Polars for ETL?")
+
+
+def test_refine_continuation_legacy_run_without_prompt_txt(tmp_path, monkeypatch):
+    """Legacy runs (pre-Phase-1) may lack prompt.txt; continuation must not
+    crash — it falls back to a placeholder for the prior question and still
+    prepends the synthesis.
+    """
+    from consult.refine import _apply_continuation
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    prior = artifacts.create_run()
+    # Deliberately do NOT write prompt.txt — simulate a pre-Phase-1 run that
+    # only had synthesis.md.
+    (prior.root / "synthesis.md").write_text("ANSWER: pick DuckDB.")
+
+    result = _apply_continuation("Follow-up", prior.run_id)
+    # Falls back to a placeholder without raising
+    assert "prior question unavailable" in result.lower()
+    assert "ANSWER: pick DuckDB." in result
+    assert "Follow-up" in result
 
 
 def test_refine_continuation_none_or_empty_is_passthrough(tmp_path, monkeypatch):
@@ -222,8 +254,11 @@ def test_refine_continuation_missing_synthesis_raises(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_refine_validates_max_rounds():
+    # Cap raised from 3 to 5 in M4 — values above 5 still rejected.
     with pytest.raises(ValueError, match="max_rounds"):
-        await refine_mod.refine("q", [ModelSpec(model="claude-haiku")], max_rounds=5)
+        await refine_mod.refine("q", [ModelSpec(model="claude-haiku")], max_rounds=6)
+    with pytest.raises(ValueError, match="max_rounds"):
+        await refine_mod.refine("q", [ModelSpec(model="claude-haiku")], max_rounds=0)
 
 
 def test_arbiter_json_extractor_tolerates_fences():
@@ -264,7 +299,7 @@ async def test_fanout_emits_progress_callbacks(tmp_path, monkeypatch):
     monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
     monkeypatch.setattr(runner, "estimate_cost", lambda specs, prompt: (0.0, True))
 
-    async def fake_call(spec, slug, per_prompt, paths, provider_sems=None):
+    async def fake_call(spec, slug, per_prompt, paths, provider_sems=None, **_):
         return ManifestEntry(
             slug=slug,
             model_id="x/y",
@@ -636,7 +671,7 @@ async def test_fanout_progress_callback_failure_does_not_abort_run(tmp_path, mon
     monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
     monkeypatch.setattr(runner, "estimate_cost", lambda specs, prompt: (0.0, True))
 
-    async def fake_call(spec, slug, per_prompt, paths, provider_sems=None):
+    async def fake_call(spec, slug, per_prompt, paths, provider_sems=None, **_):
         return ManifestEntry(
             slug=slug,
             model_id="x/y",
@@ -682,7 +717,7 @@ async def test_fanout_slow_tail_dropout_cancels_stragglers(tmp_path, monkeypatch
     monkeypatch.setenv("CONSULT_TAIL_DROPOUT_S", "0.05")
     monkeypatch.setenv("CONSULT_TAIL_K_FRAC", "0.25")  # k=1 for n=4 → trigger=3
 
-    async def fake_call(spec, slug, per_prompt, paths, provider_sems=None):
+    async def fake_call(spec, slug, per_prompt, paths, provider_sems=None, **_):
         if "slow" in slug:
             await _asyncio.sleep(5.0)
         paths.response_text(slug).write_text("ok")
@@ -726,7 +761,7 @@ async def test_fanout_no_dropout_below_threshold_panel_size(tmp_path, monkeypatc
     monkeypatch.setenv("CONSULT_TAIL_DROPOUT_S", "0.05")
     monkeypatch.setenv("CONSULT_TAIL_K_FRAC", "0.5")
 
-    async def fake_call(spec, slug, per_prompt, paths, provider_sems=None):
+    async def fake_call(spec, slug, per_prompt, paths, provider_sems=None, **_):
         if "slow" in slug:
             await _asyncio.sleep(0.3)
         paths.response_text(slug).write_text("ok")
@@ -1477,6 +1512,1242 @@ def test_internal_models_forbid_unknown_fields():
         # An unknown kwarg must be rejected, not silently dropped
         with pytest.raises(pydantic.ValidationError):
             cls(**kwargs, definitely_not_a_field="boom")
+
+
+# ---- Viewer tests ----------------------------------------------------------
+
+
+def test_viewer_markdown_subset_renders_each_construct():
+    """The viewer ships its own small markdown renderer (rather than pulling
+    in a library) — pin every construct the synthesiser actually emits so a
+    regex regression doesn't silently lose formatting in `feed.html`.
+    """
+    from consult.viewer import render_markdown
+
+    out = render_markdown("# Heading 1\n## Heading 2")
+    assert "<h1>Heading 1</h1>" in out
+    assert "<h2>Heading 2</h2>" in out
+
+    out = render_markdown("- one\n- two\n- three")
+    assert out.count("<li>") == 3
+    assert "<ul>" in out and "</ul>" in out
+
+    out = render_markdown("1. first\n2. second")
+    assert "<ol>" in out and out.count("<li>") == 2
+
+    out = render_markdown("Some **bold** and *italic* with `code` and a [link](https://x.test).")
+    assert "<strong>bold</strong>" in out
+    assert "<em>italic</em>" in out
+    assert "<code>code</code>" in out
+    assert '<a href="https://x.test">link</a>' in out
+
+    out = render_markdown("```python\nprint(1)\n```")
+    assert '<pre><code class="lang-python">print(1)</code></pre>' in out
+
+    out = render_markdown("para one\n\npara two")
+    assert out.count("<p>") == 2
+
+
+def test_viewer_markdown_escapes_untrusted_html():
+    """A panellist body that contained `<script>` must not become live HTML
+    when threaded through synthesis — every line passes through html.escape
+    before inline transforms run.
+    """
+    from consult.viewer import render_markdown
+
+    out = render_markdown("<script>alert(1)</script>")
+    assert "<script>" not in out
+    assert "&lt;script&gt;" in out
+
+    out = render_markdown("- <img src=x onerror=alert(1)>")
+    assert "<img" not in out
+    assert "&lt;img" in out
+
+
+def test_viewer_markdown_inline_code_protects_bold_markers():
+    """Inline-code spans must be stashed before the bold regex runs;
+    otherwise `` `**foo**` `` is wrongly rendered with a nested <strong>.
+    """
+    from consult.viewer import render_markdown
+
+    out = render_markdown("Literal `**not bold**` here.")
+    assert "<code>**not bold**</code>" in out
+    assert "<strong>" not in out
+
+
+def test_viewer_round_of_extracts_refine_round():
+    """Refine slugs carry an `.r<n>` suffix; the viewer uses this to bucket
+    panellists by round in the panel section.
+    """
+    from consult.viewer import _round_of
+
+    assert _round_of("claude-opus") is None
+    assert _round_of("claude-opus.r1") == 1
+    assert _round_of("claude-opus-0.r3") == 3
+
+
+def test_viewer_fmt_cost_handles_unknown_and_small_values():
+    """`cost_usd=None` and `cost_known=False` must not crash the renderer."""
+    from consult.viewer import _fmt_cost, _fmt_ms
+
+    assert _fmt_cost(None) == "—"
+    assert _fmt_cost(0) == "$0"
+    assert _fmt_cost(0.0123) == "$0.0123"
+    assert _fmt_cost(2.5).startswith("$2.5")
+    # Unknown-pricing is flagged with a trailing `*` — mirrors ledger output.
+    assert _fmt_cost(0.5, known=False).endswith("*")
+    assert _fmt_ms(None) == "—"
+    assert _fmt_ms(250) == "250ms"
+    assert _fmt_ms(2500).endswith("s")
+
+
+def _make_run_dir(
+    tmp_path,
+    run_id: str,
+    *,
+    entries: list[dict],
+    bodies: dict[str, str] | None = None,
+    synth: str | None = None,
+    arbiters: list[dict] | None = None,
+    progress_lines: list[dict] | None = None,
+    prompt: str = "test prompt",
+    extras: dict | None = None,
+):
+    """Materialise a minimal-but-realistic run dir on disk for viewer tests.
+
+    Shared across the render_run cases so each test stays focused on one
+    invariant rather than rebuilding the artifact tree.
+    """
+    root = tmp_path / run_id
+    (root / "responses").mkdir(parents=True)
+    (root / "capsules").mkdir()
+    (root / "arbiters").mkdir()
+    (root / "prompts").mkdir()
+    (root / "prompt.txt").write_text(prompt)
+    manifest = {
+        "run_id": run_id,
+        "artifacts_dir": str(root),
+        "manifest": entries,
+        "cost_usd": sum((e.get("cost_usd") or 0) for e in entries),
+        "cost_known": all(e.get("cost_known", True) for e in entries),
+        "wall_ms": 1234,
+        "partial": False,
+        "blinded": False,
+        **(extras or {}),
+    }
+    (root / "manifest.json").write_text(json.dumps(manifest))
+    for slug, body in (bodies or {}).items():
+        (root / "responses" / f"{slug}.txt").write_text(body)
+    if synth is not None:
+        (root / "synthesis.md").write_text(synth)
+    for v in arbiters or []:
+        (root / "arbiters" / f"round-{v['round']}.json").write_text(json.dumps(v))
+    if progress_lines:
+        (root / "_progress.log").write_text(
+            "\n".join(json.dumps(p) for p in progress_lines) + "\n"
+        )
+    return root
+
+
+def test_viewer_render_run_panel_includes_core_sections(tmp_path, monkeypatch):
+    """Panel-only runs (no synthesis) still render — manifest table, capsule,
+    body. The 'panel' kind is derived from the absence of synthesis.md.
+    """
+    from consult import viewer
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    rid = "20260520-fake-1"
+    _make_run_dir(
+        tmp_path,
+        rid,
+        entries=[{
+            "slug": "alpha",
+            "model_id": "anthropic/claude-opus-4-7",
+            "status": "OK",
+            "capsule": {
+                "position": "supports A",
+                "recommendation": "ship A",
+                "key_points": ["fast", "cheap"],
+            },
+            "resource_uri": f"consult://runs/{rid}/responses/alpha",
+            "body_path": "/x",
+            "latency_ms": 4200,
+            "cost_usd": 0.012,
+            "cost_known": True,
+            "confidence": 0.8,
+        }],
+        bodies={"alpha": "alpha body text"},
+    )
+    out = viewer.render_run(rid)
+    text = out.read_text()
+    assert out.name == "feed.html"
+    assert "<!doctype html>" in text
+    assert rid in text
+    # Panel run: no synthesis section, no arbiter section, but core panellist
+    # card is present with the capsule fields surfaced.
+    assert "panel" in text.lower()
+    assert "Synthesis" not in text
+    assert "Arbiter rounds" not in text
+    assert "alpha" in text
+    assert "supports A" in text
+    assert "ship A" in text
+    assert "anthropic/claude-opus-4-7" in text
+    # The status pill must use the OK tone.
+    assert "pill-ok" in text
+
+
+def test_viewer_render_run_consult_renders_synthesis_markdown(tmp_path, monkeypatch):
+    """A consult run has synthesis.md — the viewer renders it through the
+    markdown subset, not as a raw `<pre>` blob. Catches a regression where
+    we'd accidentally drop the synthesis section.
+    """
+    from consult import viewer
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    rid = "20260520-fake-2"
+    _make_run_dir(
+        tmp_path,
+        rid,
+        entries=[{
+            "slug": "alpha", "model_id": "x/y", "status": "OK",
+            "resource_uri": f"consult://runs/{rid}/responses/alpha",
+            "body_path": "/x", "latency_ms": 1, "cost_usd": 0.0,
+            "cost_known": True,
+        }],
+        synth="# Consensus\n\n- point one\n- point two",
+        extras={"synthesiser": "gemini-pro"},
+    )
+    out = viewer.render_run(rid)
+    text = out.read_text()
+    assert "<h2>Synthesis</h2>" in text
+    assert "<h1>Consensus</h1>" in text
+    assert "<li>point one</li>" in text
+    assert "consult" in text.lower()
+    # `synthesiser` field surfaces in the header stats so the reader can see
+    # which model produced the synthesis without opening the manifest.
+    assert "gemini-pro" in text
+
+
+def test_viewer_render_run_refine_shows_arbiter_rounds_and_groups_panellists(tmp_path, monkeypatch):
+    """Refine runs: arbiter section per round + panel cards bucketed by round."""
+    from consult import viewer
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    rid = "20260520-fake-3"
+    _make_run_dir(
+        tmp_path,
+        rid,
+        entries=[
+            {
+                "slug": "alpha.r1", "model_id": "x/y", "status": "OK",
+                "resource_uri": f"consult://runs/{rid}/responses/alpha.r1",
+                "body_path": "/x", "latency_ms": 1, "cost_usd": 0.0,
+                "cost_known": True,
+            },
+            {
+                "slug": "alpha.r2", "model_id": "x/y", "status": "OK",
+                "resource_uri": f"consult://runs/{rid}/responses/alpha.r2",
+                "body_path": "/x", "latency_ms": 1, "cost_usd": 0.0,
+                "cost_known": True,
+            },
+        ],
+        synth="final synth",
+        arbiters=[
+            {"round": 1, "score": 0.5, "gaps": ["missing X"], "next_round_focus": "address X", "reasoning": "r1"},
+            {"round": 2, "score": 0.9, "gaps": [], "next_round_focus": "", "reasoning": "r2"},
+        ],
+    )
+    out = viewer.render_run(rid)
+    text = out.read_text()
+    assert "Arbiter rounds" in text
+    assert "Round 1" in text
+    assert "Round 2" in text
+    assert "missing X" in text
+    assert "address X" in text
+    assert "score 0.50" in text
+    assert "score 0.90" in text
+    # Multi-round panellists must be grouped under per-round headers.
+    assert text.count("Round 1") >= 2  # arbiter card + panel group header
+    assert text.count("Round 2") >= 2
+
+
+def test_viewer_render_run_escapes_panellist_bodies(tmp_path, monkeypatch):
+    """Untrusted panellist response text must be HTML-escaped before
+    landing in `feed.html` — otherwise a body containing `<script>` would
+    execute when the user opened the page in a browser.
+    """
+    from consult import viewer
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    rid = "20260520-fake-4"
+    _make_run_dir(
+        tmp_path,
+        rid,
+        entries=[{
+            "slug": "alpha", "model_id": "x/y", "status": "OK",
+            "resource_uri": f"consult://runs/{rid}/responses/alpha",
+            "body_path": "/x", "latency_ms": 1, "cost_usd": 0.0,
+            "cost_known": True,
+        }],
+        bodies={"alpha": "<script>alert(1)</script>"},
+    )
+    out = viewer.render_run(rid)
+    text = out.read_text()
+    assert "<script>alert(1)</script>" not in text
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in text
+
+
+def test_viewer_render_run_renders_progress_timeline(tmp_path, monkeypatch):
+    """`_progress.log` events become a chronological timeline section with
+    deltas computed from the first event.
+    """
+    from consult import viewer
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    rid = "20260520-fake-5"
+    _make_run_dir(
+        tmp_path,
+        rid,
+        entries=[{
+            "slug": "alpha", "model_id": "x/y", "status": "OK",
+            "resource_uri": f"consult://runs/{rid}/responses/alpha",
+            "body_path": "/x", "latency_ms": 1, "cost_usd": 0.0,
+            "cost_known": True,
+        }],
+        progress_lines=[
+            {"ts": "2026-05-20T10:18:09.000000+00:00", "done": 0, "total": 0,
+             "kind": "panellist_completed", "slug": "alpha", "status": "OK", "latency_ms": 1234},
+            {"ts": "2026-05-20T10:18:13.500000+00:00", "done": 1, "total": 1,
+             "kind": "capsule_extracted", "slug": "alpha"},
+        ],
+    )
+    out = viewer.render_run(rid)
+    text = out.read_text()
+    assert "<h2>Timeline</h2>" in text
+    assert "panellist_completed" in text
+    assert "capsule_extracted" in text
+    # Relative offset: first event is +0.0s, second is +4.5s after it.
+    assert "+0.0s" in text
+    assert "+4.5s" in text
+
+
+def test_viewer_render_run_handles_missing_optional_artifacts(tmp_path, monkeypatch):
+    """Empty/missing prompt.txt, synthesis.md, _progress.log, and arbiters
+    must all be tolerated — the renderer is for whatever state the run is
+    in, not a strict completeness check.
+    """
+    from consult import viewer
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    rid = "20260520-fake-6"
+    root = tmp_path / rid
+    (root / "responses").mkdir(parents=True)
+    # Bare-minimum manifest, no other artifacts at all
+    (root / "manifest.json").write_text(json.dumps({
+        "run_id": rid,
+        "artifacts_dir": str(root),
+        "manifest": [],
+        "cost_usd": 0.0,
+        "wall_ms": 0,
+        "partial": False,
+    }))
+    out = viewer.render_run(rid)
+    text = out.read_text()
+    assert rid in text
+    # No panellists, no synth, no arbiters — still produces a complete document.
+    assert "<!doctype html>" in text
+    assert "</html>" in text
+
+
+def test_viewer_render_run_raises_for_missing_run(tmp_path, monkeypatch):
+    """Unknown run_id → FileNotFoundError, which the CLI surfaces as an
+    exit-code-1 error rather than a stack trace.
+    """
+    from consult import viewer
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    with pytest.raises(FileNotFoundError):
+        viewer.render_run("20990101-nope-1")
+
+
+def test_viewer_render_run_raises_for_run_without_manifest(tmp_path, monkeypatch):
+    """A run dir that exists but has no manifest can't be rendered — bail
+    out with a clear message rather than producing a half-built page.
+    """
+    from consult import viewer
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    rid = "20260520-fake-no-manifest"
+    (tmp_path / rid).mkdir()
+    with pytest.raises(FileNotFoundError, match="manifest.json missing"):
+        viewer.render_run(rid)
+
+
+def test_viewer_render_run_surfaces_partial_and_cancelled_banners(tmp_path, monkeypatch):
+    """Partial reason and the CANCELLED marker must surface visually so the
+    reader doesn't mistake a half-finished run for a clean one.
+    """
+    from consult import viewer
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    rid = "20260520-fake-7"
+    root = _make_run_dir(
+        tmp_path,
+        rid,
+        entries=[],
+        extras={"partial": True, "partial_reason": "cost cap exceeded"},
+    )
+    (root / "CANCELLED").touch()
+    text = viewer.render_run(rid).read_text()
+    assert "cost cap exceeded" in text
+    assert "cancelled" in text.lower()
+
+
+def test_viewer_cli_writes_path_to_stdout(tmp_path, monkeypatch, capsys):
+    """`consult-view <run_id>` prints the absolute path so users can pipe
+    it into `open(1)` or copy/paste it. No --open flag = no browser launch.
+    """
+    from consult import viewer
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    rid = "20260520-fake-cli"
+    _make_run_dir(
+        tmp_path,
+        rid,
+        entries=[{
+            "slug": "alpha", "model_id": "x/y", "status": "OK",
+            "resource_uri": f"consult://runs/{rid}/responses/alpha",
+            "body_path": "/x", "latency_ms": 1, "cost_usd": 0.0,
+            "cost_known": True,
+        }],
+    )
+
+    opened: list[str] = []
+    monkeypatch.setattr(viewer.webbrowser, "open", lambda url: opened.append(url))
+    monkeypatch.setattr(sys, "argv", ["consult-view", rid])
+    viewer.cli()
+
+    out = capsys.readouterr().out.strip()
+    assert out.endswith("feed.html")
+    assert Path(out).exists()
+    assert opened == []  # --open not passed
+
+
+def test_viewer_cli_open_flag_launches_browser(tmp_path, monkeypatch, capsys):
+    """`--open` invokes webbrowser.open with the file:// URI of feed.html."""
+    from consult import viewer
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    rid = "20260520-fake-cli-open"
+    _make_run_dir(
+        tmp_path,
+        rid,
+        entries=[{
+            "slug": "alpha", "model_id": "x/y", "status": "OK",
+            "resource_uri": f"consult://runs/{rid}/responses/alpha",
+            "body_path": "/x", "latency_ms": 1, "cost_usd": 0.0,
+            "cost_known": True,
+        }],
+    )
+
+    opened: list[str] = []
+    monkeypatch.setattr(viewer.webbrowser, "open", lambda url: opened.append(url))
+    monkeypatch.setattr(sys, "argv", ["consult-view", rid, "--open"])
+    viewer.cli()
+
+    assert len(opened) == 1
+    assert opened[0].startswith("file://")
+    assert opened[0].endswith("/feed.html")
+
+
+def test_viewer_cli_missing_run_exits_with_message(tmp_path, monkeypatch, capsys):
+    """An unknown run_id surfaces as a SystemExit (exit code != 0), not a
+    raw traceback — keeps the CLI feeling like the rest of the unix tools.
+    """
+    from consult import viewer
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    monkeypatch.setattr(sys, "argv", ["consult-view", "20990101-no-such-run"])
+    with pytest.raises(SystemExit) as ei:
+        viewer.cli()
+    # SystemExit carries the message in `code` when raised with a string.
+    assert "Run not found" in str(ei.value) or "no-such-run" in str(ei.value)
+
+
+# ---- M1: Context bundle / fidelity layer -----------------------------------
+
+
+def test_context_scrub_brands_masks_known_providers():
+    """Brand-name scrubber masks model + provider names so blinded mode
+    doesn't leak identity through the prompt itself.
+    """
+    from consult import context as ctx
+
+    src = "Compare claude-opus, gpt-pro, and gemini-pro for code review on Anthropic."
+    out = ctx.scrub_brands(src)
+    for brand in ("claude", "gpt", "gemini", "Anthropic"):
+        assert brand.lower() not in out.lower(), (brand, out)
+    assert out.count("[MODEL]") >= 4
+
+
+def test_context_scrub_brands_handles_provider_prefixed_ids():
+    """Raw LiteLLM IDs like `x-ai/grok-4.3` survive a simple word-boundary
+    regex; the provider-prefix pass must catch them.
+    """
+    from consult import context as ctx
+
+    src = "I asked openrouter/x-ai/grok-4.3 and meta-llama/llama-4-maverick."
+    out = ctx.scrub_brands(src)
+    assert "x-ai" not in out.lower()
+    assert "grok" not in out.lower()
+    assert "meta-llama" not in out.lower()
+    assert "llama" not in out.lower()
+
+
+def test_context_scrub_brands_is_idempotent():
+    """Running the scrubber twice produces the same result — the
+    replacement token `[MODEL]` doesn't itself match the regex."""
+    from consult import context as ctx
+
+    src = "claude vs gpt for coding"
+    once = ctx.scrub_brands(src)
+    twice = ctx.scrub_brands(once)
+    assert once == twice
+
+
+def test_context_build_keeps_raw_when_not_blinded():
+    """When blinded=False, prompt_scrubbed equals prompt — scrubbing
+    only fires when downstream stages will actually use it."""
+    from consult import context as ctx
+
+    src = "claude vs gpt — which is better?"
+    bundle = ctx.build(src, blinded=False)
+    assert bundle.prompt == src
+    assert bundle.prompt_scrubbed == src
+    assert bundle.blinded is False
+
+
+def test_context_build_scrubs_when_blinded():
+    from consult import context as ctx
+
+    src = "claude vs gpt — which is better?"
+    bundle = ctx.build(src, blinded=True)
+    assert bundle.prompt == src  # raw preserved
+    assert "[MODEL]" in bundle.prompt_scrubbed
+    assert "claude" not in bundle.prompt_scrubbed.lower()
+    assert bundle.blinded is True
+
+
+def test_context_write_and_load_roundtrip(tmp_path, monkeypatch):
+    """A written bundle loads back byte-identically."""
+    from consult import context as ctx
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    paths = artifacts.create_run()
+    src = "Review this PR for race conditions: <DIFF>"
+    bundle = ctx.build(src, blinded=False)
+    ctx.write(paths, bundle)
+
+    loaded = ctx.load_or_none(paths)
+    assert loaded is not None
+    assert loaded.prompt == bundle.prompt
+    assert loaded.prompt_scrubbed == bundle.prompt_scrubbed
+    assert loaded.blinded == bundle.blinded
+
+
+def test_context_load_or_none_returns_none_for_legacy_run(tmp_path, monkeypatch):
+    """Legacy run dirs (no context.json) load as None so callers can fall
+    back to pre-Phase-1 behaviour rather than crashing."""
+    from consult import context as ctx
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    paths = artifacts.create_run()  # no context.write
+    assert ctx.load_or_none(paths) is None
+
+
+def test_context_trim_text_head_and_tail():
+    """Trimming preserves head + tail with a marker indicating the cut."""
+    from consult import context as ctx
+
+    src = "A" * 1000 + "BBBB" + "Z" * 1000  # distinct middle marker
+    out = ctx.trim_text(src, max_chars=400)
+    assert len(out) < len(src)
+    assert "TRIMMED" in out
+    # Head from the front; tail from the back
+    assert out.startswith("AAAA")
+    assert out.endswith("ZZZZ")
+
+
+def test_context_trim_text_under_budget_is_passthrough():
+    from consult import context as ctx
+
+    src = "small"
+    assert ctx.trim_text(src, max_chars=100) == src
+
+
+def test_context_trim_synth_input_trims_largest_body_first():
+    """When overall budget is tight, the largest body is trimmed first
+    so we recover the most slack with the least per-body signal loss."""
+    from consult import context as ctx
+
+    big = "X" * 50_000
+    small = "Y" * 1_000
+    bodies = {"big": big, "small": small}
+    new_prompt, new_bodies = ctx.trim_synth_input(
+        original_prompt="prompt", bodies=bodies, overall_budget=15_000
+    )
+    assert len(new_bodies["small"]) == 1_000  # untouched
+    assert len(new_bodies["big"]) < 50_000     # trimmed
+    assert "TRIMMED" in new_bodies["big"]
+    assert new_prompt == "prompt"               # prompt is the last resort
+
+
+def test_context_trim_synth_input_passes_through_when_under_budget():
+    from consult import context as ctx
+
+    bodies = {"a": "x" * 1000, "b": "y" * 1000}
+    new_prompt, new_bodies = ctx.trim_synth_input(
+        original_prompt="prompt", bodies=bodies, overall_budget=100_000
+    )
+    assert new_prompt == "prompt"
+    assert new_bodies == bodies
+
+
+def test_context_trim_synth_input_trims_prompt_when_bodies_at_floor():
+    """If every body is at the 5000-char floor and we're still over budget,
+    the original prompt gets trimmed too — preserving the prompt is preferred
+    but not at the cost of failing the synth call."""
+    from consult import context as ctx
+
+    bodies = {"a": "x" * 8000, "b": "y" * 8000}
+    huge_prompt = "P" * 200_000
+    new_prompt, new_bodies = ctx.trim_synth_input(
+        original_prompt=huge_prompt, bodies=bodies, overall_budget=20_000
+    )
+    assert new_prompt is not None
+    assert len(new_prompt) < len(huge_prompt)
+    assert "TRIMMED" in new_prompt
+
+
+@pytest.mark.asyncio
+async def test_synth_writes_synth_input_with_original_prompt(tmp_path, monkeypatch):
+    """End-to-end fidelity check: after a fanout+synth, the persisted
+    synth_input.txt contains the original prompt and all panellist bodies —
+    the synthesiser can fact-check claims against the source."""
+    import consult.synth as synth_mod
+    from consult import context as ctx
+    from consult.types import ManifestEntry, Status
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    paths = artifacts.create_run()
+    src = "Review this PR diff: <SIGNATURE-TOKEN-FOR-TEST>"
+    ctx.write(paths, ctx.build(src, blinded=False))
+    paths.prompt_txt.write_text(src)
+
+    # Synthetic 2-panellist manifest + bodies on disk
+    manifest = [
+        ManifestEntry(
+            slug="alpha", model_id="anthropic/claude-opus-4-7", status=Status.OK,
+            resource_uri=paths.resource_uri("alpha"),
+            body_path=str(paths.response_text("alpha")),
+            latency_ms=100, cost_known=True,
+        ),
+        ManifestEntry(
+            slug="beta", model_id="openai/gpt-5.5-pro", status=Status.OK,
+            resource_uri=paths.resource_uri("beta"),
+            body_path=str(paths.response_text("beta")),
+            latency_ms=120, cost_known=True,
+        ),
+    ]
+    paths.response_text("alpha").write_text("Found a race condition at line 42.")
+    paths.response_text("beta").write_text("Found a SQL injection at line 117.")
+    artifacts.write_manifest(paths, {
+        "run_id": paths.run_id,
+        "artifacts_dir": str(paths.root),
+        "manifest": [m.model_dump(mode="json") for m in manifest],
+        "cost_usd": 0.0,
+        "cost_known": True,
+        "wall_ms": 0,
+        "partial": False,
+        "blinded": False,
+    })
+
+    # Stub out the actual LiteLLM call — we only care about what gets written
+    # to synth_input.txt.
+    async def fake_acompletion(**kwargs):
+        from types import SimpleNamespace
+        return SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(content="STUBBED SYNTHESIS"),
+                finish_reason="stop",
+            )]
+        )
+
+    monkeypatch.setattr("consult.synth.litellm.acompletion", fake_acompletion)
+    monkeypatch.setattr(
+        "consult.synth.litellm.completion_cost", lambda completion_response: 0.0
+    )
+
+    await synth_mod.synthesise(paths.run_id)
+
+    synth_input = (paths.root / "synth_input.txt").read_text()
+    # The original prompt is now in synth_input — synthesiser can fact-check
+    assert "SIGNATURE-TOKEN-FOR-TEST" in synth_input
+    # Both panellist bodies present
+    assert "race condition at line 42" in synth_input
+    assert "SQL injection at line 117" in synth_input
+
+
+def test_synth_build_input_prepends_original_prompt_section():
+    """Unit-level: _build_input puts the original prompt before the rubric/bodies."""
+    from consult.synth import _build_input
+
+    manifest = [
+        {"slug": "alpha", "model_id": "x", "persona": None, "confidence": None,
+         "status": "OK"},
+    ]
+    bodies = {"alpha": "BODY-TEXT"}
+    out = _build_input(
+        manifest, bodies, rubric="rubric for {n} responses",
+        anonymised=False, original_prompt="PROMPT-TEXT",
+    )
+    assert "Original question / source" in out
+    assert "PROMPT-TEXT" in out
+    assert "BODY-TEXT" in out
+    assert out.index("PROMPT-TEXT") < out.index("BODY-TEXT")
+
+
+def test_synth_build_input_without_original_prompt_is_legacy_shape():
+    """Omitting original_prompt yields the pre-Phase-1 layout (rubric +
+    responses only), so legacy runs render identically."""
+    from consult.synth import _build_input
+
+    manifest = [
+        {"slug": "alpha", "model_id": "x", "persona": None, "confidence": None,
+         "status": "OK"},
+    ]
+    bodies = {"alpha": "BODY-TEXT"}
+    out = _build_input(
+        manifest, bodies, rubric="rubric for {n} responses", anonymised=False,
+    )
+    assert "Original question / source" not in out
+    assert "BODY-TEXT" in out
+
+
+def test_capsule_build_prompt_includes_original_question():
+    """The capsule extractor now sees the original question above the
+    panellist body so precise refs ("section 3.2") aren't flattened."""
+    from consult.capsule import _build_capsule_prompt
+
+    out = _build_capsule_prompt("BODY", "QUESTION-TEXT")
+    assert "QUESTION-TEXT" in out
+    assert "BODY" in out
+    assert out.index("QUESTION-TEXT") < out.index("BODY")
+
+
+def test_capsule_build_prompt_without_question_is_legacy():
+    """Omitting original_question preserves the pre-Phase-1 shape."""
+    from consult.capsule import _build_capsule_prompt
+
+    out = _build_capsule_prompt("BODY", None)
+    assert "ORIGINAL QUESTION" not in out
+    assert out.endswith("BODY")
+
+
+def test_refine_base_slug_strips_round_suffix():
+    from consult.refine import _base_slug
+
+    assert _base_slug("claude-opus-0.r2") == "claude-opus-0"
+    assert _base_slug("alpha.r3") == "alpha"
+    assert _base_slug("no-suffix") == "no-suffix"
+    assert _base_slug("name-with.dot.r1") == "name-with.dot"
+
+
+def test_refine_format_position_diff_round_one_placeholder():
+    from consult.refine import _format_position_diff
+
+    out = _format_position_diff(None, [])
+    assert "first round" in out
+
+
+def test_refine_format_position_diff_shows_changes_and_unchanged():
+    """The position-diff helper renders:
+    - unchanged stances as `unchanged`
+    - changed stances as `before:` / `after:`
+    - new panellists this round
+    - dropped panellists from prior round
+    """
+    from consult.refine import _format_position_diff
+    from consult.types import Capsule, ManifestEntry, Status
+
+    def entry(slug: str, position: str) -> ManifestEntry:
+        return ManifestEntry(
+            slug=slug, status=Status.OK,
+            resource_uri=f"consult://runs/x/responses/{slug}",
+            body_path=f"/x/{slug}",
+            capsule=Capsule(position=position),
+        )
+
+    prior = [
+        entry("alpha.r1", "ship now"),
+        entry("beta.r1", "needs review"),
+        entry("gamma.r1", "dropping out"),
+    ]
+    current = [
+        entry("alpha.r2", "ship now"),  # unchanged
+        entry("beta.r2", "ready to merge"),  # changed
+        entry("delta.r2", "joined late"),  # new this round
+        # gamma is missing this round
+    ]
+    out = _format_position_diff(prior, current)
+    assert "alpha: unchanged" in out
+    assert "beta:" in out and "before: needs review" in out and "after:  ready to merge" in out
+    assert "delta (new this round)" in out
+    assert "gamma (dropped this round" in out
+
+
+def test_runner_writes_context_bundle_at_run_init(tmp_path, monkeypatch):
+    """`runner.fanout` writes context.json alongside prompt.txt — every
+    fresh run has a bundle downstream stages can load.
+    """
+    import asyncio
+
+    from consult import context as ctx
+    from consult.runner import fanout
+    from consult.types import ModelSpec
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    # dry_run avoids any API call but still triggers run-init.
+    handle = asyncio.run(fanout(
+        "test prompt with claude reference",
+        [ModelSpec(model="claude-haiku")],
+        dry_run=True,
+        blinded=True,
+    ))
+    paths = artifacts.load_run(handle.run_id)
+    bundle = ctx.load_or_none(paths)
+    assert bundle is not None
+    assert bundle.prompt == "test prompt with claude reference"
+    assert bundle.blinded is True
+    # Blinded mode scrubbed the brand from prompt_scrubbed
+    assert "claude" not in bundle.prompt_scrubbed.lower()
+    assert "[MODEL]" in bundle.prompt_scrubbed
+
+
+# ---- M2: Schema versioning, rubric registry, capsule kinds, streaming ------
+
+
+def test_manifest_carries_schema_version():
+    """Every RunHandle / RunResult / RefineResult dump includes
+    `schema_version` so future capsule-shape additions are detectable by
+    clients without out-of-band coordination."""
+    from consult.types import RefineResult, RunHandle, RunResult
+
+    rh = RunHandle(
+        run_id="x", artifacts_dir="/x", manifest=[],
+        cost_usd=0.0, wall_ms=0,
+    )
+    assert rh.model_dump()["schema_version"] >= 2
+
+    rr = RunResult(
+        run_id="x", synthesis="s", manifest=[], cost_usd=0.0, wall_ms=0,
+    )
+    assert rr.model_dump()["schema_version"] >= 2
+
+    rfr = RefineResult(
+        run_id="x", rounds_completed=0, final_manifest=[], verdicts=[],
+        synthesis="s", converged=False, threshold=0.85,
+        cost_usd=0.0, wall_ms=0,
+    )
+    assert rfr.model_dump()["schema_version"] >= 2
+
+
+def test_legacy_capsule_dict_without_kind_loads_as_decision():
+    """Pre-M2 manifest entries don't have `capsule.kind`. The ManifestEntry
+    pre-validator must inject it so they parse as decision capsules."""
+    from consult.types import ManifestEntry
+
+    legacy_payload = {
+        "slug": "alpha",
+        "status": "OK",
+        "resource_uri": "consult://runs/x/responses/alpha",
+        "body_path": "/x/alpha",
+        "capsule": {
+            "position": "ship it",
+            "recommendation": "merge",
+            "key_points": [],
+            "unique_claims": [],
+            "caveats": [],
+            "agrees_with": [],
+            "disagrees_with": [],
+            "confidence": 0.8,
+        },
+    }
+    entry = ManifestEntry.model_validate(legacy_payload)
+    assert entry.capsule is not None
+    assert entry.capsule.kind == "decision"
+    assert entry.capsule.position == "ship it"
+
+
+def test_review_capsule_round_trips():
+    from consult.types import Finding, ManifestEntry, ReviewCapsule
+
+    review = ReviewCapsule(
+        findings=[
+            Finding(
+                severity="blocker", file="src/auth.py", line_range=(42, 58),
+                category="security", summary="SQL injection in login",
+                suggestion="use parameterised query",
+            ),
+        ],
+        overall_verdict="changes_requested",
+        confidence=0.9,
+    )
+    entry = ManifestEntry(
+        slug="alpha", status="OK",
+        resource_uri="consult://runs/x/responses/alpha", body_path="/x",
+        capsule=review,
+    )
+    dumped = entry.model_dump()
+    assert dumped["capsule"]["kind"] == "review"
+    assert dumped["capsule"]["overall_verdict"] == "changes_requested"
+    # Round-trip through validation
+    reloaded = ManifestEntry.model_validate(dumped)
+    assert reloaded.capsule.kind == "review"
+    assert reloaded.capsule.findings[0].file == "src/auth.py"
+
+
+def test_research_capsule_round_trips():
+    from consult.types import ManifestEntry, ResearchCapsule
+
+    research = ResearchCapsule(
+        claims=["Polars is faster for groupby on 10GB+"],
+        evidence=["TPC-H q3 benchmark from polars team"],
+        uncertainties=["Memory headroom at 100GB unknown"],
+        sources_cited=["https://pola.rs/blog/..."],
+        confidence=0.7,
+    )
+    entry = ManifestEntry(
+        slug="alpha", status="OK",
+        resource_uri="consult://runs/x/responses/alpha", body_path="/x",
+        capsule=research,
+    )
+    dumped = entry.model_dump()
+    assert dumped["capsule"]["kind"] == "research"
+    reloaded = ManifestEntry.model_validate(dumped)
+    assert reloaded.capsule.kind == "research"
+    assert "Polars" in reloaded.capsule.claims[0]
+
+
+def test_capsule_kind_picks_correct_prompt_head():
+    """The extractor's prompt head varies by kind — verify the dispatch."""
+    from consult.capsule import (
+        _CAPSULE_PROMPT_HEAD_DECISION,
+        _CAPSULE_PROMPT_HEAD_RESEARCH,
+        _CAPSULE_PROMPT_HEAD_REVIEW,
+        _build_capsule_prompt,
+    )
+
+    body = "BODY-TEXT"
+    decision_p = _build_capsule_prompt(body, None, kind="decision")
+    review_p = _build_capsule_prompt(body, None, kind="review")
+    research_p = _build_capsule_prompt(body, None, kind="research")
+    assert _CAPSULE_PROMPT_HEAD_DECISION.split("\n")[0] in decision_p
+    assert _CAPSULE_PROMPT_HEAD_REVIEW.split("\n")[0] in review_p
+    assert _CAPSULE_PROMPT_HEAD_RESEARCH.split("\n")[0] in research_p
+    # Unknown kinds default to decision (so a typo doesn't silently produce
+    # zero-data capsules).
+    assert _CAPSULE_PROMPT_HEAD_DECISION.split("\n")[0] in _build_capsule_prompt(
+        body, None, kind="nonsense"
+    )
+
+
+def test_registry_resolve_rubric_loads_named_packaged_rubrics():
+    """The four packaged rubrics resolve by name."""
+    from consult import registry as reg
+
+    for name in ("consensus", "code_review", "research_brief", "critique"):
+        text = reg.resolve_rubric(name)
+        assert "{n}" in text, f"rubric {name} should have an n-placeholder"
+        # Should look like a real rubric, not a one-line stub
+        assert len(text) > 200, f"rubric {name} suspiciously short: {len(text)}"
+
+
+def test_registry_resolve_rubric_passes_literal_through():
+    """Unknown names → returned as-is (literal rubric)."""
+    from consult import registry as reg
+
+    literal = "You have {n} responses. Write a haiku."
+    assert reg.resolve_rubric(literal) == literal
+
+
+def test_registry_list_rubrics_includes_packaged():
+    from consult import registry as reg
+
+    rubrics = reg.list_rubrics()
+    for expected in ("consensus", "code_review", "research_brief", "critique"):
+        assert expected in rubrics, (expected, rubrics)
+
+
+def test_progress_panellist_partial_event_message():
+    """The new PanellistPartial event has a stable wire message."""
+    from consult.progress import PanellistPartial, event_message
+
+    ev = PanellistPartial(
+        done=2, total=8, slug="alpha", chars_so_far=1500, elapsed_ms=4200
+    )
+    msg = event_message(ev)
+    assert "alpha" in msg
+    assert "1500" in msg
+    assert "4200" in msg
+
+
+@pytest.mark.asyncio
+async def test_fanout_stream_env_var_enables_streaming(tmp_path, monkeypatch):
+    """The CONSULT_STREAM env var flips fanout's `stream` default on so
+    callers can opt into streaming without changing their tool call."""
+    from consult.runner import fanout
+    from consult.types import ManifestEntry, ModelSpec, Status
+
+    captured: dict[str, bool] = {}
+
+    async def fake_call(spec, slug, per_prompt, paths, provider_sems=None, *, stream=False, on_partial=None):
+        captured["stream"] = stream
+        paths.response_text(slug).write_text("body")
+        return ManifestEntry(
+            slug=slug, status=Status.OK,
+            resource_uri=paths.resource_uri(slug),
+            body_path=str(paths.response_text(slug)),
+            latency_ms=10, cost_known=True,
+        )
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    monkeypatch.setattr("consult.runner._call_one", fake_call)
+    monkeypatch.setenv("CONSULT_STREAM", "1")
+
+    await fanout("hi", [ModelSpec(model="claude-haiku")])
+    assert captured.get("stream") is True
+
+
+@pytest.mark.asyncio
+async def test_fanout_stream_default_off(tmp_path, monkeypatch):
+    """Without CONSULT_STREAM or explicit stream=True, streaming stays off."""
+    from consult.runner import fanout
+    from consult.types import ManifestEntry, ModelSpec, Status
+
+    captured: dict[str, bool] = {}
+
+    async def fake_call(spec, slug, per_prompt, paths, provider_sems=None, *, stream=False, on_partial=None):
+        captured["stream"] = stream
+        paths.response_text(slug).write_text("body")
+        return ManifestEntry(
+            slug=slug, status=Status.OK,
+            resource_uri=paths.resource_uri(slug),
+            body_path=str(paths.response_text(slug)),
+            latency_ms=10, cost_known=True,
+        )
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    monkeypatch.setattr("consult.runner._call_one", fake_call)
+    monkeypatch.delenv("CONSULT_STREAM", raising=False)
+
+    await fanout("hi", [ModelSpec(model="claude-haiku")])
+    assert captured.get("stream") is False
+
+
+# ---- M3: Labelled attachments, git-diff resolver, per-step sequence ---------
+
+
+def test_render_attachment_bare_string_renders_path_and_content(tmp_path):
+    """Bare string attachment paths still work (backwards compat)."""
+    from consult.server import _render_attachment
+
+    f = tmp_path / "foo.py"
+    f.write_text("print('hi')")
+    out = _render_attachment(str(f))
+    assert str(f) in out
+    assert "print('hi')" in out
+    assert "```" in out  # code-fenced
+
+
+def test_render_attachment_labelled_renders_label_heading(tmp_path):
+    """Labelled attachments render `## LABEL: path` headers so panellists
+    can refer to sections by name."""
+    from consult.server import _render_attachment
+
+    f = tmp_path / "auth.py"
+    f.write_text("def login(): pass")
+    out = _render_attachment({"path": str(f), "label": "AUTH_MODULE", "kind": "source"})
+    assert "## AUTH_MODULE" in out
+    assert str(f) in out
+    assert "def login()" in out
+
+
+def test_render_attachment_kind_hints_fence_language(tmp_path):
+    """`kind: "diff"` produces a ```diff fence so the panellist sees the
+    syntax-highlighting hint."""
+    from consult.server import _render_attachment
+
+    f = tmp_path / "patch.diff"
+    f.write_text("--- a/foo\n+++ b/foo\n@@ +1\n+hello")
+    out = _render_attachment({"path": str(f), "kind": "diff"})
+    assert "```diff" in out
+
+
+def test_render_attachment_missing_file_renders_error_not_crash(tmp_path):
+    """A missing file produces an inline error marker — the rest of the
+    panel still runs."""
+    from consult.server import _render_attachment
+
+    out = _render_attachment(str(tmp_path / "nonexistent.py"))
+    assert "ERROR" in out
+    assert "nonexistent.py" in out
+
+
+def test_render_attachment_malformed_dict_surfaces_error():
+    """A dict without `path` or `source` keys surfaces an error rather
+    than crashing the whole tool call."""
+    from consult.server import _render_attachment
+
+    out = _render_attachment({"foo": "bar"})
+    assert "ERROR" in out
+
+
+def test_inline_attachments_renders_each_item():
+    """`_inline_attachments` chains render output and prepends the
+    --- ATTACHMENTS --- divider."""
+    from consult.server import _inline_attachments
+
+    out = _inline_attachments("PROMPT", [])
+    # Empty list → no divider added (kept as passthrough)
+    assert out == "PROMPT"
+
+
+def test_sources_validate_ref_rejects_shell_metachars():
+    """Refs with shell metacharacters must not flow to subprocess."""
+    from consult.sources import _validate_ref
+
+    # Valid refs
+    for good in ("main", "refs/heads/feature/x", "v1.0.0", "abc123", "feat+x"):
+        _validate_ref(good, field="base")
+
+    # Invalid refs — anything outside [A-Za-z0-9._/+-] is rejected
+    for bad in ("main; rm -rf /", "main$(id)", "main`whoami`", "main|cat", "main\nfoo"):
+        with pytest.raises(ValueError, match="invalid base"):
+            _validate_ref(bad, field="base")
+
+
+def test_sources_validate_repo_path_enforces_trusted_roots(tmp_path, monkeypatch):
+    """`repo_path` must resolve under CONSULT_TRUSTED_REPO_ROOTS."""
+    from consult.sources import _validate_repo_path
+
+    trusted = tmp_path / "trusted"
+    trusted.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+
+    monkeypatch.setenv("CONSULT_TRUSTED_REPO_ROOTS", str(trusted))
+
+    # Inside the trusted root → returns the resolved path
+    assert _validate_repo_path(str(trusted)) == trusted.resolve()
+
+    # Outside the trusted root → raises with a helpful message
+    with pytest.raises(ValueError, match="not under any CONSULT_TRUSTED_REPO_ROOTS"):
+        _validate_repo_path(str(outside))
+
+
+def test_sources_validate_repo_path_defaults_to_cwd(tmp_path, monkeypatch):
+    """Without CONSULT_TRUSTED_REPO_ROOTS, only the current cwd is trusted."""
+    from consult.sources import _validate_repo_path
+
+    monkeypatch.delenv("CONSULT_TRUSTED_REPO_ROOTS", raising=False)
+    monkeypatch.chdir(tmp_path)
+
+    # cwd works
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    assert _validate_repo_path(str(sub)) == sub.resolve()
+
+    # Outside cwd fails
+    elsewhere = tmp_path.parent / "elsewhere"
+    elsewhere.mkdir(exist_ok=True)
+    with pytest.raises(ValueError):
+        _validate_repo_path(str(elsewhere))
+
+
+def test_sources_resolve_git_diff_against_real_repo(tmp_path, monkeypatch):
+    """End-to-end: init a real git repo, commit a file, modify it, and
+    confirm resolve_git_diff returns the expected diff text."""
+    import subprocess
+
+    from consult.sources import resolve_git_diff
+
+    monkeypatch.setenv("CONSULT_TRUSTED_REPO_ROOTS", str(tmp_path))
+    # Init repo
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test"], cwd=tmp_path, check=True
+    )
+    # First commit
+    (tmp_path / "hello.py").write_text("print('hi')\n")
+    subprocess.run(["git", "add", "hello.py"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=tmp_path, check=True)
+    # Change + new commit
+    (tmp_path / "hello.py").write_text("print('hello, world')\n")
+    subprocess.run(["git", "commit", "-aq", "-m", "change"], cwd=tmp_path, check=True)
+
+    diff = resolve_git_diff("HEAD~1", "HEAD", repo_path=str(tmp_path))
+    assert "hello.py" in diff
+    assert "-print('hi')" in diff
+    assert "+print('hello, world')" in diff
+
+
+@pytest.mark.asyncio
+async def test_handle_sequence_per_step_attachments(tmp_path, monkeypatch):
+    """A sequence with object-form prompts can carry per-step attachments
+    that override the top-level default."""
+    from consult.server import _handle_sequence
+
+    # Stub out the underlying sequence to capture what prompts arrive.
+    captured: dict[str, list[str]] = {}
+
+    async def fake_sequence(prompts, specs, **kwargs):
+        from consult.sequence import SequenceResult
+        captured["prompts"] = list(prompts)
+        return SequenceResult(
+            steps=[], final_synthesis="", cost_usd=0.0, cost_known=True, wall_ms=0,
+        )
+
+    monkeypatch.setattr("consult.server.sequence_mod.sequence", fake_sequence)
+
+    f_default = tmp_path / "default.txt"
+    f_default.write_text("DEFAULT-CONTENT")
+    f_step2 = tmp_path / "step2.txt"
+    f_step2.write_text("STEP2-CONTENT")
+
+    args = {
+        "prompts": [
+            "step 1 prompt",  # bare string → uses default attachments
+            {"prompt": "step 2 prompt", "attachments": [str(f_step2)]},  # override
+            {"prompt": "step 3 prompt"},  # no override → uses default
+        ],
+        "models": [{"model": "claude-haiku"}],
+        "attachments": [str(f_default)],
+    }
+    await _handle_sequence(args)
+
+    p1, p2, p3 = captured["prompts"]
+    # Step 1 sees the default attachment
+    assert "DEFAULT-CONTENT" in p1
+    assert "STEP2-CONTENT" not in p1
+    # Step 2 sees only its own attachment, not the default
+    assert "STEP2-CONTENT" in p2
+    assert "DEFAULT-CONTENT" not in p2
+    # Step 3 falls back to the default (no override)
+    assert "DEFAULT-CONTENT" in p3
 
 
 # ---- Live tests (gated on API keys) ----------------------------------------

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from enum import StrEnum
 from math import ceil
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -43,14 +44,20 @@ class ModelSpec(BaseModel):
 
 
 class Capsule(BaseModel):
-    """Structured ~200-token extract from a panellist response.
+    """Structured ~200-token extract from a panellist response (decision shape).
 
     Designed so the parent agent can synthesise from the manifest alone in
     most cases, only reading full bodies when it needs depth.
+
+    `kind="decision"` discriminates this from `ReviewCapsule` and
+    `ResearchCapsule` in the `AnyCapsule` discriminated union. Defaulted
+    so callers that construct `Capsule()` directly (legacy code, tests)
+    don't need to thread the literal through.
     """
 
     model_config = _STRICT
 
+    kind: Literal["decision"] = "decision"
     position: str = Field("", description="One-line summary of stance/conclusion")
     recommendation: str = Field("", description="What the panellist recommends")
     key_points: list[str] = Field(default_factory=list)
@@ -61,6 +68,70 @@ class Capsule(BaseModel):
     agrees_with: list[str] = Field(default_factory=list, description="Slugs this agrees with")
     disagrees_with: list[str] = Field(default_factory=list, description="Slugs this disagrees with")
     confidence: float | None = Field(None, ge=0.0, le=1.0)
+
+
+class Finding(BaseModel):
+    """One line-anchored review finding (used by ReviewCapsule)."""
+
+    model_config = _STRICT
+
+    severity: Literal["blocker", "major", "minor", "nit", "praise"]
+    file: str | None = Field(None, description="File path, if the finding is file-specific.")
+    line_range: tuple[int, int] | None = Field(
+        None,
+        description="(start, end) line range, if known. Use start=end for a single line.",
+    )
+    category: Literal[
+        "security", "performance", "correctness", "style", "maintainability", "tests", "docs"
+    ]
+    summary: str = Field(..., description="≤30 words summarising the finding.")
+    suggestion: str = Field("", description="≤30 words on the specific change.")
+
+
+class ReviewCapsule(BaseModel):
+    """Structured extract for code/PR review panels.
+
+    Use `capsule_kind="review"` on `panel`/`consult`/`refine` to ask the
+    extractor to produce this shape instead of the decision-shape `Capsule`.
+    """
+
+    model_config = _STRICT
+
+    kind: Literal["review"] = "review"
+    findings: list[Finding] = Field(default_factory=list)
+    overall_verdict: Literal["ship", "changes_requested", "discuss"] = "discuss"
+    confidence: float | None = Field(None, ge=0.0, le=1.0)
+
+
+class ResearchCapsule(BaseModel):
+    """Structured extract for research-question panels.
+
+    Use `capsule_kind="research"` on `panel`/`consult`/`refine`. Suits
+    workflows where the panel surveys evidence rather than picks a stance.
+    """
+
+    model_config = _STRICT
+
+    kind: Literal["research"] = "research"
+    claims: list[str] = Field(default_factory=list, description="The panellist's main assertions.")
+    evidence: list[str] = Field(default_factory=list, description="What backs each claim.")
+    uncertainties: list[str] = Field(
+        default_factory=list, description="Where the panellist is genuinely unsure."
+    )
+    sources_cited: list[str] = Field(
+        default_factory=list, description="URLs, papers, or vendor docs named in the body."
+    )
+    confidence: float | None = Field(None, ge=0.0, le=1.0)
+
+
+# Discriminated union over capsule variants. Pydantic dispatches based on the
+# `kind` field. Legacy capsule dicts (manifest.json from before kind existed)
+# are handled by ManifestEntry's pre-validator which injects `kind="decision"`
+# when absent.
+AnyCapsule = Annotated[
+    Capsule | ReviewCapsule | ResearchCapsule,
+    Field(discriminator="kind"),
+]
 
 
 class ManifestEntry(BaseModel):
@@ -82,7 +153,7 @@ class ManifestEntry(BaseModel):
     persona: str | None = None
     status: Status
     finish_reason: str | None = None
-    capsule: Capsule | None = None
+    capsule: AnyCapsule | None = None
     confidence: float | None = Field(None, ge=0.0, le=1.0)
     resource_uri: str = Field(..., description="consult://runs/<id>/responses/<slug>")
     body_path: str = Field(..., description="On-disk path for direct access")
@@ -93,6 +164,20 @@ class ManifestEntry(BaseModel):
     cost_known: bool = True
     error: str | None = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def _default_capsule_kind(cls, data):
+        """Inject `kind="decision"` into legacy capsule dicts that predate the
+        discriminated union. Without this, manifest.json files written before
+        M2 fail to validate because the discriminator field is absent.
+        """
+        if isinstance(data, dict):
+            cap = data.get("capsule")
+            if isinstance(cap, dict) and "kind" not in cap:
+                # Copy to avoid mutating the caller's dict, then add kind.
+                data = {**data, "capsule": {**cap, "kind": "decision"}}
+        return data
+
     @model_validator(mode="after")
     def _validate_status_payload(self) -> ManifestEntry:
         if self.status in (Status.ERROR, Status.TIMEOUT) and not self.error:
@@ -102,11 +187,22 @@ class ManifestEntry(BaseModel):
         return self
 
 
+_MANIFEST_SCHEMA_VERSION = 2
+
+
 class RunHandle(BaseModel):
-    """Returned by `panel`. Manifest-only — no raw bodies inlined."""
+    """Returned by `panel`. Manifest-only — no raw bodies inlined.
+
+    `schema_version=2` indicates a manifest whose `capsule` field may be
+    any member of the `Capsule | ReviewCapsule | ResearchCapsule` discriminated
+    union. v1 manifests (pre-M2) contained only decision-shape `Capsule`
+    entries; clients pinned to v1 should check `schema_version` before
+    structurally parsing `capsule.*`.
+    """
 
     model_config = _STRICT
 
+    schema_version: int = Field(_MANIFEST_SCHEMA_VERSION, ge=1)
     run_id: str
     artifacts_dir: str
     manifest: list[ManifestEntry]
@@ -157,6 +253,7 @@ class RunResult(BaseModel):
 
     model_config = _STRICT
 
+    schema_version: int = Field(_MANIFEST_SCHEMA_VERSION, ge=1)
     run_id: str
     synthesis: str
     manifest: list[ManifestEntry]
@@ -215,6 +312,7 @@ class RefineResult(BaseModel):
 
     model_config = _STRICT
 
+    schema_version: int = Field(_MANIFEST_SCHEMA_VERSION, ge=1)
     run_id: str
     rounds_completed: int = Field(..., ge=0)
     final_manifest: list[ManifestEntry]

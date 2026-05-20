@@ -45,6 +45,21 @@ class PanellistCompleted(_BaseProgressEvent):
     latency_ms: int = Field(..., ge=0)
 
 
+class PanellistPartial(_BaseProgressEvent):
+    """Mid-stream chunk indicator from a panellist.
+
+    Emitted only when `fanout(stream=True)` is requested. Lets MCP clients
+    show liveness during long panel runs without waiting for the full
+    response. Carries cumulative chars (not the chunk content itself —
+    sending raw chunks would balloon the progress channel).
+    """
+
+    kind: Literal["panellist_partial"] = "panellist_partial"
+    slug: str
+    chars_so_far: int = Field(..., ge=0)
+    elapsed_ms: int = Field(..., ge=0)
+
+
 class CapsuleExtracted(_BaseProgressEvent):
     """The cheap extractor produced (or failed to produce) a Capsule for one slug."""
 
@@ -87,7 +102,7 @@ class SequenceStepCompleted(_BaseProgressEvent):
 
 
 ProgressEvent = Annotated[
-    PanellistCompleted | CapsuleExtracted | ArbiterScored | SynthStarted | SynthCompleted | SequenceStepStarted | SequenceStepCompleted,
+    PanellistCompleted | PanellistPartial | CapsuleExtracted | ArbiterScored | SynthStarted | SynthCompleted | SequenceStepStarted | SequenceStepCompleted,
     Field(discriminator="kind"),
 ]
 
@@ -99,6 +114,8 @@ def event_message(event: ProgressEvent) -> str:
     """
     if isinstance(event, PanellistCompleted):
         return f"{event.slug}: {event.status}"
+    if isinstance(event, PanellistPartial):
+        return f"{event.slug}: streaming ({event.chars_so_far} chars / {event.elapsed_ms}ms)"
     if isinstance(event, CapsuleExtracted):
         return f"capsule {event.slug}"
     if isinstance(event, ArbiterScored):

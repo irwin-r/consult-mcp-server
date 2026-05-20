@@ -93,6 +93,38 @@ def default_max_run_usd() -> float:
     return float(models_config().get("defaults", {}).get("max_run_usd", 5.0))
 
 
+def list_rubrics() -> list[str]:
+    """List available rubric names (user overrides + package defaults)."""
+    seen: set[str] = set()
+    for d in (_USER_CONFIG / "rubrics", _PKG_CONFIG / "rubrics"):
+        if d.exists():
+            for p in d.glob("*.md"):
+                seen.add(p.stem)
+    return sorted(seen)
+
+
+def resolve_rubric(name_or_text: str) -> str:
+    """Resolve a rubric reference.
+
+    Lookup order (user overrides first, then package defaults):
+    1. `~/.consult/rubrics/<name>.md`
+    2. `consult/config/rubrics/<name>.md`
+    3. Otherwise return `name_or_text` as a literal rubric string — preserves
+       backwards compat with `synthesise(rubric=<literal multi-line string>)`.
+
+    Callers passing an unknown short name get the literal back; that will
+    show up clearly in `synth_input.txt`. Use `list_rubrics()` to discover
+    the available named rubrics.
+    """
+    user_path = _USER_CONFIG / "rubrics" / f"{name_or_text}.md"
+    if user_path.exists():
+        return user_path.read_text()
+    pkg_path = _PKG_CONFIG / "rubrics" / f"{name_or_text}.md"
+    if pkg_path.exists():
+        return pkg_path.read_text()
+    return name_or_text
+
+
 def provider_concurrency() -> dict[str, int]:
     """Returns provider → max concurrent in-flight LiteLLM calls.
 

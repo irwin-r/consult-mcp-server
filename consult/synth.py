@@ -14,13 +14,15 @@ from typing import Any
 
 import litellm
 
-from . import artifacts, registry
+from . import artifacts, context, registry
 from .runner import _build_messages
 from .types import Status
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_RUBRIC = """\
+# Defensive fallback if the package's consensus.md is missing on disk
+# (broken install, etc). Kept in sync with consult/config/rubrics/consensus.md.
+_FALLBACK_CONSENSUS_RUBRIC = """\
 You have {n} expert responses below. Synthesise them under this rubric:
 
 # Consensus
@@ -45,12 +47,28 @@ Be specific. Quote when it helps. Down-weight responses tagged TRUNCATED or with
 """
 
 
+def _resolve_rubric(rubric: str | None) -> str:
+    """Pick a rubric: named lookup, literal passthrough, or the fallback."""
+    if rubric is None:
+        rubric = "consensus"
+    resolved = registry.resolve_rubric(rubric)
+    # `resolve_rubric` returns the input string verbatim when no file matched.
+    # For the "consensus" default, fall back to the in-process constant so a
+    # missing rubrics dir doesn't ship a literal "consensus" string to the
+    # synth model. Custom literals (multi-line strings the caller composed
+    # themselves) pass through unchanged.
+    if rubric == "consensus" and resolved == "consensus":
+        return _FALLBACK_CONSENSUS_RUBRIC
+    return resolved
+
+
 def _build_input(
     manifest: list[dict[str, Any]],
     bodies: dict[str, str],
     *,
     rubric: str,
     anonymised: bool,
+    original_prompt: str | None = None,
 ) -> str:
     usable = [m for m in manifest if m["status"] in (Status.OK.value, Status.TRUNCATED.value)]
     header = rubric.format(n=len(usable))
@@ -67,7 +85,12 @@ def _build_input(
             label = f"[{slug} ({mid}) | persona={persona} | confidence={conf} | status={status}]"
         body = bodies.get(slug, "")
         blocks.append(f"{label}\n{body.strip()}")
-    return header + "\n\n---\nRESPONSES:\n\n" + "\n\n".join(blocks)
+    parts: list[str] = []
+    if original_prompt:
+        parts.append("## Original question / source\n\n" + original_prompt + "\n\n---\n\n")
+    parts.append(header)
+    parts.append("\n\n---\nRESPONSES:\n\n" + "\n\n".join(blocks))
+    return "".join(parts)
 
 
 async def synthesise(
@@ -85,8 +108,29 @@ async def synthesise(
         for m in manifest
         if m["status"] in (Status.OK.value, Status.TRUNCATED.value)
     }
-    rub = rubric or _DEFAULT_RUBRIC
-    synth_input = _build_input(manifest, bodies, rubric=rub, anonymised=anonymised)
+    rub = _resolve_rubric(rubric)
+    # Load the per-run context bundle so the synthesiser can fact-check
+    # panellist claims against the source. Legacy runs (pre-Phase 1)
+    # have no context.json; in that case the prompt is simply omitted
+    # and the synthesis proceeds with bodies only (pre-Phase-1 behaviour).
+    bundle = context.load_or_none(paths)
+    original_prompt = (
+        bundle.prompt_for_downstream(anonymised=anonymised) if bundle else None
+    )
+    # Apply the per-stage input budget — trims the longest bodies first,
+    # then the original prompt as a last resort. Silently passing 1MB+
+    # of source material to a model with a 200K context would either
+    # fail at the API or drop the response, neither of which we want.
+    original_prompt, bodies = context.trim_synth_input(
+        original_prompt=original_prompt, bodies=bodies
+    )
+    synth_input = _build_input(
+        manifest,
+        bodies,
+        rubric=rub,
+        anonymised=anonymised,
+        original_prompt=original_prompt,
+    )
     # Persist for reproducibility
     (paths.root / "synth_input.txt").write_text(synth_input)
 

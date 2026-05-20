@@ -20,8 +20,8 @@ from typing import Any
 
 import litellm
 
-from . import artifacts, registry
-from .progress import PanellistCompleted, ProgressEvent
+from . import artifacts, context, registry
+from .progress import PanellistCompleted, PanellistPartial, ProgressEvent
 from .status import classify
 from .types import ManifestEntry, ModelSpec, RunHandle, Status
 
@@ -232,12 +232,71 @@ def _make_slug(spec: ModelSpec, idx: int, blinded: bool) -> str:
     return f"{base}-{idx}" if idx > 0 else base
 
 
+_STREAM_PARTIAL_INTERVAL_S = float(os.environ.get("CONSULT_STREAM_PARTIAL_INTERVAL_S", 1.0))
+
+
+async def _stream_acompletion(
+    *,
+    timeout: float,
+    on_partial: Callable[[int, int], Awaitable[None]] | None,
+    start: float,
+    **kwargs: Any,
+) -> Any:
+    """Streaming variant of `_acompletion_with_retry`.
+
+    Streams chunks from LiteLLM, accumulates them, and uses
+    `litellm.stream_chunk_builder` to reconstruct a single response object
+    compatible with `litellm.completion_cost` and `classify()`. Emits
+    progress callbacks throttled to ~`_STREAM_PARTIAL_INTERVAL_S`.
+
+    Retry is NOT layered on top of streaming — a rate-limit mid-stream is
+    rare and recovering it well requires re-emitting partials, which adds
+    complexity without much practical benefit. Falls back to the synthetic
+    response object on the happy path.
+    """
+    stream = await litellm.acompletion(stream=True, **kwargs)
+    chunks: list[Any] = []
+    body = ""
+    last_emit = time.monotonic()
+
+    async def _read():
+        nonlocal body, last_emit
+        async for chunk in stream:
+            chunks.append(chunk)
+            try:
+                delta = chunk.choices[0].delta.content if chunk.choices else None
+            except (AttributeError, IndexError):
+                delta = None
+            if delta:
+                body += delta
+            now = time.monotonic()
+            if on_partial is not None and (now - last_emit) >= _STREAM_PARTIAL_INTERVAL_S:
+                last_emit = now
+                try:
+                    await on_partial(len(body), int((time.time() - start) * 1000))
+                except Exception as e:  # noqa: BLE001 — best-effort
+                    logger.debug("partial callback failed: %s", e)
+
+    await asyncio.wait_for(_read(), timeout=timeout)
+
+    # Reconstruct a single ModelResponse so the rest of `_call_one` can
+    # treat the streamed call identically to the non-streamed path.
+    try:
+        return litellm.stream_chunk_builder(chunks, messages=kwargs.get("messages"))
+    except Exception as e:  # noqa: BLE001
+        logger.warning("stream_chunk_builder failed: %s — using last chunk", e)
+        return chunks[-1] if chunks else None
+
+
 async def _call_one(
     spec: ModelSpec,
     slug: str,
     per_slug_prompt: str,
     paths: artifacts.RunPaths,
     provider_sems: dict[str, asyncio.Semaphore] | None = None,
+    *,
+    stream: bool = False,
+    on_partial: Callable[[int, int], Awaitable[None]] | None = None,
 ) -> ManifestEntry:
     # An unknown alias must fail this single panellist, not the whole panel.
     # `asyncio.gather` without return_exceptions=True would otherwise cancel
@@ -296,13 +355,24 @@ async def _call_one(
 
     try:
         async with sem if sem is not None else nullcontext():
-            resp = await _acompletion_with_retry(
-                timeout=timeout,
-                model=litellm_id,
-                messages=_build_messages(per_slug_prompt, provider),
-                max_tokens=budget,
-                **extra,
-            )
+            if stream:
+                resp = await _stream_acompletion(
+                    timeout=timeout,
+                    on_partial=on_partial,
+                    start=start,
+                    model=litellm_id,
+                    messages=_build_messages(per_slug_prompt, provider),
+                    max_tokens=budget,
+                    **extra,
+                )
+            else:
+                resp = await _acompletion_with_retry(
+                    timeout=timeout,
+                    model=litellm_id,
+                    messages=_build_messages(per_slug_prompt, provider),
+                    max_tokens=budget,
+                    **extra,
+                )
         # Persist raw response — use model_dump for Pydantic, fall back to dict
         try:
             raw = resp.model_dump()  # type: ignore[attr-defined]
@@ -329,7 +399,7 @@ async def _call_one(
         cost_known = True  # no call was billable
     except Exception as e:  # noqa: BLE001 — LiteLLM raises many concrete types
         status, finish, body = classify(None, exception=e)
-        error = str(e)[:500] or f"{type(e).__name__}"
+        error = str(e)[:4096] or f"{type(e).__name__}"
         cost_known = True  # no call was billable
 
     paths.response_text(slug).write_text(body)
@@ -432,6 +502,7 @@ async def fanout(
     max_run_usd: float | None = None,
     existing_paths: artifacts.RunPaths | None = None,
     on_progress: ProgressCallback | None = None,
+    stream: bool = False,
 ) -> RunHandle:
     """Parallel fan-out. Creates a fresh run by default. Pass `existing_paths`
     to write into an existing run dir (used by `refine` to keep all rounds
@@ -444,11 +515,21 @@ async def fanout(
     # Resolve `model:N` sugar BEFORE estimate_cost so the cap reflects the
     # real panel size, not the pre-expansion request count.
     specs = expand_specs(specs)
+    # Env-var override for streaming — lets a user enable streaming across
+    # every fanout (incl. the ones nested inside consult/refine/sequence)
+    # without changing the tool-call surface.
+    if not stream and os.environ.get("CONSULT_STREAM", "0") == "1":
+        stream = True
     if existing_paths is None:
         paths = artifacts.create_run()
         paths.prompt_txt.write_text(prompt)
         # Snapshot the registry so replays are stable
         paths.registry_snapshot.write_text(json.dumps(registry.models_config(), indent=2))
+        # Single immutable per-run context bundle. Downstream stages
+        # (synth, capsule, arbiter) load this rather than re-receiving
+        # the prompt — keeps the blinding scrub centralised and avoids
+        # silent prompt-prompt skew across stages.
+        context.write(paths, context.build(prompt, blinded=blinded))
     else:
         paths = existing_paths
 
@@ -509,7 +590,25 @@ async def fanout(
 
     async def _run_one(spec: ModelSpec, slug: str, per_prompt: str) -> ManifestEntry:
         nonlocal done
-        entry = await _call_one(spec, slug, per_prompt, paths, provider_sems)
+        # When streaming is enabled, wire each panellist's mid-stream chunk
+        # callback to emit `PanellistPartial` events. Throttled to
+        # ~1 chunk/sec by `_STREAM_PARTIAL_INTERVAL_S` so the progress
+        # channel doesn't drown in micro-updates.
+        on_partial: Callable[[int, int], Awaitable[None]] | None = None
+        if stream and on_progress is not None:
+            async def _emit_partial(chars: int, elapsed_ms: int) -> None:
+                try:
+                    await on_progress(PanellistPartial(
+                        done=done, total=total, slug=slug,
+                        chars_so_far=chars, elapsed_ms=elapsed_ms,
+                    ))
+                except Exception as e:  # noqa: BLE001
+                    logger.debug("PanellistPartial callback failed: %s", e)
+            on_partial = _emit_partial
+        entry = await _call_one(
+            spec, slug, per_prompt, paths, provider_sems,
+            stream=stream, on_partial=on_partial,
+        )
         done += 1
         if on_progress is not None:
             try:

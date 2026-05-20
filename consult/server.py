@@ -29,6 +29,7 @@ from . import (
     progress,
     registry,
     runner,
+    sources,
     synth,
 )
 from . import (
@@ -50,6 +51,50 @@ server: Server = Server("consult")
 
 
 # ---- Tool schemas -----------------------------------------------------------
+
+# Used by every tool's `attachments` array. Bare strings stay supported for
+# backwards compat; labelled objects let callers tag a file with a section
+# heading ("DESIGN_DOC", "AUTH_MODULE"); the `git_diff` source form makes
+# the server resolve the diff itself (parent never holds the diff in its
+# own context).
+_ATTACHMENT_SCHEMA_ITEMS = {
+    "anyOf": [
+        {"type": "string", "description": "Absolute file path."},
+        {
+            "type": "object",
+            "required": ["path"],
+            "properties": {
+                "path": {"type": "string", "description": "Absolute file path."},
+                "label": {
+                    "type": "string",
+                    "description": "Human-readable label rendered as a section heading.",
+                },
+                "kind": {
+                    "type": "string",
+                    "enum": ["text", "diff", "design_doc", "source", "data"],
+                    "description": "Hint for fence language and presentation.",
+                },
+            },
+        },
+        {
+            "type": "object",
+            "required": ["source", "base", "head"],
+            "properties": {
+                "source": {"type": "string", "enum": ["git_diff"]},
+                "base": {"type": "string", "description": "Base ref (e.g. 'main')."},
+                "head": {"type": "string", "description": "Head ref (e.g. 'HEAD')."},
+                "repo_path": {
+                    "type": "string",
+                    "description": (
+                        "Repo dir. Must resolve under CONSULT_TRUSTED_REPO_ROOTS "
+                        "(defaults to cwd)."
+                    ),
+                },
+                "label": {"type": "string"},
+            },
+        },
+    ],
+}
 
 _PANEL_SCHEMA = {
     "type": "object",
@@ -80,8 +125,12 @@ _PANEL_SCHEMA = {
         },
         "attachments": {
             "type": "array",
-            "items": {"type": "string"},
-            "description": "Absolute file paths to inline into the prompt.",
+            "items": _ATTACHMENT_SCHEMA_ITEMS,
+            "description": (
+                "Each entry is either an absolute file path (string), a labelled "
+                "file `{path, label?, kind?}`, or a server-resolved source "
+                "`{source: \"git_diff\", base, head, repo_path?, label?}`."
+            ),
         },
         "dry_run": {
             "type": "boolean",
@@ -96,6 +145,16 @@ _PANEL_SCHEMA = {
             "type": "boolean",
             "default": True,
             "description": "Run the capsule extractor after fanout. Disable for raw output.",
+        },
+        "capsule_kind": {
+            "type": "string",
+            "enum": ["decision", "review", "research"],
+            "default": "decision",
+            "description": (
+                "Shape of the extracted capsule. 'decision' = position/recommendation "
+                "(general-purpose). 'review' = line-anchored Finding[] for code/PR "
+                "review. 'research' = claims/evidence/uncertainties for research."
+            ),
         },
     },
 }
@@ -151,8 +210,8 @@ _REFINE_SCHEMA = {
             "type": "integer",
             "default": 3,
             "minimum": 1,
-            "maximum": 3,
-            "description": "Hard cap on rounds. Cannot exceed 3.",
+            "maximum": 5,
+            "description": "Hard cap on rounds. 1-5; default 3.",
         },
         "blinded": {"type": "boolean", "default": False},
         "attachments": {"type": "array", "items": {"type": "string"}},
@@ -160,6 +219,22 @@ _REFINE_SCHEMA = {
         "synthesiser": {
             "type": "string",
             "description": "Final synthesis model. Defaults to the arbiter.",
+        },
+        "rubric": {
+            "type": "string",
+            "description": (
+                "Rubric name (e.g. 'consensus', 'code_review', 'research_brief', "
+                "'critique') or a literal rubric string. Defaults to 'consensus'."
+            ),
+        },
+        "capsule_kind": {
+            "type": "string",
+            "enum": ["decision", "review", "research"],
+            "default": "decision",
+            "description": (
+                "Shape of the extracted capsule. 'decision' (default), 'review' for "
+                "code reviews, 'research' for evidence-gathering panels."
+            ),
         },
         "continuation_id": {
             "type": "string",
@@ -179,10 +254,34 @@ _SEQUENCE_SCHEMA = {
         "prompts": {
             "type": "array",
             "minItems": 1,
-            "items": {"type": "string"},
+            "items": {
+                "anyOf": [
+                    {"type": "string"},
+                    {
+                        "type": "object",
+                        "required": ["prompt"],
+                        "properties": {
+                            "prompt": {"type": "string"},
+                            "attachments": {
+                                "type": "array",
+                                "items": _ATTACHMENT_SCHEMA_ITEMS,
+                                "description": (
+                                    "Per-step attachments. When set, override the "
+                                    "top-level `attachments` for this step. Lets step "
+                                    "N attach files step N-1 didn't need (closes the "
+                                    "'step N reasons over English summary of step N-1's "
+                                    "code' trap)."
+                                ),
+                            },
+                        },
+                    },
+                ],
+            },
             "description": (
-                "Ordered list of prompts. Each step's synthesis is prepended "
-                "to the next step's prompt as 'prior synthesis' context."
+                "Ordered list of prompts. Each entry is either a string (uses "
+                "the top-level `attachments`) or an object `{prompt, attachments?}` "
+                "with per-step attachments. Each step's synthesis is prepended to "
+                "the next step's prompt as 'prior synthesis' context."
             ),
         },
         "models": {
@@ -209,6 +308,8 @@ _SEQUENCE_SCHEMA = {
 }
 
 
+_TIER_NAMES = list(registry.models_config().get("tiers", {}).keys())
+
 _CONSULT_SCHEMA = {
     "type": "object",
     "required": ["prompt"],
@@ -216,8 +317,8 @@ _CONSULT_SCHEMA = {
         "prompt": {"type": "string"},
         "tier": {
             "type": "string",
-            "enum": ["quick", "standard", "deep"],
-            "default": "standard",
+            "enum": _TIER_NAMES or ["quick", "standard", "deep"],
+            "default": "standard" if "standard" in _TIER_NAMES else (_TIER_NAMES[0] if _TIER_NAMES else "standard"),
         },
         "roles": {
             "type": "object",
@@ -226,6 +327,22 @@ _CONSULT_SCHEMA = {
         },
         "attachments": {"type": "array", "items": {"type": "string"}},
         "synthesiser": {"type": "string", "description": "Override synth model."},
+        "rubric": {
+            "type": "string",
+            "description": (
+                "Rubric name (e.g. 'consensus', 'code_review', 'research_brief', "
+                "'critique') or a literal rubric string. Defaults to 'consensus'."
+            ),
+        },
+        "capsule_kind": {
+            "type": "string",
+            "enum": ["decision", "review", "research"],
+            "default": "decision",
+            "description": (
+                "Shape of the extracted capsule. 'decision' (default), 'review' for "
+                "code reviews, 'research' for evidence-gathering panels."
+            ),
+        },
         "blinded": {"type": "boolean", "default": False},
         "max_run_usd": {"type": "number"},
     },
@@ -289,16 +406,68 @@ async def handle_list_tools() -> list[Tool]:
 # ---- Helpers ----------------------------------------------------------------
 
 
-def _inline_attachments(prompt: str, attachments: list[str] | None) -> str:
+_KIND_FENCE_LANG = {
+    "diff": "diff",
+    "design_doc": "markdown",
+    "source": "",
+    "data": "",
+    "text": "",
+    "git_diff": "diff",
+}
+
+
+def _render_attachment(item: Any) -> str:
+    """Render a single attachment spec into a markdown block.
+
+    Three input shapes are accepted (see `_attachments_schema_items`):
+    - bare string → absolute file path
+    - `{path, label?, kind?}` → labelled file attachment
+    - `{source: "git_diff", base, head, repo_path?, label?}` → server-side
+      resolved git diff
+    """
+    # Bare string → file path
+    if isinstance(item, str):
+        path = item
+        label = None
+        kind = None
+        try:
+            content = Path(path).read_text()
+        except OSError as e:
+            return f"\n# {path}\n[ERROR: {e}]\n"
+    elif isinstance(item, dict) and item.get("source") == "git_diff":
+        # Source resolver
+        base = item.get("base")
+        head = item.get("head")
+        repo_path = item.get("repo_path")
+        label = item.get("label") or f"git_diff[{base}..{head}]"
+        kind = "git_diff"
+        path = f"git_diff:{base}..{head}"
+        try:
+            content = sources.resolve_git_diff(base, head, repo_path)
+        except (ValueError, RuntimeError) as e:
+            return f"\n## {label}\n[ERROR: {e}]\n"
+    elif isinstance(item, dict) and item.get("path"):
+        path = item["path"]
+        label = item.get("label")
+        kind = item.get("kind")
+        try:
+            content = Path(path).read_text()
+        except OSError as e:
+            return f"\n# {path}\n[ERROR: {e}]\n"
+    else:
+        return f"\n[ERROR: malformed attachment spec: {item!r}]\n"
+
+    fence_lang = _KIND_FENCE_LANG.get(kind or "", "")
+    header = f"## {label}: {path}" if label else f"# {path}"
+    return f"\n{header}\n```{fence_lang}\n{content}\n```\n"
+
+
+def _inline_attachments(prompt: str, attachments: list | None) -> str:
     if not attachments:
         return prompt
     parts = [prompt, "\n\n--- ATTACHMENTS ---\n"]
-    for path in attachments:
-        try:
-            content = Path(path).read_text()
-            parts.append(f"\n# {path}\n```\n{content}\n```\n")
-        except OSError as e:
-            parts.append(f"\n# {path}\n[ERROR: {e}]\n")
+    for item in attachments:
+        parts.append(_render_attachment(item))
     return "".join(parts)
 
 
@@ -419,7 +588,9 @@ async def _handle_panel(args: dict[str, Any]) -> dict[str, Any]:
         on_progress=progress_cb,
     )
     if args.get("extract_capsules", True) and not handle.partial and handle.manifest:
-        handle = await capsule.annotate(handle, on_progress=progress_cb)
+        handle = await capsule.annotate(
+            handle, on_progress=progress_cb, kind=args.get("capsule_kind", "decision")
+        )
     return handle.model_dump()
 
 
@@ -495,15 +666,24 @@ async def _handle_consult(args: dict[str, Any]) -> dict[str, Any]:
         )
         return partial.model_dump()
     offset = len(specs)
-    handle = await capsule.annotate(handle, on_progress=phase())
+    handle = await capsule.annotate(
+        handle, on_progress=phase(), kind=args.get("capsule_kind", "decision")
+    )
     offset = len(specs) * 2
     if base is not None:
         await base(progress.SynthStarted(done=offset, total=overall_total))
     synthesis = await synth.synthesise(
-        handle.run_id, by_model=synth_alias, anonymised=args.get("blinded", False)
+        handle.run_id,
+        by_model=synth_alias,
+        anonymised=args.get("blinded", False),
+        rubric=args.get("rubric"),
     )
     if base is not None:
         await base(progress.SynthCompleted(done=overall_total, total=overall_total))
+    # Persist the synthesiser choice on disk so `consult-view` can badge it
+    # in the header. `RunResult` carries it on the wire, but the manifest
+    # written by `runner.fanout` was assembled before synth ran.
+    artifacts.augment_manifest(artifacts.load_run(handle.run_id), synthesiser=synth_alias)
     result = RunResult(
         run_id=handle.run_id,
         synthesis=synthesis,
@@ -517,12 +697,21 @@ async def _handle_consult(args: dict[str, Any]) -> dict[str, Any]:
 
 
 async def _handle_sequence(args: dict[str, Any]) -> dict[str, Any]:
-    # Attachments — if supplied — are inlined into every step's prompt, since
-    # a sequence is one logical consultation with shared context. Per-step
-    # attachment overrides are a v2 feature.
+    # Each step gets its own inlined-attachments prompt. The top-level
+    # `attachments` is the default for every step; a step that's an
+    # object can supply its own `attachments` to override (per-step
+    # source material — closes the "naïve sequence drops step N's code"
+    # trap from the v2 audit).
     raw_prompts = args["prompts"]
-    attachments = args.get("attachments")
-    prompts = [_inline_attachments(p, attachments) for p in raw_prompts]
+    default_attachments = args.get("attachments")
+    prompts: list[str] = []
+    for item in raw_prompts:
+        if isinstance(item, str):
+            prompts.append(_inline_attachments(item, default_attachments))
+        else:
+            step_atts = item.get("attachments")
+            effective_atts = step_atts if step_atts is not None else default_attachments
+            prompts.append(_inline_attachments(item["prompt"], effective_atts))
     specs = _specs_from_args(args["models"])
     result = await sequence_mod.sequence(
         prompts,
@@ -548,6 +737,8 @@ async def _handle_refine(args: dict[str, Any]) -> dict[str, Any]:
         max_run_usd=args.get("max_run_usd"),
         synthesiser=args.get("synthesiser"),
         continuation_id=args.get("continuation_id"),
+        rubric=args.get("rubric"),
+        capsule_kind=args.get("capsule_kind", "decision"),
         on_progress=_progress_callback(),
     )
     return result.model_dump()
