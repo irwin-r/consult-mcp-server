@@ -354,6 +354,39 @@ def test_run_handle_validates_partial_coupling():
         RunHandle(**base, partial=False, partial_reason="oops")  # reason without partial
 
 
+def test_refine_result_validates_partial_coupling_and_surfaces_reason():
+    """RefineResult must (a) enforce partial⇔partial_reason coupling and
+    (b) actually accept partial_reason at all — previously the field didn't
+    exist on the model, so refine() silently dropped it via Pydantic's
+    "ignore extras" default and callers had no way to learn why a run
+    stopped early (e.g. cost-cap or unknown-pricing refusal).
+    """
+    import pydantic
+
+    from consult.types import RefineResult
+
+    base = dict(
+        run_id="r",
+        rounds_completed=1,
+        final_manifest=[],
+        verdicts=[],
+        synthesis="x",
+        converged=False,
+        threshold=0.85,
+        cost_usd=0.0,
+        wall_ms=0,
+    )
+    # Happy path: partial_reason actually round-trips through the model
+    rr = RefineResult(**base, partial=True, partial_reason="cost cap exceeded")
+    assert rr.partial_reason == "cost cap exceeded"
+
+    # Validator catches the inconsistent states
+    with pytest.raises(pydantic.ValidationError):
+        RefineResult(**base, partial=True)  # no reason
+    with pytest.raises(pydantic.ValidationError):
+        RefineResult(**base, partial=False, partial_reason="oops")
+
+
 # ---- Live tests (gated on API keys) ----------------------------------------
 
 

@@ -195,3 +195,14 @@ class RefineResult(BaseModel):
     wall_ms: int = Field(..., ge=0)
     partial: bool = False
     partial_reason: str | None = None
+
+    @model_validator(mode="after")
+    def _validate_partial(self) -> RefineResult:
+        if self.partial and not self.partial_reason:
+            raise ValueError("RefineResult.partial=True requires partial_reason")
+        if not self.partial and self.partial_reason:
+            raise ValueError("RefineResult.partial=False must not carry a partial_reason")
+        return self
+    wall_ms: int = Field(..., ge=0)
+    partial: bool = False
+    partial_reason: str | None = None
