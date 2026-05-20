@@ -24,7 +24,15 @@ from mcp.types import (
     Tool,
 )
 
-from . import artifacts, capsule, refine as refine_mod, registry, runner, synth
+from . import (
+    artifacts,
+    capsule,
+    refine as refine_mod,
+    registry,
+    runner,
+    sequence as sequence_mod,
+    synth,
+)
 from .types import ModelSpec, RunResult
 
 logger = logging.getLogger("consult")
@@ -160,6 +168,43 @@ _REFINE_SCHEMA = {
     },
 }
 
+_SEQUENCE_SCHEMA = {
+    "type": "object",
+    "required": ["prompts", "models"],
+    "properties": {
+        "prompts": {
+            "type": "array",
+            "minItems": 1,
+            "items": {"type": "string"},
+            "description": (
+                "Ordered list of prompts. Each step's synthesis is prepended "
+                "to the next step's prompt as 'prior synthesis' context."
+            ),
+        },
+        "models": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+                "type": "object",
+                "required": ["model"],
+                "properties": {
+                    "model": {"type": "string"},
+                    "stance": {"type": "string"},
+                    "slug": {"type": "string"},
+                },
+            },
+        },
+        "synthesiser": {"type": "string", "description": "Per-step synth model."},
+        "blinded": {"type": "boolean", "default": False},
+        "attachments": {"type": "array", "items": {"type": "string"}},
+        "max_run_usd": {
+            "type": "number",
+            "description": "Cap across the whole sequence (cumulative, not per-step).",
+        },
+    },
+}
+
+
 _CONSULT_SCHEMA = {
     "type": "object",
     "required": ["prompt"],
@@ -222,6 +267,17 @@ async def handle_list_tools() -> list[Tool]:
                 "Hard cap at 3 rounds. Per-round transcripts available as MCP resources."
             ),
             inputSchema=_REFINE_SCHEMA,
+        ),
+        Tool(
+            name="sequence",
+            description=(
+                "Run an ordered list of prompts where each step's synthesis is "
+                "prepended as context for the next step. Use for multi-stage "
+                "research (e.g. break-down → per-subquestion → meta-synth) or "
+                "any plan-then-execute workflow. Returns per-step run_ids + "
+                "the final synthesis."
+            ),
+            inputSchema=_SEQUENCE_SCHEMA,
         ),
     ]
 
@@ -294,6 +350,8 @@ async def handle_call_tool(name: str, arguments: dict[str, Any]) -> list[TextCon
         return await _handle_consult(arguments)
     if name == "refine":
         return await _handle_refine(arguments)
+    if name == "sequence":
+        return await _handle_sequence(arguments)
     raise ValueError(f"Unknown tool: {name}")
 
 
@@ -380,6 +438,25 @@ async def _handle_consult(args: dict[str, Any]) -> list[TextContent]:
         wall_ms=handle.wall_ms,
         partial=False,
         synthesiser=synth_alias,
+    )
+    return _text_result(result.model_dump())
+
+
+async def _handle_sequence(args: dict[str, Any]) -> list[TextContent]:
+    # Attachments — if supplied — are inlined into every step's prompt, since
+    # a sequence is one logical consultation with shared context. Per-step
+    # attachment overrides are a v2 feature.
+    raw_prompts = args["prompts"]
+    attachments = args.get("attachments")
+    prompts = [_inline_attachments(p, attachments) for p in raw_prompts]
+    specs = _specs_from_args(args["models"])
+    result = await sequence_mod.sequence(
+        prompts,
+        specs,
+        synthesiser=args.get("synthesiser"),
+        blinded=args.get("blinded", False),
+        max_run_usd=args.get("max_run_usd"),
+        on_progress=_progress_callback(),
     )
     return _text_result(result.model_dump())
 

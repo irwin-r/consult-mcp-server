@@ -420,6 +420,102 @@ async def test_fanout_cost_cap_message_discloses_partial_pricing(monkeypatch):
     assert handle.cost_known is False
 
 
+def test_sequence_step_prompt_threads_prior_synth():
+    """Step N>1 must include step N-1's synthesis as 'prior synthesis' context."""
+    from consult.sequence import _step_prompt
+
+    p1 = _step_prompt(1, 3, None, "What is X?")
+    assert p1 == "What is X?"  # first step: no prior context
+
+    p2 = _step_prompt(2, 3, "X is foo.", "Given X is foo, what about Y?")
+    assert "Step 1 of 3 — prior synthesis" in p2
+    assert "X is foo." in p2
+    assert "Step 2 of 3 prompt" in p2
+    assert "Given X is foo, what about Y?" in p2
+
+
+@pytest.mark.asyncio
+async def test_sequence_chains_synthesis_across_steps(tmp_path, monkeypatch):
+    """A 2-step sequence: step 2's prompt-as-sent must contain step 1's
+    synthesis, and the final_synthesis matches the last step's output.
+    Heavy machinery (fanout, capsule, synth) is monkeypatched.
+    """
+    from consult import sequence as sequence_mod
+    from consult import runner as runner_mod
+    from consult import capsule as capsule_mod
+    from consult import synth as synth_mod
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    monkeypatch.setattr(runner_mod, "estimate_cost", lambda specs, prompt: (0.0, True))
+
+    seen_prompts: list[str] = []
+
+    async def fake_fanout(prompt, specs, **kwargs):
+        seen_prompts.append(prompt)
+        paths = artifacts.create_run()
+        return RunHandle(
+            run_id=paths.run_id,
+            artifacts_dir=str(paths.root),
+            manifest=[
+                ManifestEntry(
+                    slug="alpha",
+                    model_id="x/y",
+                    status=Status.OK,
+                    finish_reason="stop",
+                    resource_uri=paths.resource_uri("alpha"),
+                    body_path=str(paths.response_text("alpha")),
+                    latency_ms=1,
+                    cost_usd=0.01,
+                    cost_known=True,
+                )
+            ],
+            cost_usd=0.01,
+            cost_known=True,
+            wall_ms=1,
+            partial=False,
+        )
+
+    async def fake_annotate(handle, **kwargs):
+        return handle
+
+    synth_counter = {"i": 0}
+
+    async def fake_synth(run_id, by_model=None, anonymised=False, **kwargs):
+        synth_counter["i"] += 1
+        return f"SYNTH_{synth_counter['i']}"
+
+    monkeypatch.setattr(runner_mod, "fanout", fake_fanout)
+    monkeypatch.setattr(capsule_mod, "annotate", fake_annotate)
+    monkeypatch.setattr(synth_mod, "synthesise", fake_synth)
+
+    result = await sequence_mod.sequence(
+        ["First question", "Second question"],
+        [ModelSpec(model="claude-haiku")],
+    )
+    assert len(result.steps) == 2
+    assert result.final_synthesis == "SYNTH_2"
+    assert result.cost_usd == pytest.approx(0.02)
+    assert result.partial is False
+
+    # Step 1 prompt: just the body.
+    assert seen_prompts[0] == "First question"
+    # Step 2 prompt: prior synth must be embedded.
+    assert "SYNTH_1" in seen_prompts[1]
+    assert "Second question" in seen_prompts[1]
+    assert "prior synthesis" in seen_prompts[1]
+
+
+@pytest.mark.asyncio
+async def test_sequence_rejects_empty_inputs():
+    """Empty prompts list or empty specs list is a usage error."""
+    from consult import sequence as sequence_mod
+
+    with pytest.raises(ValueError, match="at least one prompt"):
+        await sequence_mod.sequence([], [ModelSpec(model="claude-haiku")])
+    with pytest.raises(ValueError, match="at least one model spec"):
+        await sequence_mod.sequence(["q"], [])
+
+
 def test_capsule_extract_json_recovers_prose_and_fences():
     """The capsule contract depends on this — one regex change breaks all callers."""
     from consult.capsule import _extract_json

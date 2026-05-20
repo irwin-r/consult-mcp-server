@@ -1,0 +1,187 @@
+"""Sequential multi-step consultation.
+
+Runs an ordered list of prompts where each step is a full
+fanout → capsule → synth cycle, and step N's synthesis is prepended as
+context for step N+1. Each step gets its own run_id; the SequenceResult
+collects them all with the final synth (= last step's synth) exposed
+directly for callers that don't need per-step detail.
+
+Stops early on cost-cap violation; returns a partial SequenceResult so
+the caller can see how far the chain got.
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+
+from pydantic import BaseModel, Field, model_validator
+
+from . import capsule, registry, runner, synth
+from .types import ModelSpec
+
+logger = logging.getLogger(__name__)
+
+
+class SequenceStep(BaseModel):
+    """One step in a sequence — its run_id, prompt-as-sent, and synth."""
+
+    step: int = Field(..., ge=1)
+    run_id: str
+    synthesis: str
+    cost_usd: float = Field(..., ge=0.0)
+    cost_known: bool = True
+    panel_size: int = Field(..., ge=0)
+
+
+class SequenceResult(BaseModel):
+    """Aggregate result of a sequence run."""
+
+    steps: list[SequenceStep] = Field(default_factory=list)
+    final_synthesis: str
+    cost_usd: float = Field(..., ge=0.0)
+    cost_known: bool = True
+    wall_ms: int = Field(..., ge=0)
+    partial: bool = False
+    partial_reason: str | None = None
+
+    @model_validator(mode="after")
+    def _validate_partial(self) -> SequenceResult:
+        if self.partial and not self.partial_reason:
+            raise ValueError("SequenceResult.partial=True requires partial_reason")
+        if not self.partial and self.partial_reason:
+            raise ValueError("SequenceResult.partial=False must not carry a partial_reason")
+        return self
+
+
+def _step_prompt(step_num: int, total: int, prior_synth: str | None, body: str) -> str:
+    if prior_synth is None:
+        return body
+    return (
+        f"## Step {step_num - 1} of {total} — prior synthesis\n\n"
+        f"{prior_synth}\n\n---\n\n"
+        f"## Step {step_num} of {total} prompt\n\n{body}"
+    )
+
+
+async def sequence(
+    prompts: list[str],
+    specs: list[ModelSpec],
+    *,
+    synthesiser: str | None = None,
+    blinded: bool = False,
+    max_run_usd: float | None = None,
+    on_progress: runner.ProgressCallback | None = None,
+) -> SequenceResult:
+    """Run `prompts` as a chain where step i sees step i-1's synthesis."""
+    if not prompts:
+        raise ValueError("sequence requires at least one prompt")
+    if not specs:
+        raise ValueError("sequence requires at least one model spec")
+
+    synth_alias = synthesiser or registry.default_synthesiser()
+    cap = max_run_usd if max_run_usd is not None else registry.default_max_run_usd()
+
+    start = time.time()
+    steps: list[SequenceStep] = []
+    cumulative_cost = 0.0
+    cost_all_known = True
+    partial_reason: str | None = None
+    prior_synth: str | None = None
+    total = len(prompts)
+
+    # Bucketed progress: roughly 2N+1 ticks per step (fanout panellists +
+    # capsules + synth). Coarse but monotonic; the per-step callbacks tick
+    # within their bucket.
+    panel_n = len(specs)
+    progress_total = total * (panel_n * 2 + 1)
+    progress_done = 0
+
+    async def notify(msg: str) -> None:
+        if on_progress is not None:
+            try:
+                await on_progress(progress_done, progress_total, msg)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("sequence on_progress failed: %s", e)
+
+    def phase_cb(base: int, label: str) -> runner.ProgressCallback | None:
+        if on_progress is None:
+            return None
+
+        async def cb(done: int, _local_total: int, msg: str) -> None:
+            nonlocal progress_done
+            progress_done = base + done
+            await notify(f"{label}: {msg}")
+
+        return cb
+
+    for i, body in enumerate(prompts, start=1):
+        step_base = (i - 1) * (panel_n * 2 + 1)
+        full_prompt = _step_prompt(i, total, prior_synth, body)
+
+        estimate, est_known = runner.estimate_cost(specs, full_prompt)
+        if cumulative_cost + estimate > cap:
+            partial_reason = (
+                f"would exceed cap: spent ${cumulative_cost:.2f}, step {i} estimate "
+                f"${estimate:.2f}, cap ${cap:.2f}"
+            )
+            break
+        if not est_known and i > 1:
+            partial_reason = (
+                f"refusing further steps: per-model pricing unknown at step {i}, "
+                f"can't validate cap (${cumulative_cost:.2f} spent / ${cap:.2f} cap)"
+            )
+            break
+
+        handle = await runner.fanout(
+            full_prompt,
+            specs,
+            blinded=blinded,
+            max_run_usd=cap - cumulative_cost,
+            on_progress=phase_cb(step_base, f"step {i} fanout"),
+        )
+        if handle.partial or not handle.manifest:
+            partial_reason = (
+                f"step {i} fanout returned partial: {handle.partial_reason}"
+            )
+            break
+
+        handle = await capsule.annotate(
+            handle,
+            on_progress=phase_cb(step_base + panel_n, f"step {i} capsules"),
+        )
+        cumulative_cost += handle.cost_usd
+        if not handle.cost_known:
+            cost_all_known = False
+
+        progress_done = step_base + panel_n * 2
+        await notify(f"step {i} synthesising")
+        step_synth = await synth.synthesise(
+            handle.run_id, by_model=synth_alias, anonymised=blinded
+        )
+        progress_done = step_base + panel_n * 2 + 1
+        await notify(f"step {i} complete")
+
+        steps.append(
+            SequenceStep(
+                step=i,
+                run_id=handle.run_id,
+                synthesis=step_synth,
+                cost_usd=handle.cost_usd,
+                cost_known=handle.cost_known,
+                panel_size=len(handle.manifest),
+            )
+        )
+        prior_synth = step_synth
+
+    wall_ms = int((time.time() - start) * 1000)
+    final = steps[-1].synthesis if steps else "(no steps completed — see partial_reason)"
+    return SequenceResult(
+        steps=steps,
+        final_synthesis=final,
+        cost_usd=cumulative_cost,
+        cost_known=cost_all_known,
+        wall_ms=wall_ms,
+        partial=partial_reason is not None,
+        partial_reason=partial_reason,
+    )
