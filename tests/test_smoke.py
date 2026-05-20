@@ -251,6 +251,113 @@ async def test_fanout_dry_run_returns_partial():
 
 
 @pytest.mark.asyncio
+async def test_fanout_emits_progress_callbacks(tmp_path, monkeypatch):
+    """fanout must call on_progress once per panellist with monotonically
+    increasing `done`. The "A" half of the A + D progress design.
+    """
+    from consult import runner
+    from consult.runner import fanout
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    monkeypatch.setattr(runner, "estimate_cost", lambda specs, prompt: (0.0, True))
+
+    async def fake_call(spec, slug, per_prompt, paths):
+        return ManifestEntry(
+            slug=slug,
+            model_id="x/y",
+            persona=None,
+            status=Status.OK,
+            finish_reason="stop",
+            resource_uri=paths.resource_uri(slug),
+            body_path=str(paths.response_text(slug)),
+            latency_ms=10,
+            cost_usd=0.0,
+            cost_known=True,
+        )
+
+    monkeypatch.setattr(runner, "_call_one", fake_call)
+
+    progress: list[tuple[int, int, str]] = []
+
+    async def on_progress(done: int, total: int, msg: str) -> None:
+        progress.append((done, total, msg))
+
+    specs = [
+        ModelSpec(model="claude-haiku"),
+        ModelSpec(model="claude-sonnet"),
+        ModelSpec(model="claude-opus"),
+    ]
+    handle = await fanout("p", specs, on_progress=on_progress)
+    assert handle.partial is False
+
+    # 3 panellists ⇒ 3 progress ticks, each with total=3, done counter
+    # 1→2→3 (order may interleave with gather, so check set semantics).
+    assert len(progress) == 3
+    assert {p[0] for p in progress} == {1, 2, 3}
+    assert all(p[1] == 3 for p in progress)
+
+
+def test_append_progress_log_writes_jsonl(tmp_path):
+    """The "D" half: a tailable JSONL log in the run dir, written by both
+    fanout and capsule.annotate so a client tailing the file gets a unified
+    timeline even when MCP notifications/progress isn't subscribed.
+    """
+    from consult.runner import _append_progress_log
+
+    _append_progress_log(tmp_path, {"kind": "panellist", "slug": "haiku", "status": "OK"})
+    _append_progress_log(tmp_path, {"kind": "capsule", "slug": "haiku"})
+
+    lines = (tmp_path / "_progress.log").read_text().splitlines()
+    assert len(lines) == 2
+    parsed = [json.loads(line) for line in lines]
+    assert parsed[0]["kind"] == "panellist"
+    assert parsed[0]["slug"] == "haiku"
+    assert parsed[0]["status"] == "OK"
+    assert "ts" in parsed[0]
+    assert parsed[1]["kind"] == "capsule"
+
+
+@pytest.mark.asyncio
+async def test_fanout_progress_callback_failure_does_not_abort_run(tmp_path, monkeypatch):
+    """A raising on_progress callback must not tear down the fanout —
+    progress is best-effort, the run completes regardless.
+    """
+    from consult import runner
+    from consult.runner import fanout
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    monkeypatch.setattr(runner, "estimate_cost", lambda specs, prompt: (0.0, True))
+
+    async def fake_call(spec, slug, per_prompt, paths):
+        return ManifestEntry(
+            slug=slug,
+            model_id="x/y",
+            persona=None,
+            status=Status.OK,
+            finish_reason="stop",
+            resource_uri=paths.resource_uri(slug),
+            body_path=str(paths.response_text(slug)),
+            latency_ms=1,
+            cost_usd=0.0,
+            cost_known=True,
+        )
+
+    monkeypatch.setattr(runner, "_call_one", fake_call)
+
+    async def bad_progress(done, total, msg):
+        raise RuntimeError("client went away")
+
+    handle = await fanout(
+        "p",
+        [ModelSpec(model="claude-haiku")],
+        on_progress=bad_progress,
+    )
+    assert handle.partial is False
+    assert len(handle.manifest) == 1
+    assert handle.manifest[0].status is Status.OK
+
+
+@pytest.mark.asyncio
 async def test_call_one_unknown_alias_returns_error_entry(tmp_path, monkeypatch):
     """An unknown alias must surface as a per-spec Status.ERROR rather than
     crashing the panel. Regression guard: KeyError out of `resolve_model`

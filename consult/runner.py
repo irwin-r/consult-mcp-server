@@ -9,6 +9,9 @@ import json
 import logging
 import re
 import time
+from collections.abc import Awaitable, Callable
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import litellm
@@ -18,6 +21,26 @@ from .status import classify
 from .types import ManifestEntry, ModelSpec, RunHandle, Status
 
 logger = logging.getLogger(__name__)
+
+# Async progress callback signature: (completed, total, message). Wrapped at
+# each call site in a try/except so a notification failure never aborts the
+# real work (best-effort observability, not a hard contract).
+ProgressCallback = Callable[[int, int, str], Awaitable[None]]
+
+
+def _append_progress_log(run_root: Path, entry: dict[str, Any]) -> None:
+    """Append a JSONL line to `<run>/_progress.log` for client-less tailing.
+
+    Always on — gives mid-run observability via `tail -f` even when the MCP
+    client didn't ask for `notifications/progress`. A write error here is
+    logged at debug and swallowed; the progress log is best-effort.
+    """
+    entry = {"ts": datetime.now(timezone.utc).isoformat(), **entry}
+    try:
+        with (run_root / "_progress.log").open("a") as fh:
+            fh.write(json.dumps(entry) + "\n")
+    except OSError as e:  # pragma: no cover — log-write failure is benign
+        logger.debug("progress log write failed: %s", e)
 
 # Drop unsupported params per provider so e.g. `reasoning_effort` on a
 # non-reasoning model is silently ignored rather than failing the panel.
@@ -219,6 +242,20 @@ async def _call_one(
     # manifest. Use info-level so production stays quiet by default.
     logger.info("panellist %s: %s in %dms", slug, status.value, latency_ms)
 
+    # Per-run progress log (kind=panellist) — always on, tailable as
+    # JSONL even if the MCP client didn't subscribe to notifications/progress.
+    # See pass #2's panel synthesis: "A + D" — progress notifications PLUS
+    # a local log file as the fallback when the in-band path fails.
+    _append_progress_log(
+        paths.root,
+        {
+            "kind": "panellist",
+            "slug": slug,
+            "status": status.value,
+            "latency_ms": latency_ms,
+        },
+    )
+
     persona_label = spec.stance if spec.stance else None
 
     # Status.ERROR/TIMEOUT require a non-empty error per the model invariant.
@@ -293,10 +330,15 @@ async def fanout(
     dry_run: bool = False,
     max_run_usd: float | None = None,
     existing_paths: artifacts.RunPaths | None = None,
+    on_progress: ProgressCallback | None = None,
 ) -> RunHandle:
     """Parallel fan-out. Creates a fresh run by default. Pass `existing_paths`
     to write into an existing run dir (used by `refine` to keep all rounds
     under one run_id with round-suffixed slugs).
+
+    If `on_progress` is set, it's called once per panellist as it completes
+    with `(done, total, message)`. Failures inside the callback are logged
+    and swallowed — progress is best-effort, not load-bearing.
     """
     # Resolve `model:N` sugar BEFORE estimate_cost so the cap reflects the
     # real panel size, not the pre-expansion request count.
@@ -351,8 +393,22 @@ async def fanout(
     ]
 
     start = time.time()
+    total = len(specs)
+    done = 0
+
+    async def _run_one(spec: ModelSpec, slug: str, per_prompt: str) -> ManifestEntry:
+        nonlocal done
+        entry = await _call_one(spec, slug, per_prompt, paths)
+        done += 1
+        if on_progress is not None:
+            try:
+                await on_progress(done, total, f"{slug}: {entry.status.value}")
+            except Exception as e:  # noqa: BLE001 — notification is best-effort
+                logger.debug("on_progress callback failed: %s", e)
+        return entry
+
     tasks = [
-        _call_one(spec, slug, per_prompt, paths)
+        _run_one(spec, slug, per_prompt)
         for spec, slug, per_prompt in zip(specs, slugs, per_prompts, strict=True)
     ]
     manifest = await asyncio.gather(*tasks)

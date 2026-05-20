@@ -252,6 +252,35 @@ def _text_result(payload: dict | str) -> list[TextContent]:
     return [TextContent(type="text", text=json.dumps(payload, indent=2, default=str))]
 
 
+def _progress_callback():
+    """Build a callback that forwards `(done, total, msg)` tuples as MCP
+    `notifications/progress`. Returns None if the client didn't send a
+    `progressToken` (so nothing is sent at all — silent for non-subscribers).
+
+    The token is opaque to us; we echo whatever the client supplied. Any
+    notification failure (e.g. closed session) is caught upstream by the
+    per-callsite try/except so it never aborts the underlying tool call.
+    """
+    try:
+        ctx = server.request_context
+    except LookupError:
+        return None
+    token = ctx.meta.progressToken if ctx.meta else None
+    if token is None:
+        return None
+    session = ctx.session
+
+    async def notify(done: int, total: int, message: str) -> None:
+        await session.send_progress_notification(
+            progress_token=token,
+            progress=float(done),
+            total=float(total),
+            message=message,
+        )
+
+    return notify
+
+
 # ---- Tool dispatch ----------------------------------------------------------
 
 
@@ -271,15 +300,17 @@ async def handle_call_tool(name: str, arguments: dict[str, Any]) -> list[TextCon
 async def _handle_panel(args: dict[str, Any]) -> list[TextContent]:
     prompt = _inline_attachments(args["prompt"], args.get("attachments"))
     specs = _specs_from_args(args["models"])
+    progress = _progress_callback()
     handle = await runner.fanout(
         prompt,
         specs,
         blinded=args.get("blinded", False),
         dry_run=args.get("dry_run", False),
         max_run_usd=args.get("max_run_usd"),
+        on_progress=progress,
     )
     if args.get("extract_capsules", True) and not handle.partial and handle.manifest:
-        handle = await capsule.annotate(handle)
+        handle = await capsule.annotate(handle, on_progress=progress)
     return _text_result(handle.model_dump())
 
 
@@ -304,20 +335,43 @@ async def _handle_consult(args: dict[str, Any]) -> list[TextContent]:
     panel_aliases = [m for m in tier_models if m != synth_alias]
     specs = [ModelSpec(model=m, stance=roles.get(m)) for m in panel_aliases]
 
+    # consult has three phases (fanout → capsules → synth). MCP progress
+    # is monotonic, so wrap each phase callback with an offset into a
+    # single growing total.
+    base = _progress_callback()
+    overall_total = len(specs) * 2 + 1  # fanout + capsules + synth
+    offset = 0
+
+    def phase(label: str):
+        if base is None:
+            return None
+
+        async def cb(done: int, _local_total: int, msg: str) -> None:
+            await base(offset + done, overall_total, f"{label}: {msg}")
+
+        return cb
+
     handle = await runner.fanout(
         prompt,
         specs,
         blinded=args.get("blinded", False),
         max_run_usd=args.get("max_run_usd"),
+        on_progress=phase("fanout"),
     )
     if handle.partial or not handle.manifest:
         return _text_result(
             {"partial": True, "reason": handle.partial_reason, "manifest": []}
         )
-    handle = await capsule.annotate(handle)
+    offset = len(specs)
+    handle = await capsule.annotate(handle, on_progress=phase("capsules"))
+    offset = len(specs) * 2
+    if base is not None:
+        await base(offset, overall_total, "synthesising")
     synthesis = await synth.synthesise(
         handle.run_id, by_model=synth_alias, anonymised=args.get("blinded", False)
     )
+    if base is not None:
+        await base(overall_total, overall_total, "synthesis complete")
     result = RunResult(
         run_id=handle.run_id,
         synthesis=synthesis,
@@ -343,6 +397,7 @@ async def _handle_refine(args: dict[str, Any]) -> list[TextContent]:
         max_run_usd=args.get("max_run_usd"),
         synthesiser=args.get("synthesiser"),
         continuation_id=args.get("continuation_id"),
+        on_progress=_progress_callback(),
     )
     return _text_result(result.model_dump())
 

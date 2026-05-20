@@ -19,6 +19,7 @@ from typing import Any
 import litellm
 
 from . import artifacts, registry
+from .runner import ProgressCallback, _append_progress_log
 from .types import Capsule, ManifestEntry, RunHandle, Status
 
 logger = logging.getLogger(__name__)
@@ -139,11 +140,17 @@ async def _extract_one(
     return capsule, cost, cost_known
 
 
-async def annotate(handle: RunHandle, *, extractor: str | None = None) -> RunHandle:
+async def annotate(
+    handle: RunHandle,
+    *,
+    extractor: str | None = None,
+    on_progress: ProgressCallback | None = None,
+) -> RunHandle:
     """Populate `capsule` and `confidence` on each manifest entry in place.
 
     Returns the same handle for chainability. Cost from extraction is added to
-    the handle's `cost_usd`.
+    the handle's `cost_usd`. `on_progress(done, total, msg)` is invoked once
+    per capsule as it lands; failures inside the callback are swallowed.
     """
     ext_alias = extractor or registry.default_capsule_extractor()
     ext_entry = registry.resolve_model(ext_alias)
@@ -151,19 +158,35 @@ async def annotate(handle: RunHandle, *, extractor: str | None = None) -> RunHan
     timeout = ext_entry.get("default_timeout_s", 60)
 
     paths = artifacts.load_run(handle.run_id)
-    tasks = []
     targets: list[ManifestEntry] = []
+    bodies: list[str] = []
     for entry in handle.manifest:
         if entry.status not in (Status.OK, Status.TRUNCATED):
             continue
-        body = paths.response_text(entry.slug).read_text()
-        tasks.append(_extract_one(body, ext_id, timeout))
+        bodies.append(paths.response_text(entry.slug).read_text())
         targets.append(entry)
 
-    if not tasks:
+    if not targets:
         return handle
 
-    results = await asyncio.gather(*tasks)
+    total = len(targets)
+    done = 0
+
+    async def _run(body: str, slug: str) -> tuple[Capsule, float | None, bool]:
+        nonlocal done
+        result = await _extract_one(body, ext_id, timeout)
+        done += 1
+        _append_progress_log(paths.root, {"kind": "capsule", "slug": slug})
+        if on_progress is not None:
+            try:
+                await on_progress(done, total, f"capsule {slug}")
+            except Exception as e:  # noqa: BLE001 — best-effort
+                logger.debug("capsule on_progress failed: %s", e)
+        return result
+
+    results = await asyncio.gather(
+        *(_run(body, entry.slug) for body, entry in zip(bodies, targets, strict=True))
+    )
     extra_cost = 0.0
     extractor_cost_all_known = True
     for entry, (capsule, cost, cost_known) in zip(targets, results, strict=True):

@@ -301,6 +301,7 @@ async def refine(
     max_run_usd: float | None = None,
     synthesiser: str | None = None,
     continuation_id: str | None = None,
+    on_progress: runner.ProgressCallback | None = None,
 ) -> RefineResult:
     if max_rounds < 1 or max_rounds > 3:
         raise ValueError("max_rounds must be between 1 and 3 (hard cap from v1.1 spec)")
@@ -327,6 +328,32 @@ async def refine(
     converged = False
     partial_reason: str | None = None
 
+    # Bucketed progress across all rounds. Per round we tick once per
+    # panellist (fanout), once per capsule, then once for the arbiter;
+    # final synth ticks once at the end. The counter is monotonic across
+    # the whole refine call so the client never sees `done` go backwards.
+    panel_n = len(specs)
+    progress_total = max_rounds * (panel_n * 2 + 1) + 1  # rounds × (fanout+capsule+arbiter) + synth
+    progress_done = 0
+
+    async def notify(msg: str) -> None:
+        if on_progress is not None:
+            try:
+                await on_progress(progress_done, progress_total, msg)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("refine on_progress failed: %s", e)
+
+    def make_phase_cb(base: int, label: str) -> runner.ProgressCallback | None:
+        if on_progress is None:
+            return None
+
+        async def cb(done: int, _local_total: int, msg: str) -> None:
+            nonlocal progress_done
+            progress_done = base + done
+            await notify(f"{label}: {msg}")
+
+        return cb
+
     round_prompt = prompt
     for round_num in range(1, max_rounds + 1):
         # Estimate next-round cost; refuse if it'd blow the cap.
@@ -346,17 +373,29 @@ async def refine(
             )
             break
 
+        round_base = (round_num - 1) * (panel_n * 2 + 1)
         round_specs = _suffix_specs(specs, round_num)
         handle = await runner.fanout(
-            round_prompt, round_specs, blinded=blinded, existing_paths=paths
+            round_prompt,
+            round_specs,
+            blinded=blinded,
+            existing_paths=paths,
+            on_progress=make_phase_cb(round_base, f"r{round_num} fanout"),
         )
-        handle = await capsule.annotate(handle)
+        handle = await capsule.annotate(
+            handle,
+            on_progress=make_phase_cb(round_base + panel_n, f"r{round_num} capsules"),
+        )
         final_manifest = handle.manifest
         cumulative_cost += handle.cost_usd
         if not handle.cost_known:
             cost_all_known = False
 
+        progress_done = round_base + panel_n * 2
+        await notify(f"r{round_num} arbiter")
         verdict = await _ask_arbiter(prompt, round_num, handle.manifest, arbiter_alias)
+        progress_done = round_base + panel_n * 2 + 1
+        await notify(f"r{round_num} arbiter score={verdict.score:.2f}")
         verdicts.append(verdict)
         if verdict.cost_usd:
             cumulative_cost += verdict.cost_usd
@@ -381,7 +420,11 @@ async def refine(
 
     # Synthesise from the final round
     if final_manifest:
+        progress_done = progress_total - 1
+        await notify("synthesising")
         text = await synth.synthesise(paths.run_id, by_model=synth_alias)
+        progress_done = progress_total
+        await notify("synthesis complete")
     else:
         text = "(no rounds completed — see partial_reason)"
 
