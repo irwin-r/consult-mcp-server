@@ -25,8 +25,44 @@ import os
 import random
 import re
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+
+# Injectable URI formatter. The default produces the `consult://` scheme
+# that the MCP adapter dereferences via `read_resource`. Library or HTTP
+# consumers can swap this for `http(s)://...` or a relative form via
+# `set_resource_uri_formatter()`; the manifest then carries whatever URI
+# their downstream tooling knows how to fetch.
+#
+# Module-level (rather than per-RunPaths) so a process-wide override
+# applies to runs created by every code path (refine, sequence, the CLI
+# tools, etc.) without threading a formatter through every call site.
+ResourceUriFormatter = Callable[[str, str], str]
+
+
+def _default_resource_uri(run_id: str, slug: str) -> str:
+    return f"consult://runs/{run_id}/responses/{slug}"
+
+
+_resource_uri_formatter: ResourceUriFormatter = _default_resource_uri
+
+
+def set_resource_uri_formatter(fn: ResourceUriFormatter) -> None:
+    """Override the URI formatter used by every new manifest entry.
+
+    Call once at process start. Existing on-disk manifests are NOT rewritten —
+    `parse_resource_uri()` below only knows the default `consult://` scheme,
+    so a custom formatter implies the consumer owns its own parse path too.
+    """
+    global _resource_uri_formatter
+    _resource_uri_formatter = fn
+
+
+def reset_resource_uri_formatter() -> None:
+    """Restore the default `consult://` formatter. Useful for tests."""
+    global _resource_uri_formatter
+    _resource_uri_formatter = _default_resource_uri
 
 
 def runs_root() -> Path:
@@ -111,7 +147,7 @@ class RunPaths:
         return self.capsules / f"{_validate_id(slug, 'slug')}.json"
 
     def resource_uri(self, slug: str) -> str:
-        return f"consult://runs/{self.run_id}/responses/{_validate_id(slug, 'slug')}"
+        return _resource_uri_formatter(self.run_id, _validate_id(slug, "slug"))
 
     def arbiter_for(self, round_num: int) -> Path:
         return self.arbiters / f"round-{round_num}.json"

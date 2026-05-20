@@ -76,7 +76,11 @@ The parent can synthesise from this alone in most cases. Bodies are fetched via 
 git clone <this repo> ~/Projects/personal/consult-mcp-server
 cd ~/Projects/personal/consult-mcp-server
 uv venv
-uv pip install -e ".[dev]"
+uv pip install -e ".[dev]"   # full install: engine + mcp adapter + dev deps
+# or, for library-only use (no MCP SDK pulled in):
+# uv pip install -e .
+# or, engine + MCP adapter without dev deps:
+# uv pip install -e ".[mcp]"
 cp .env.example .env  # then fill in your provider keys
 ```
 
@@ -260,30 +264,68 @@ Renders the entire run as one self-contained HTML file — header with cost / wa
 
 ## Layout
 
+The package splits engine (`consult.*`) from MCP adapter (`consult.mcp.*`).
+Only the adapter imports the `mcp` SDK; everything under `consult/` is
+pure async-Python + Pydantic and is directly callable from any consumer
+(CLI, HTTP, library use, tests). `pip install consult-mcp-server` gives
+you the engine; `pip install consult-mcp-server[mcp]` adds the adapter
+and the `consult-mcp` stdio server.
+
 ```
-consult/
-  server.py        # MCP wiring (panel, synthesise, consult, refine, sequence)
-  __main__.py      # consult-mcp entry point
-  runner.py        # asyncio.gather + LiteLLM fanout + progress log
-  capsule.py       # post-fanout structured extraction
-  synth.py         # flagship synthesiser pass
-  refine.py        # iterative arbiter-driven loop (max 3 rounds) + continuation
-  sequence.py      # chained multi-step consultations
-  ledger.py        # daily cost ledger (consult-ledger entry point)
-  viewer.py        # static HTML run renderer (consult-view entry point)
-  registry.py      # models.json + stances.json loader
-  artifacts.py     # ~/.consult/runs/<id>/ layout + resource URIs
-  status.py        # LiteLLM response → Status
-  types.py         # Pydantic models
+consult/                # ENGINE — no mcp.* imports
+  runner.py             # asyncio.gather + LiteLLM fanout + progress log
+  capsule.py            # post-fanout structured extraction
+  synth.py              # flagship synthesiser pass
+  refine.py             # iterative arbiter-driven loop (max 3 rounds) + continuation
+  sequence.py           # chained multi-step consultations
+  orchestrate.py        # consult() hero: fanout → capsule → synth, typed
+  ledger.py             # daily cost ledger (consult-ledger entry point)
+  viewer.py             # static HTML run renderer (consult-view entry point)
+  registry.py           # models.json + stances.json loader
+  artifacts.py          # ~/.consult/runs/<id>/ layout + injectable URI formatter
+  attachments.py        # file/diff inlining
+  context.py            # per-run context bundle + blinding scrub
+  progress.py           # typed ProgressEvent union (consumer-agnostic)
+  status.py             # LiteLLM response → Status
+  types.py              # Pydantic models
+  mcp/                  # MCP ADAPTER — only thing that imports mcp.*
+    server.py           # MCP wiring (panel, synthesise, consult, refine, sequence)
+    handlers.py         # MCP args-dict adapter — calls engine via typed kwargs
+    schemas.py          # MCP tool JSON Schemas
+    errors.py           # MCP error-envelope wire shape
+    __main__.py         # consult-mcp entry point
   config/
-    models.json    # default model registry
-    stances.json   # default persona prompts
+    models.json         # default model registry
+    stances.json        # default persona prompts
 tests/
-  test_smoke.py    # offline + live tests (40 offline)
+  test_smoke.py         # offline + live tests
 .github/
   workflows/
-    tests.yml      # CI: pytest on 3.11 / 3.12 / 3.13
-FRICTION.md         # dogfooding log
+    tests.yml           # CI: pytest on 3.11 / 3.12 / 3.13
+FRICTION.md             # dogfooding log
+```
+
+### Driving the engine directly
+
+```python
+from consult import orchestrate
+result = await orchestrate.consult("question?", tier="standard")
+print(result.synthesis, result.cost_usd)
+
+# Or compose primitives directly:
+from consult import runner, capsule, synth
+handle = await runner.fanout(prompt, specs)
+handle = await capsule.annotate(handle)
+synth_result = await synth.synthesise(handle.run_id)
+```
+
+A non-MCP consumer can swap the URI scheme on the manifest:
+
+```python
+from consult import artifacts
+artifacts.set_resource_uri_formatter(
+    lambda run_id, slug: f"https://api.example.com/runs/{run_id}/{slug}"
+)
 ```
 
 ## Testing

@@ -1,26 +1,33 @@
 [project]
 name = "consult-mcp-server"
 version = "0.1.0"
-description = "MCP server for multi-model panel orchestration with rich manifest capsules and on-disk artifacts as MCP resources."
+description = "Multi-model panel orchestration engine with an MCP adapter. The engine (consult.*) is MCP-free and usable as a library; the MCP adapter (consult.mcp.*) is an optional extra."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 dependencies = [
-    "mcp>=1.2.0",
     "litellm>=1.55.0",
     "pydantic>=2.6.0",
     "python-dotenv>=1.0.0",
 ]
 
 [project.optional-dependencies]
+# MCP adapter dependencies. Install with `pip install consult-mcp-server[mcp]`
+# to get the `consult-mcp` stdio server. Library consumers driving the
+# engine directly (runner.fanout, refine.refine, orchestrate.consult, etc.)
+# don't need this.
+mcp = [
+    "mcp>=1.2.0",
+]
 dev = [
+    "mcp>=1.2.0",
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     "ruff>=0.4",
 ]
 
 [project.scripts]
-consult-mcp = "consult.__main__:cli"
+consult-mcp = "consult.mcp.__main__:cli"
 consult-ledger = "consult.ledger:cli"
 consult-view = "consult.viewer:cli"
 

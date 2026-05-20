@@ -1,15 +1,25 @@
 """MCP server entry point.
 
 Wires the MCP protocol surface (tool listing, dispatch, resource access,
-stdio main loop) to the per-tool handlers in `consult/handlers.py` and the
-schemas in `consult/schemas.py`. Kept deliberately small — orchestration
-lives elsewhere so the wiring file doesn't drift when handlers change.
+stdio main loop) to the per-tool handlers in `consult/mcp/handlers.py` and
+the schemas in `consult/mcp/schemas.py`. Kept deliberately small —
+orchestration lives in the engine (`consult.orchestrate`, `consult.runner`,
+`consult.refine`, `consult.sequence`, `consult.synth`) so this file doesn't
+drift when engine flows change.
+
+Owns the MCP-specific glue that used to leak into handlers:
+- builds the `progressToken`-aware progress callback per request and passes
+  it into the handler (removes the lazy `from .server import server` cycle
+  the handler used to do)
+- wraps `synthesise`'s markdown output in `TextContent` (every other tool
+  returns a dict for structured-content compatibility)
 """
 
 from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
@@ -24,17 +34,16 @@ from mcp.types import (
     Tool,
 )
 
-from . import (
-    artifacts,
-    errors,
-    handlers,
-    schemas,
-)
+from .. import artifacts
+from ..progress import ProgressEvent, event_message
+from . import errors, handlers, schemas
 
 logger = logging.getLogger("consult")
 
 # Load .env from the working directory, the package directory, and the user's home.
-for p in (Path.cwd() / ".env", Path(__file__).parent.parent / ".env", Path.home() / ".consult" / ".env"):
+# `Path(__file__).parents[2]` resolves to the repo root (consult/mcp/server.py →
+# consult/mcp → consult → repo root) which is where the dev-time .env sits.
+for p in (Path.cwd() / ".env", Path(__file__).parents[2] / ".env", Path.home() / ".consult" / ".env"):
     if p.exists():
         dotenv.load_dotenv(p, override=False)
 
@@ -106,6 +115,45 @@ _HANDLERS = {
     "sequence": handlers.sequence,
 }
 
+# Tools whose result is a markdown blob rather than a structured dict. The
+# dispatcher wraps these in `TextContent` so clients render them directly;
+# every other tool returns a dict so MCP also surfaces `structuredContent`.
+_TEXT_RESULT_TOOLS = {"synthesise"}
+
+
+def _build_progress_callback() -> Callable[[ProgressEvent], Awaitable[None]] | None:
+    """Build a `progressToken`-aware MCP progress callback for the current request.
+
+    Returns None if the client didn't send a `progressToken` — silent for
+    non-subscribers. The wire-format message string is derived from the
+    event via `progress.event_message()`; the event's `(done, total)`
+    populate the wire `progress` / `total` fields. The token is opaque to
+    us; we echo what the client supplied.
+
+    Previously the handlers reached back into `server.request_context` via
+    a lazy import (`from .server import server`) — an upside-down dependency
+    that made the engine handlers MCP-aware. Building the callback here and
+    passing it as a kwarg keeps the handlers pure orchestration.
+    """
+    try:
+        ctx = server.request_context
+    except LookupError:
+        return None
+    token = ctx.meta.progressToken if ctx.meta else None
+    if token is None:
+        return None
+    session = ctx.session
+
+    async def notify(event: ProgressEvent) -> None:
+        await session.send_progress_notification(
+            progress_token=token,
+            progress=float(event.done),
+            total=float(event.total),
+            message=event_message(event),
+        )
+
+    return notify
+
 
 @server.call_tool()
 async def handle_call_tool(
@@ -118,8 +166,9 @@ async def handle_call_tool(
     handler = _HANDLERS.get(name)
     if handler is None:
         return errors.envelope(errors.ErrorCode.INVALID_INPUT, f"Unknown tool: {name}")
+    on_progress = _build_progress_callback()
     try:
-        return await handler(arguments)
+        result = await handler(arguments, on_progress=on_progress)
     except ValueError as e:
         # Caller-side problems: out-of-range params, bad continuation_id,
         # empty prompt list, missing required fields, etc. Raised
@@ -140,6 +189,12 @@ async def handle_call_tool(
         return errors.envelope(
             errors.ErrorCode.INTERNAL_ERROR, f"{type(e).__name__}: {e}"
         )
+    # Wire-shape adaptation for synthesise: a markdown blob is more usefully
+    # delivered as `TextContent` so clients render it directly rather than
+    # forcing them to unwrap a dict.
+    if name in _TEXT_RESULT_TOOLS and isinstance(result, str):
+        return [TextContent(type="text", text=result)]
+    return result
 
 
 # ---- Resources --------------------------------------------------------------

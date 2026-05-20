@@ -24,8 +24,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from . import registry
-from .attachments import ATTACHMENT_SCHEMA_ITEMS
+from .. import registry
+from ..attachments import ATTACHMENT_SCHEMA_ITEMS
 
 # --- Shared sub-schemas -------------------------------------------------------
 
