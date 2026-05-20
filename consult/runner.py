@@ -272,6 +272,10 @@ async def fanout(
     estimate, all_known = estimate_cost(specs, prompt)
     cap = max_run_usd if max_run_usd is not None else registry.default_max_run_usd()
     if estimate > cap:
+        # When some prices are unknown, `estimate` is only the known-priced
+        # portion; the actual run could cost more. Surface that so the cap
+        # message isn't misleading low. Mirrors the dry_run branch below.
+        suffix = "" if all_known else " (known-priced portion only; some unknown)"
         return RunHandle(
             run_id=paths.run_id,
             artifacts_dir=str(paths.root),
@@ -280,7 +284,9 @@ async def fanout(
             cost_known=all_known,
             wall_ms=0,
             partial=True,
-            partial_reason=f"estimated cost ${estimate:.2f} exceeds cap ${cap:.2f}",
+            partial_reason=(
+                f"estimated cost ${estimate:.2f}{suffix} exceeds cap ${cap:.2f}"
+            ),
             blinded=blinded,
         )
     if dry_run:

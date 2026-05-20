@@ -71,3 +71,27 @@ score 0.20 and no convergence — and the script had no idea why.
   steel-manned the dissent, and recommended A (notifications/progress) + D (log
   file fallback). That's exactly the answer worth keeping for when the
   deferred-from-v1 progress feature comes back online.
+
+## 2026-05-20 — third dogfood pass (consult on Polars vs DuckDB)
+
+Ran `consult` (standard tier, 9 panellists, cap $7, ~$0.11) on an external
+analytics question. 7/9 OK, 2 OpenAI panellists rate-limited (third run in a
+row hitting the same shared bucket). Panel unanimous on DuckDB — no bug claims
+made about the codebase. Observations:
+
+- [ux] ~~**Cost cap message is misleading when pricing is partial-unknown**~~ —
+  RESOLVED: cap-exceeded message in `runner.fanout` (runner.py:283) now appends
+  `(known-priced portion only; some unknown)` when `all_known=False`. Mirrors
+  the dry_run branch which already had this disambiguation. Test added.
+- [env] **OpenAI rate-limits hit on every run, both shared keys**. Pass 1 (code
+  tier): gpt-codex + gpt-mini. Pass 2 (code tier): same. Pass 3 (standard tier):
+  gpt-pro + gpt. Pattern: ALL OpenAI panellists fail concurrently on every run
+  from this machine. Per-minute request limit on the OpenAI key. Workarounds:
+  rotate keys, throttle per-provider concurrency, or accept the partial panel.
+- [ux] **Latency variance widens with bigger panels**. Standard-tier run had
+  claude-opus at 33s, kimi at 156s. Wall time is bounded by the slowest. Bigger
+  panels mean longer tails. Per-model timeouts in config already cap at 180-240s
+  so worst case is bounded, but a 5× spread between fastest and slowest in the
+  same panel makes the "wait" feel uneven.
+- [meta] **No bug claims this pass.** The panel engaged with the external
+  question, not the codebase, as intended.

@@ -205,7 +205,27 @@ async def test_fanout_cost_cap_returns_partial(monkeypatch):
     handle = await fanout("p", specs, max_run_usd=0.01)
     assert handle.partial is True
     assert handle.partial_reason and "exceeds cap" in handle.partial_reason
+    assert "known-priced" not in handle.partial_reason  # all_known=True path
     assert handle.manifest == []
+
+
+@pytest.mark.asyncio
+async def test_fanout_cost_cap_message_discloses_partial_pricing(monkeypatch):
+    """When estimate_cost returns all_known=False, the cap message must say
+    so — otherwise the displayed estimate (only the known-priced portion)
+    looks misleadingly low. Mirrors the dry_run branch.
+    """
+    from consult import runner
+    from consult.runner import fanout
+
+    monkeypatch.setattr(runner, "estimate_cost", lambda specs, prompt: (0.50, False))
+    specs = [ModelSpec(model="claude-haiku")]
+    handle = await fanout("p", specs, max_run_usd=0.01)
+    assert handle.partial is True
+    assert handle.partial_reason
+    assert "known-priced portion only" in handle.partial_reason
+    assert "exceeds cap" in handle.partial_reason
+    assert handle.cost_known is False
 
 
 def test_capsule_extract_json_recovers_prose_and_fences():
