@@ -264,7 +264,7 @@ async def test_fanout_emits_progress_callbacks(tmp_path, monkeypatch):
     monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
     monkeypatch.setattr(runner, "estimate_cost", lambda specs, prompt: (0.0, True))
 
-    async def fake_call(spec, slug, per_prompt, paths):
+    async def fake_call(spec, slug, per_prompt, paths, provider_sems=None):
         return ManifestEntry(
             slug=slug,
             model_id="x/y",
@@ -636,7 +636,7 @@ async def test_fanout_progress_callback_failure_does_not_abort_run(tmp_path, mon
     monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
     monkeypatch.setattr(runner, "estimate_cost", lambda specs, prompt: (0.0, True))
 
-    async def fake_call(spec, slug, per_prompt, paths):
+    async def fake_call(spec, slug, per_prompt, paths, provider_sems=None):
         return ManifestEntry(
             slug=slug,
             model_id="x/y",
@@ -663,6 +663,63 @@ async def test_fanout_progress_callback_failure_does_not_abort_run(tmp_path, mon
     assert handle.partial is False
     assert len(handle.manifest) == 1
     assert handle.manifest[0].status is Status.OK
+
+
+@pytest.mark.asyncio
+async def test_fanout_caps_per_provider_concurrency(tmp_path, monkeypatch):
+    """With CONSULT_PROVIDER_CONCURRENCY=anthropic:1, only one Anthropic
+    panellist may be in-flight at a time even if the panel has 5 of them.
+    Locks the FRICTION-driven rate-limit mitigation: without the cap, every
+    panellist hit the provider in lockstep.
+    """
+    import asyncio as _asyncio
+
+    from consult import runner
+    from consult.runner import fanout
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    monkeypatch.setattr(runner, "estimate_cost", lambda specs, prompt: (0.0, True))
+    monkeypatch.setenv("CONSULT_PROVIDER_CONCURRENCY", "anthropic:1")
+    # Drop the registry cache so the env var takes effect on this call.
+    registry.models_config.cache_clear()
+
+    inflight = 0
+    peak = 0
+    real_acompletion = runner.litellm.acompletion
+
+    async def fake_acompletion(**kwargs):
+        nonlocal inflight, peak
+        inflight += 1
+        peak = max(peak, inflight)
+        try:
+            await _asyncio.sleep(0.05)
+        finally:
+            inflight -= 1
+        # Build a minimal LiteLLM-like response object
+        class _Msg:
+            content = "ok\n\nCONFIDENCE: 0.7\nKEY_REASON: x"
+            tool_calls = None
+        class _Choice:
+            message = _Msg()
+            finish_reason = "stop"
+        class _Resp:
+            choices = [_Choice()]
+            usage = None
+            def model_dump(self): return {"_stub": True}
+        return _Resp()
+
+    monkeypatch.setattr(runner.litellm, "acompletion", fake_acompletion)
+    monkeypatch.setattr(runner.litellm, "completion_cost", lambda **_: 0.0)
+
+    specs = [ModelSpec(model="claude-haiku") for _ in range(5)]
+    handle = await fanout("anything", specs)
+    assert handle.partial is False
+    assert len(handle.manifest) == 5
+    assert peak == 1, f"semaphore cap=1 violated: peak in-flight = {peak}"
+
+    # Restore registry cache so other tests aren't affected
+    registry.models_config.cache_clear()
+    monkeypatch.setattr(runner.litellm, "acompletion", real_acompletion)
 
 
 @pytest.mark.asyncio

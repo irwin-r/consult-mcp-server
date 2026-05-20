@@ -91,3 +91,32 @@ def default_max_run_usd() -> float:
     if env:
         return float(env)
     return float(models_config().get("defaults", {}).get("max_run_usd", 5.0))
+
+
+def provider_concurrency() -> dict[str, int]:
+    """Returns provider → max concurrent in-flight LiteLLM calls.
+
+    Sourced from `models.json:defaults.concurrency`, then overlaid with the
+    `CONSULT_PROVIDER_CONCURRENCY` env var (comma-separated `provider:N` pairs).
+    The key `"default"` applies to any provider not explicitly listed — useful
+    for raw LiteLLM IDs that resolve to providers absent from the registry.
+
+    `openai` defaults to 2 because the FRICTION log records OpenAI rate-limits
+    on every panel run from a shared key; the other providers haven't shown
+    the same pattern and default to 5.
+    """
+    cfg_caps = models_config().get("defaults", {}).get("concurrency", {})
+    out: dict[str, int] = {"default": 5}
+    for k, v in cfg_caps.items():
+        out[k] = int(v)
+    env = os.environ.get("CONSULT_PROVIDER_CONCURRENCY")
+    if env:
+        for pair in env.split(","):
+            if ":" not in pair:
+                continue
+            provider, limit = pair.split(":", 1)
+            try:
+                out[provider.strip()] = int(limit)
+            except ValueError:
+                continue
+    return out

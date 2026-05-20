@@ -146,6 +146,13 @@
   "defaults": {
     "synthesiser": "gemini-pro",
     "capsule_extractor": "claude-haiku",
-    "max_run_usd": 5.0
+    "max_run_usd": 5.0,
+    "concurrency": {
+      "openai": 2,
+      "anthropic": 5,
+      "google": 5,
+      "openrouter": 5,
+      "default": 5
+    }
   }
 }

@@ -10,6 +10,7 @@ import logging
 import re
 import time
 from collections.abc import Awaitable, Callable
+from contextlib import nullcontext
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -158,6 +159,7 @@ async def _call_one(
     slug: str,
     per_slug_prompt: str,
     paths: artifacts.RunPaths,
+    provider_sems: dict[str, asyncio.Semaphore] | None = None,
 ) -> ManifestEntry:
     # An unknown alias must fail this single panellist, not the whole panel.
     # `asyncio.gather` without return_exceptions=True would otherwise cancel
@@ -203,16 +205,28 @@ async def _call_one(
     tokens_out: int | None = None
     error: str | None = None
 
+    # Per-provider concurrency gate. The FRICTION log shows OpenAI panellists
+    # rate-limiting concurrently on every panel run — the shared key's
+    # per-minute bucket is exhausted by N parallel calls. The semaphore caps
+    # the in-flight count per provider so e.g. only 2 OpenAI calls run at
+    # once, the rest queue up. `provider_sems["default"]` covers raw LiteLLM
+    # IDs whose provider isn't enumerated in models.json. `nullcontext()` is
+    # async-compatible since Python 3.10 — same shape as a Semaphore, no-op.
+    sem: asyncio.Semaphore | None = None
+    if provider_sems:
+        sem = provider_sems.get(provider) or provider_sems.get("default")
+
     try:
-        resp = await asyncio.wait_for(
-            litellm.acompletion(
-                model=litellm_id,
-                messages=_build_messages(per_slug_prompt, provider),
-                max_tokens=budget,
-                **extra,
-            ),
-            timeout=timeout,
-        )
+        async with sem if sem is not None else nullcontext():
+            resp = await asyncio.wait_for(
+                litellm.acompletion(
+                    model=litellm_id,
+                    messages=_build_messages(per_slug_prompt, provider),
+                    max_tokens=budget,
+                    **extra,
+                ),
+                timeout=timeout,
+            )
         # Persist raw response — use model_dump for Pydantic, fall back to dict
         try:
             raw = resp.model_dump()  # type: ignore[attr-defined]
@@ -403,13 +417,23 @@ async def fanout(
         _build_per_slug_prompt(prompt, registry.resolve_stance(s.stance)) for s in specs
     ]
 
+    # Per-provider semaphores. Built per-fanout (each call gets fresh
+    # semaphores bound to the running loop). Cross-call rate-limiting would
+    # need a per-loop registry — out of scope here; an MCP client typically
+    # issues serial tool calls, so within-panel throttling fully covers the
+    # FRICTION-logged failure mode.
+    caps = registry.provider_concurrency()
+    provider_sems: dict[str, asyncio.Semaphore] = {
+        p: asyncio.Semaphore(n) for p, n in caps.items()
+    }
+
     start = time.time()
     total = len(specs)
     done = 0
 
     async def _run_one(spec: ModelSpec, slug: str, per_prompt: str) -> ManifestEntry:
         nonlocal done
-        entry = await _call_one(spec, slug, per_prompt, paths)
+        entry = await _call_one(spec, slug, per_prompt, paths, provider_sems)
         done += 1
         if on_progress is not None:
             try:
