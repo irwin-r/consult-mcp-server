@@ -1,15 +1,21 @@
 """On-disk run layout + MCP resource URI conventions.
 
 Directory tree under ~/.consult/runs/<run_id>/:
-  prompt.txt              # the base prompt sent to every panellist
-  manifest.json           # the full RunHandle serialised
-  registry_snapshot.json  # frozen registry at run time
-  prompts/<slug>.txt      # per-slug prompt (with stance prefix)
-  responses/<slug>.json   # raw provider response (LiteLLM ModelResponse dump)
-  responses/<slug>.txt    # extracted body text (for resource serving)
-  capsules/<slug>.json    # extracted capsule
+  prompt.txt               # the base prompt sent to every panellist
+  manifest.json            # the full RunHandle serialised
+  registry_snapshot.json   # frozen registry at run time
+  prompts/<slug>.txt       # per-slug prompt (with stance prefix)
+  responses/<slug>.json    # raw provider response (LiteLLM ModelResponse dump)
+  responses/<slug>.txt     # extracted body text (for resource serving)
+  capsules/<slug>.json     # extracted capsule
+  arbiters/round-<n>.json  # refine: per-round ArbiterVerdict (refine runs only)
+  synth_input.txt          # synth: full input sent to the synthesiser
+  synthesis.md             # synth: synthesis output (or error sentinel)
 
 Resource URI scheme: consult://runs/<id>/responses/<slug>
+
+Note: refine round-suffixes slugs as `<base>.r<n>`, so the URI grammar is
+unchanged but slugs may contain dots and an `.r<digit>` suffix.
 """
 
 from __future__ import annotations

@@ -1,15 +1,18 @@
-"""Capsule extractor — turn a raw panellist body into a ~200-token
-structured Capsule via a cheap model returning strict JSON.
+"""Capsule extractor — turn a raw panellist body into a compact structured
+Capsule via a cheap model returning strict JSON.
 
 Runs in parallel across the panel after fanout completes. Failed extractions
-return an empty Capsule rather than failing the whole run; the body is still
-available as a resource.
+return a near-empty Capsule (carrying body-parsed confidence if present)
+rather than failing the whole run; the body is still available as a resource.
+The extractor call, JSON build, and cost lookup are independently wrapped so
+a failure in one stage doesn't poison the others.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 from typing import Any
 
@@ -17,6 +20,8 @@ import litellm
 
 from . import artifacts, registry
 from .types import Capsule, ManifestEntry, RunHandle, Status
+
+logger = logging.getLogger(__name__)
 
 _CAPSULE_PROMPT = """\
 You will be given one panellist's response from a multi-model consultation.
@@ -49,7 +54,6 @@ _CONFIDENCE = re.compile(r"^\s*CONFIDENCE\s*:\s*([0-9.]+)", re.M | re.I)
 
 def _extract_json(text: str) -> dict[str, Any] | None:
     text = text.strip()
-    # Strip markdown fences if present
     if text.startswith("```"):
         text = re.sub(r"^```(?:json)?\n", "", text)
         text = re.sub(r"\n```$", "", text)
@@ -67,9 +71,18 @@ def _extract_json(text: str) -> dict[str, Any] | None:
 
 async def _extract_one(
     body: str, extractor_id: str, timeout: int
-) -> tuple[Capsule, float | None]:
+) -> tuple[Capsule, float | None, bool]:
+    """Returns (capsule, cost_usd, cost_known).
+
+    The extractor call and the cost lookup are kept in separate try blocks so
+    that a price-table miss for the extractor model never discards a
+    successfully extracted capsule. `cost_known=False` distinguishes "we don't
+    know" from 0.0.
+    """
     if not body or not body.strip():
-        return Capsule(), None
+        return Capsule(), None, True  # zero cost is known: we made no call
+
+    # 1) Extraction call — exceptions here mean we couldn't build a capsule
     prompt = _CAPSULE_PROMPT + body
     try:
         resp = await asyncio.wait_for(
@@ -81,21 +94,43 @@ async def _extract_one(
             ),
             timeout=timeout,
         )
+    except Exception as e:
+        logger.warning(
+            "capsule extractor call failed for extractor=%s: %s", extractor_id, e
+        )
+        m = _CONFIDENCE.search(body)
+        conf = float(m.group(1)) if m else None
+        return Capsule(confidence=conf), None, False
+
+    # 2) Capsule build — failures here are JSON shape or Pydantic validation
+    try:
         text = resp.choices[0].message.content or ""
         data = _extract_json(text) or {}
-        # Coerce confidence — model may emit null
         if data.get("confidence") in (None, "null"):
             m = _CONFIDENCE.search(body)
             if m:
                 data["confidence"] = float(m.group(1))
-        return Capsule(**{k: v for k, v in data.items() if k in Capsule.model_fields}), getattr(
-            litellm, "completion_cost", lambda **_: 0.0
-        )(completion_response=resp) if hasattr(litellm, "completion_cost") else None
-    except Exception:
-        # Fallback: parse confidence from body, leave the rest blank
+        capsule = Capsule(
+            **{k: v for k, v in data.items() if k in Capsule.model_fields}
+        )
+    except Exception as e:
+        logger.warning("capsule JSON build failed for extractor=%s: %s", extractor_id, e)
         m = _CONFIDENCE.search(body)
         conf = float(m.group(1)) if m else None
-        return Capsule(confidence=conf), None
+        capsule = Capsule(confidence=conf)
+
+    # 3) Cost lookup — never let a pricing miss discard a successful capsule
+    try:
+        cost = litellm.completion_cost(completion_response=resp)
+        cost_known = cost is not None
+    except Exception as e:
+        logger.warning(
+            "capsule cost lookup failed for extractor=%s: %s", extractor_id, e
+        )
+        cost = None
+        cost_known = False
+
+    return capsule, cost, cost_known
 
 
 async def annotate(handle: RunHandle, *, extractor: str | None = None) -> RunHandle:
@@ -124,15 +159,19 @@ async def annotate(handle: RunHandle, *, extractor: str | None = None) -> RunHan
 
     results = await asyncio.gather(*tasks)
     extra_cost = 0.0
-    for entry, (capsule, cost) in zip(targets, results, strict=True):
+    extractor_cost_all_known = True
+    for entry, (capsule, cost, cost_known) in zip(targets, results, strict=True):
         entry.capsule = capsule
         if capsule.confidence is not None:
             entry.confidence = capsule.confidence
         if cost:
             extra_cost += cost
-        # Persist capsule artifact
+        if not cost_known:
+            extractor_cost_all_known = False
         paths.capsule_for(entry.slug).write_text(capsule.model_dump_json(indent=2))
 
     handle.cost_usd += extra_cost
+    if not extractor_cost_all_known:
+        handle.cost_known = False
     artifacts.write_manifest(paths, handle.model_dump())
     return handle

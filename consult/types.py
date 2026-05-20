@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from enum import Enum
+from math import ceil
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class Status(str, Enum):
@@ -50,7 +51,14 @@ class Capsule(BaseModel):
 
 
 class ManifestEntry(BaseModel):
-    """Per-panellist row returned to the parent. ~200 tokens."""
+    """Per-panellist row returned to the parent. ~200 tokens.
+
+    Invariants enforced by `_validate_status_payload`:
+    - Status in {ERROR, TIMEOUT} ⇒ `error` is set
+    - Numeric fields (latency_ms, tokens_*, cost_usd) are non-negative when set
+    - `cost_known=False` distinguishes "we couldn't look up the price" from
+      a true zero cost (matters for the `max_run_usd` cap math in refine).
+    """
 
     slug: str
     model_id: str | None = Field(
@@ -60,14 +68,23 @@ class ManifestEntry(BaseModel):
     status: Status
     finish_reason: str | None = None
     capsule: Capsule | None = None
-    confidence: float | None = None
+    confidence: float | None = Field(None, ge=0.0, le=1.0)
     resource_uri: str = Field(..., description="consult://runs/<id>/responses/<slug>")
     body_path: str = Field(..., description="On-disk path for direct access")
-    latency_ms: int | None = None
-    tokens_in: int | None = None
-    tokens_out: int | None = None
-    cost_usd: float | None = None
+    latency_ms: int | None = Field(None, ge=0)
+    tokens_in: int | None = Field(None, ge=0)
+    tokens_out: int | None = Field(None, ge=0)
+    cost_usd: float | None = Field(None, ge=0.0)
+    cost_known: bool = True
     error: str | None = None
+
+    @model_validator(mode="after")
+    def _validate_status_payload(self) -> ManifestEntry:
+        if self.status in (Status.ERROR, Status.TIMEOUT) and not self.error:
+            raise ValueError(
+                f"ManifestEntry with status={self.status.value} must carry an error message"
+            )
+        return self
 
 
 class RunHandle(BaseModel):
@@ -76,19 +93,32 @@ class RunHandle(BaseModel):
     run_id: str
     artifacts_dir: str
     manifest: list[ManifestEntry]
-    cost_usd: float
-    wall_ms: int
+    cost_usd: float = Field(..., ge=0.0)
+    cost_known: bool = True
+    wall_ms: int = Field(..., ge=0)
     partial: bool = False
     partial_reason: str | None = None
     blinded: bool = False
+
+    @model_validator(mode="after")
+    def _validate_partial(self) -> RunHandle:
+        if self.partial and not self.partial_reason:
+            raise ValueError("RunHandle.partial=True requires partial_reason")
+        if not self.partial and self.partial_reason:
+            raise ValueError("RunHandle.partial=False must not carry a partial_reason")
+        return self
+
+    def status_counts(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for m in self.manifest:
+            counts[m.status.value] = counts.get(m.status.value, 0) + 1
+        return counts
 
     def usable(self, min_ok: int | None = None, min_providers: int | None = None) -> bool:
         """Parametric viability check.
 
         Defaults: min_ok = max(2, ceil(len(manifest) * 0.6)); min_providers = min(2, panel_size).
         """
-        from math import ceil
-
         n = len(self.manifest)
         if min_ok is None:
             min_ok = max(2, ceil(n * 0.6))
@@ -111,8 +141,9 @@ class RunResult(BaseModel):
     run_id: str
     synthesis: str
     manifest: list[ManifestEntry]
-    cost_usd: float
-    wall_ms: int
+    cost_usd: float = Field(..., ge=0.0)
+    cost_known: bool = True
+    wall_ms: int = Field(..., ge=0)
     partial: bool = False
 
 
@@ -122,6 +153,10 @@ class ArbiterVerdict(BaseModel):
     `score` is a sufficiency rating (1.0 = strong consensus, ready to ship)
     rather than absolute truth. `gaps` and `next_round_focus` feed the next
     round's prompt.
+
+    `parsed_ok=False` means the arbiter call or JSON parse failed; downstream
+    callers must not feed `gaps` into a follow-up prompt in that case (the
+    "gaps" carry an exception message, not a real arbiter finding).
     """
 
     round: int
@@ -130,6 +165,9 @@ class ArbiterVerdict(BaseModel):
     next_round_focus: str = ""
     reasoning: str = ""
     cost_usd: float | None = None
+    cost_known: bool = True
+    parsed_ok: bool = True
+    error: str | None = None
 
 
 class RefineResult(BaseModel):
@@ -141,13 +179,14 @@ class RefineResult(BaseModel):
     """
 
     run_id: str
-    rounds_completed: int
+    rounds_completed: int = Field(..., ge=0)
     final_manifest: list[ManifestEntry]
     verdicts: list[ArbiterVerdict]
     synthesis: str
     converged: bool = Field(..., description="True if score >= threshold")
-    threshold: float
-    cost_usd: float
-    wall_ms: int
+    threshold: float = Field(..., ge=0.0, le=1.0)
+    cost_usd: float = Field(..., ge=0.0)
+    cost_known: bool = True
+    wall_ms: int = Field(..., ge=0)
     partial: bool = False
     partial_reason: str | None = None

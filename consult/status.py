@@ -1,10 +1,83 @@
-"""Classify a LiteLLM response (or exception) into a Status."""
+"""Classify a LiteLLM response (or exception) into a Status.
+
+Exception classification uses LiteLLM's typed exception hierarchy where
+available (`litellm.exceptions.*`) and falls back to substring matching on
+the message only for exception types LiteLLM doesn't model. Substring
+matching was the v1 default; it mis-classifies (e.g. socket "connection rate
+limit reset" → RATE_LIMITED) so we prefer typed checks first.
+"""
 
 from __future__ import annotations
 
+import asyncio
+import logging
 from typing import Any
 
 from .types import Status
+
+logger = logging.getLogger(__name__)
+
+
+def _classify_exception(exc: BaseException) -> Status:
+    # LiteLLM exposes typed exceptions; import lazily so tests don't require it
+    try:
+        from litellm import exceptions as lex
+    except Exception:  # pragma: no cover — litellm always available in production
+        lex = None  # type: ignore[assignment]
+
+    if lex is not None:
+        # Order matters: Timeout is sometimes a subclass of APIConnectionError
+        timeout_classes: tuple[type, ...] = (asyncio.TimeoutError, TimeoutError)
+        for name in ("Timeout", "APITimeoutError"):
+            cls = getattr(lex, name, None)
+            if cls:
+                timeout_classes = (*timeout_classes, cls)
+        if isinstance(exc, timeout_classes):
+            return Status.TIMEOUT
+        rate_cls = getattr(lex, "RateLimitError", None)
+        if rate_cls and isinstance(exc, rate_cls):
+            return Status.RATE_LIMITED
+        cpv_cls = getattr(lex, "ContentPolicyViolationError", None)
+        if cpv_cls and isinstance(exc, cpv_cls):
+            return Status.CONTENT_FILTERED
+        # Auth / BadRequest / NotFound / ContextWindow → ERROR
+        # (these are configuration bugs, not transient — caller should see them
+        # as ERROR and inspect the message)
+        for name in (
+            "AuthenticationError",
+            "BadRequestError",
+            "NotFoundError",
+            "ContextWindowExceededError",
+            "InvalidRequestError",
+            "PermissionDeniedError",
+        ):
+            cls = getattr(lex, name, None)
+            if cls and isinstance(exc, cls):
+                return Status.ERROR
+        # ServiceUnavailableError / InternalServerError / APIConnectionError →
+        # treat as transient ERROR (caller may retry)
+        for name in (
+            "ServiceUnavailableError",
+            "InternalServerError",
+            "APIConnectionError",
+        ):
+            cls = getattr(lex, name, None)
+            if cls and isinstance(exc, cls):
+                return Status.ERROR
+
+    # Plain Python timeouts (asyncio.wait_for) still need to map to TIMEOUT
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+        return Status.TIMEOUT
+
+    # Fallback: substring matching for genuinely unknown exception types.
+    msg = str(exc).lower()
+    if "rate" in msg and "limit" in msg:
+        return Status.RATE_LIMITED
+    if "timeout" in msg or "timed out" in msg:
+        return Status.TIMEOUT
+    if "content_filter" in msg or "content policy" in msg:
+        return Status.CONTENT_FILTERED
+    return Status.ERROR
 
 
 def classify(
@@ -17,14 +90,7 @@ def classify(
     (a known OR thinking-model failure mode) are classified as EMPTY.
     """
     if exception is not None:
-        msg = str(exception).lower()
-        if "rate" in msg and "limit" in msg:
-            return Status.RATE_LIMITED, None, ""
-        if "timeout" in msg or "timed out" in msg:
-            return Status.TIMEOUT, None, ""
-        if "content_filter" in msg or "content policy" in msg:
-            return Status.CONTENT_FILTERED, None, ""
-        return Status.ERROR, None, ""
+        return _classify_exception(exception), None, ""
 
     if response is None:
         return Status.EMPTY, None, ""

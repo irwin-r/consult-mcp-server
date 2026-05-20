@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import time
 from typing import Any
@@ -29,6 +30,8 @@ from .types import (
     Status,
 )
 
+logger = logging.getLogger(__name__)
+
 _ARBITER_PROMPT = """\
 You are evaluating whether a multi-model panel has reached sufficient \
 agreement to ship a final answer. You are scoring **sufficiency for action**, \
@@ -36,6 +39,11 @@ not absolute truth.
 
 Original question:
 {question}
+
+Panel health: {usable_count} of {total_count} panellists returned usable \
+responses ({health_breakdown}). Down-weight your sufficiency score if a \
+significant fraction of the panel failed — consensus from half a panel is \
+weaker evidence than consensus from a full panel.
 
 Round {round_num} panel capsules:
 {capsules}
@@ -142,10 +150,22 @@ async def _ask_arbiter(
     litellm_id = entry["litellm_id"]
     timeout = entry.get("default_timeout_s", 180)
 
+    usable_count = sum(1 for m in manifest if m.status in (Status.OK, Status.TRUNCATED))
+    counts: dict[str, int] = {}
+    for m in manifest:
+        counts[m.status.value] = counts.get(m.status.value, 0) + 1
+    health_breakdown = ", ".join(f"{v}× {k}" for k, v in sorted(counts.items()))
+
     prompt = _ARBITER_PROMPT.format(
-        question=question, round_num=round_num, capsules=_format_capsules(manifest)
+        question=question,
+        round_num=round_num,
+        capsules=_format_capsules(manifest),
+        usable_count=usable_count,
+        total_count=len(manifest),
+        health_breakdown=health_breakdown,
     )
-    cost: float | None = None
+
+    # 1) Call — exception here means we never got text back
     try:
         resp = await asyncio.wait_for(
             litellm.acompletion(
@@ -156,29 +176,76 @@ async def _ask_arbiter(
             ),
             timeout=timeout,
         )
-        text = resp.choices[0].message.content or ""
-        data = _extract_json(text) or {}
-        try:
-            cost = litellm.completion_cost(completion_response=resp)
-        except Exception:
-            cost = None
-        return ArbiterVerdict(
-            round=round_num,
-            score=float(data.get("score", 0.0)),
-            gaps=list(data.get("gaps") or []),
-            next_round_focus=str(data.get("next_round_focus") or ""),
-            reasoning=str(data.get("reasoning") or ""),
-            cost_usd=cost,
-        )
     except Exception as e:
-        # Arbiter failure: assume not converged so caller decides whether to retry
+        logger.warning("arbiter call failed: %s: %s", type(e).__name__, e)
         return ArbiterVerdict(
             round=round_num,
             score=0.0,
-            gaps=[f"arbiter error: {type(e).__name__}: {e!s:.150}"],
-            reasoning="arbiter call failed; treating as non-convergent",
+            gaps=[],
+            reasoning="arbiter call failed; refine must abort or retry",
             cost_usd=None,
+            cost_known=False,
+            parsed_ok=False,
+            error=f"{type(e).__name__}: {e!s:.150}",
         )
+
+    text = resp.choices[0].message.content or ""
+
+    # 2) Cost — independent of parsing
+    try:
+        cost = litellm.completion_cost(completion_response=resp)
+        cost_known = cost is not None
+    except Exception as e:
+        logger.warning("arbiter cost lookup failed: %s", e)
+        cost = None
+        cost_known = False
+
+    # 3) JSON parse — failure here is real signal (don't pollute gaps with an
+    # exception string; the next round's prompt would silently include it)
+    data = _extract_json(text)
+    if data is None:
+        logger.warning(
+            "arbiter returned non-JSON; sample=%r", text[:120].replace("\n", " ")
+        )
+        return ArbiterVerdict(
+            round=round_num,
+            score=0.0,
+            gaps=[],
+            reasoning="arbiter returned non-JSON output",
+            cost_usd=cost,
+            cost_known=cost_known,
+            parsed_ok=False,
+            error="json_parse_failed",
+        )
+
+    # 4) Score coercion — strings like "high" must not silently float-fail
+    try:
+        score = float(data.get("score", 0.0))
+        if not 0.0 <= score <= 1.0:
+            raise ValueError(f"out of range: {score}")
+    except (TypeError, ValueError) as e:
+        logger.warning("arbiter score not parseable: %s", e)
+        return ArbiterVerdict(
+            round=round_num,
+            score=0.0,
+            gaps=[],
+            reasoning="arbiter score field malformed",
+            cost_usd=cost,
+            cost_known=cost_known,
+            parsed_ok=False,
+            error=f"bad_score: {e!s:.100}",
+        )
+
+    return ArbiterVerdict(
+        round=round_num,
+        score=score,
+        gaps=list(data.get("gaps") or []),
+        next_round_focus=str(data.get("next_round_focus") or ""),
+        reasoning=str(data.get("reasoning") or ""),
+        cost_usd=cost,
+        cost_known=cost_known,
+        parsed_ok=True,
+    )
 
 
 def _suffix_specs(specs: list[ModelSpec], round_num: int) -> list[ModelSpec]:
@@ -222,17 +289,26 @@ async def refine(
     verdicts: list[ArbiterVerdict] = []
     final_manifest: list[ManifestEntry] = []
     cumulative_cost = 0.0
+    cost_all_known = True
     converged = False
     partial_reason: str | None = None
 
     round_prompt = prompt
     for round_num in range(1, max_rounds + 1):
-        # Estimate next-round cost; refuse if it'd blow the cap
-        estimate = runner.estimate_cost(specs, round_prompt)
+        # Estimate next-round cost; refuse if it'd blow the cap.
+        # If pricing is unknown for any spec, refuse conservatively past the
+        # first round to avoid an unbounded bill.
+        estimate, est_known = runner.estimate_cost(specs, round_prompt)
         if cumulative_cost + estimate > cap:
             partial_reason = (
                 f"would exceed cap: spent ${cumulative_cost:.2f}, next round estimate "
                 f"${estimate:.2f}, cap ${cap:.2f}"
+            )
+            break
+        if not est_known and round_num > 1:
+            partial_reason = (
+                "refusing further rounds: per-model pricing unknown for at least one "
+                f"panellist, can't validate cap (${cumulative_cost:.2f} spent / ${cap:.2f} cap)"
             )
             break
 
@@ -243,12 +319,24 @@ async def refine(
         handle = await capsule.annotate(handle)
         final_manifest = handle.manifest
         cumulative_cost += handle.cost_usd
+        if not handle.cost_known:
+            cost_all_known = False
 
         verdict = await _ask_arbiter(prompt, round_num, handle.manifest, arbiter_alias)
         verdicts.append(verdict)
         if verdict.cost_usd:
             cumulative_cost += verdict.cost_usd
         paths.arbiter_for(round_num).write_text(verdict.model_dump_json(indent=2))
+
+        if not verdict.parsed_ok:
+            # Don't continue: an arbiter call/parse failure means we can't trust
+            # the verdict to drive a next-round prompt. Stop the loop and let
+            # the caller decide what to do with the final manifest we have.
+            partial_reason = (
+                f"arbiter failed at round {round_num} ({verdict.error}); "
+                "loop aborted to avoid feeding error text into next-round prompt"
+            )
+            break
 
         if verdict.score >= threshold:
             converged = True
@@ -273,6 +361,7 @@ async def refine(
         converged=converged,
         threshold=threshold,
         cost_usd=cumulative_cost,
+        cost_known=cost_all_known,
         wall_ms=wall_ms,
         partial=partial_reason is not None,
         partial_reason=partial_reason,

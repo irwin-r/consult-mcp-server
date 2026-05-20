@@ -29,10 +29,6 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["consult"]
 
-[tool.hatch.build.targets.wheel.force-include]
-"config/models.json" = "consult/config/models.json"
-"config/stances.json" = "consult/config/stances.json"
-
 [tool.ruff]
 line-length = 110
 target-version = "py311"

@@ -9,9 +9,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from typing import Any
 
 import litellm
+
+logger = logging.getLogger(__name__)
 
 from . import artifacts, registry
 from .types import Status
@@ -92,14 +95,46 @@ async def synthesise(
     budget = max(entry.get("default_budget_tokens", 16000), 16000)
     timeout = entry.get("default_timeout_s", 300)
 
-    resp = await asyncio.wait_for(
-        litellm.acompletion(
-            model=litellm_id,
-            messages=[{"role": "user", "content": synth_input}],
-            max_tokens=budget,
-        ),
-        timeout=timeout,
-    )
-    text = (resp.choices[0].message.content or "").strip()
+    # Containment: a synthesiser failure must not tear down the parent request
+    # (consult / refine). Persist a clear sentinel to synthesis.md so the run
+    # artifact directory remains consistent.
+    try:
+        resp = await asyncio.wait_for(
+            litellm.acompletion(
+                model=litellm_id,
+                messages=[{"role": "user", "content": synth_input}],
+                max_tokens=budget,
+            ),
+            timeout=timeout,
+        )
+    except Exception as e:
+        logger.warning("synth call failed (%s): %s", litellm_id, e)
+        text = (
+            f"# Synthesis unavailable\n\n"
+            f"The synthesiser (`{litellm_id}`) failed: `{type(e).__name__}: {e!s:.300}`.\n\n"
+            f"The panel manifest is still available at the run's artifacts. "
+            f"Retry `synthesise(run_id, by_model=...)` with a different model."
+        )
+        (paths.root / "synthesis.md").write_text(text)
+        return text
+
+    content = resp.choices[0].message.content
+    if not content or not content.strip():
+        finish = getattr(resp.choices[0], "finish_reason", None)
+        logger.warning(
+            "synth produced empty content (finish_reason=%s) for %s",
+            finish,
+            litellm_id,
+        )
+        text = (
+            f"# Synthesis empty\n\n"
+            f"The synthesiser (`{litellm_id}`) returned no content "
+            f"(finish_reason=`{finish}`). "
+            f"Retry with a larger budget or a different model."
+        )
+        (paths.root / "synthesis.md").write_text(text)
+        return text
+
+    text = content.strip()
     (paths.root / "synthesis.md").write_text(text)
     return text

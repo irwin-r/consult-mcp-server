@@ -11,7 +11,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-_PKG_CONFIG = Path(__file__).parent.parent / "config"
+_PKG_CONFIG = Path(__file__).parent / "config"
 _USER_CONFIG = Path(os.path.expanduser("~/.consult"))
 
 

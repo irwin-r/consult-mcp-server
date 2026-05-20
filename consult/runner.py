@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from typing import Any
 
@@ -15,8 +16,15 @@ from . import artifacts, registry
 from .status import classify
 from .types import ManifestEntry, ModelSpec, RunHandle, Status
 
-litellm.drop_params = True  # silently drop unsupported params per provider
+logger = logging.getLogger(__name__)
 
+# Drop unsupported params per provider so e.g. `reasoning_effort` on a
+# non-reasoning model is silently ignored rather than failing the panel.
+litellm.drop_params = True
+
+# CONTRACT: capsule.py:_CONFIDENCE and the capsule extractor prompt depend on
+# these exact line prefixes (`CONFIDENCE:` and `KEY_REASON:`). Don't rename
+# either without updating both.
 _FOOTER = """\
 ---
 End your response with EXACTLY these two lines (after your main answer):
@@ -75,6 +83,7 @@ async def _call_one(
     finish: str | None = None
     body = ""
     cost: float | None = None
+    cost_known: bool = True
     tokens_in: int | None = None
     tokens_out: int | None = None
     error: str | None = None
@@ -103,21 +112,32 @@ async def _call_one(
             tokens_out = getattr(usage, "completion_tokens", None)
         try:
             cost = litellm.completion_cost(completion_response=resp)
-        except Exception:
+            cost_known = cost is not None
+        except Exception as ce:  # noqa: BLE001
+            logger.warning("cost lookup failed for %s: %s", litellm_id, ce)
             cost = None
+            cost_known = False
 
-    except TimeoutError:
+    except (TimeoutError, asyncio.TimeoutError):
         status, finish, body = Status.TIMEOUT, None, ""
         error = f"timeout after {timeout}s"
+        cost_known = True  # no call was billable
     except Exception as e:  # noqa: BLE001 — LiteLLM raises many concrete types
         status, finish, body = classify(None, exception=e)
-        error = str(e)[:500]
+        error = str(e)[:500] or f"{type(e).__name__}"
+        cost_known = True  # no call was billable
 
     paths.response_text(slug).write_text(body)
     latency_ms = int((time.time() - start) * 1000)
 
-    persona = registry.resolve_stance(spec.stance) if spec.stance else None
     persona_label = spec.stance if spec.stance else None
+
+    # Status.ERROR/TIMEOUT require a non-empty error per the model invariant.
+    # Defensive: if classify() returns ERROR with no exception path taken (e.g.
+    # malformed empty response), synthesise a placeholder so construction
+    # doesn't blow up — the underlying classifier already logged the shape.
+    if status in (Status.ERROR, Status.TIMEOUT) and not error:
+        error = f"{status.value}: no provider exception captured"
 
     return ManifestEntry(
         slug=slug,
@@ -131,32 +151,44 @@ async def _call_one(
         tokens_in=tokens_in,
         tokens_out=tokens_out,
         cost_usd=cost,
+        cost_known=cost_known,
         error=error,
         confidence=None,  # populated by capsule extractor
         capsule=None,
     )
 
 
-def estimate_cost(specs: list[ModelSpec], prompt: str) -> float:
-    """Rough cost estimate using LiteLLM's token counter and registered prices.
+def estimate_cost(specs: list[ModelSpec], prompt: str) -> tuple[float, bool]:
+    """Returns (total_estimate, all_known).
 
-    Best-effort; LiteLLM does not have prices for every OR model. Missing prices
-    contribute 0 to the estimate (caller may treat 0 as "unknown").
+    Uses LiteLLM's per-token price tables via `cost_per_token()`. Models that
+    don't have pricing data set `all_known=False`; caller must treat unknown
+    costs conservatively (a panel with even one unknown-cost spec cannot be
+    validated against `max_run_usd`).
+
+    Unknown-alias errors are re-raised (they're a configuration bug, not a
+    pricing gap).
     """
     total = 0.0
+    all_known = True
     for spec in specs:
-        entry = registry.resolve_model(spec.model)
+        entry = registry.resolve_model(spec.model)  # may raise KeyError — bubble up
         litellm_id = entry["litellm_id"]
         try:
             tin = litellm.token_counter(model=litellm_id, text=prompt)
             tout = entry.get("default_budget_tokens", 8000)
-            cost = litellm.completion_cost(
+            in_per_tok, out_per_tok = litellm.cost_per_token(
                 model=litellm_id, prompt_tokens=tin, completion_tokens=tout
             )
-            total += cost or 0.0
-        except Exception:
+            if in_per_tok is None or out_per_tok is None:
+                all_known = False
+                continue
+            total += in_per_tok + out_per_tok
+        except Exception as e:  # noqa: BLE001
+            logger.warning("estimate_cost: no price for %s (%s)", litellm_id, e)
+            all_known = False
             continue
-    return total
+    return total, all_known
 
 
 async def fanout(
@@ -181,7 +213,7 @@ async def fanout(
         paths = existing_paths
 
     # Estimate cost up front; if dry_run, return immediately with empty manifest
-    estimate = estimate_cost(specs, prompt)
+    estimate, all_known = estimate_cost(specs, prompt)
     cap = max_run_usd if max_run_usd is not None else registry.default_max_run_usd()
     if estimate > cap:
         return RunHandle(
@@ -189,20 +221,23 @@ async def fanout(
             artifacts_dir=str(paths.root),
             manifest=[],
             cost_usd=0.0,
+            cost_known=all_known,
             wall_ms=0,
             partial=True,
             partial_reason=f"estimated cost ${estimate:.2f} exceeds cap ${cap:.2f}",
             blinded=blinded,
         )
     if dry_run:
+        suffix = "" if all_known else " (some prices unknown — actual cost may differ)"
         return RunHandle(
             run_id=paths.run_id,
             artifacts_dir=str(paths.root),
             manifest=[],
             cost_usd=0.0,
+            cost_known=all_known,
             wall_ms=0,
             partial=True,
-            partial_reason=f"dry_run: estimated cost ${estimate:.4f}",
+            partial_reason=f"dry_run: estimated cost ${estimate:.4f}{suffix}",
             blinded=blinded,
         )
 
@@ -226,11 +261,13 @@ async def fanout(
             m.model_id = None
 
     cost_total = sum((m.cost_usd or 0.0) for m in manifest)
+    all_known = all(m.cost_known for m in manifest)
     handle = RunHandle(
         run_id=paths.run_id,
         artifacts_dir=str(paths.root),
         manifest=manifest,
         cost_usd=cost_total,
+        cost_known=all_known,
         wall_ms=wall_ms,
         partial=False,
         blinded=blinded,

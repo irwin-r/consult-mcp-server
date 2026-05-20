@@ -136,11 +136,10 @@ def test_refinement_prompt_includes_gaps_and_focus():
     assert "m-1.r1" in out
 
 
-def test_refine_validates_max_rounds():
+@pytest.mark.asyncio
+async def test_refine_validates_max_rounds():
     with pytest.raises(ValueError, match="max_rounds"):
-        asyncio.get_event_loop().run_until_complete(
-            refine_mod.refine("q", [ModelSpec(model="claude-haiku")], max_rounds=5)
-        )
+        await refine_mod.refine("q", [ModelSpec(model="claude-haiku")], max_rounds=5)
 
 
 def test_arbiter_json_extractor_tolerates_fences():
@@ -148,6 +147,183 @@ def test_arbiter_json_extractor_tolerates_fences():
     data = refine_mod._extract_json(fenced)
     assert data["score"] == 0.7
     assert data["gaps"] == ["x"]
+
+
+# ---- New (post-review) offline tests --------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_fanout_dry_run_returns_partial():
+    """Dry run must never make a billable call and must explain itself."""
+    from consult.runner import fanout
+
+    specs = [ModelSpec(model="claude-haiku"), ModelSpec(model="claude-sonnet")]
+    handle = await fanout("any prompt", specs, dry_run=True)
+    assert handle.partial is True
+    assert handle.partial_reason and "dry_run" in handle.partial_reason
+    assert handle.manifest == []
+    assert handle.cost_usd == 0.0
+
+
+@pytest.mark.asyncio
+async def test_fanout_cost_cap_returns_partial(monkeypatch):
+    """Setting max_run_usd to 0 must abort before any model call."""
+    from consult import runner
+    from consult.runner import fanout
+
+    # Force a non-zero estimate so the cap path is exercised
+    monkeypatch.setattr(runner, "estimate_cost", lambda specs, prompt: (0.99, True))
+    specs = [ModelSpec(model="claude-haiku")]
+    handle = await fanout("p", specs, max_run_usd=0.01)
+    assert handle.partial is True
+    assert handle.partial_reason and "exceeds cap" in handle.partial_reason
+    assert handle.manifest == []
+
+
+def test_capsule_extract_json_recovers_prose_and_fences():
+    """The capsule contract depends on this — one regex change breaks all callers."""
+    from consult.capsule import _extract_json
+
+    assert _extract_json('{"score": 0.5}') == {"score": 0.5}
+    assert _extract_json('```json\n{"k": "v"}\n```') == {"k": "v"}
+    assert _extract_json('prefix\n{"k": 1}\nsuffix') == {"k": 1}
+    assert _extract_json("definitely not json") is None
+    assert _extract_json("") is None
+
+
+def test_parse_resource_uri_rejects_malformed():
+    """Permissive parsing would be a path-traversal hazard."""
+    with pytest.raises(ValueError):
+        artifacts.parse_resource_uri("http://example.com/runs/abc/responses/x")
+    with pytest.raises(ValueError):
+        artifacts.parse_resource_uri("consult://runs/abc")
+    with pytest.raises(ValueError):
+        artifacts.parse_resource_uri("consult://runs/abc/responses/x/extra")
+    with pytest.raises(ValueError):
+        artifacts.parse_resource_uri("consult://runs/abc/capsules/x")
+    # Happy path still works
+    rid, slug = artifacts.parse_resource_uri("consult://runs/r1/responses/alpha.r2")
+    assert rid == "r1"
+    assert slug == "alpha.r2"
+
+
+def test_status_classifier_normal_responses():
+    """Cover the OK/TRUNCATED/EMPTY/CONTENT_FILTERED/MALFORMED response paths.
+
+    Today only the exception branch is tested — the body classification logic
+    could return wrong statuses silently if not exercised.
+    """
+    from types import SimpleNamespace
+
+    from consult.status import classify
+
+    def make_resp(content, finish):
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content=content), finish_reason=finish
+                )
+            ]
+        )
+
+    s, _, body = classify(make_resp("real content", "stop"))
+    assert s == Status.OK
+    assert body == "real content"
+
+    s, _, body = classify(make_resp("partial", "length"))
+    assert s == Status.TRUNCATED
+    assert body == "partial"
+
+    s, _, _ = classify(make_resp("", "length"))
+    assert s == Status.TRUNCATED  # empty body + length still TRUNCATED
+
+    s, _, _ = classify(make_resp("    \n  \n", "stop"))
+    assert s == Status.EMPTY  # whitespace-only body (OR thinking-model fail mode)
+
+    s, _, _ = classify(make_resp("blocked", "content_filter"))
+    assert s == Status.CONTENT_FILTERED
+
+    s, _, _ = classify(SimpleNamespace(choices=[]))
+    assert s == Status.MALFORMED
+
+    s, _, _ = classify(None)
+    assert s == Status.EMPTY
+
+
+def test_synth_build_input_anonymised_and_filters_failures():
+    """Privacy-relevant for blinded mode + correctness for the synthesiser input.
+
+    ERROR/EMPTY entries must be excluded from the synthesiser input, and
+    anonymised mode must not leak model IDs.
+    """
+    from consult.synth import _build_input
+
+    manifest = [
+        {
+            "slug": "panelist-alpha",
+            "model_id": "anthropic/claude-opus-4-7",
+            "persona": "contrarian",
+            "confidence": 0.8,
+            "status": "OK",
+        },
+        {
+            "slug": "panelist-beta",
+            "model_id": "openai/gpt-5.5",
+            "persona": None,
+            "confidence": None,
+            "status": "EMPTY",  # must be filtered out
+        },
+        {
+            "slug": "panelist-gamma",
+            "model_id": "gemini/gemini-3.1-pro-preview",
+            "persona": None,
+            "confidence": 0.6,
+            "status": "TRUNCATED",  # truncated-with-body stays in
+        },
+    ]
+    bodies = {
+        "panelist-alpha": "alpha body",
+        "panelist-beta": "",
+        "panelist-gamma": "gamma body",
+    }
+    rubric = "rubric {n}"
+
+    blinded = _build_input(manifest, bodies, rubric=rubric, anonymised=True)
+    assert "anthropic/claude-opus-4-7" not in blinded
+    assert "openai/gpt-5.5" not in blinded
+    assert "panelist-alpha" in blinded
+    assert "panelist-gamma" in blinded
+    assert "panelist-beta" not in blinded  # filtered
+    assert "alpha body" in blinded
+    assert "rubric 2" in blinded  # only OK + TRUNCATED counted
+
+    unblinded = _build_input(manifest, bodies, rubric=rubric, anonymised=False)
+    assert "anthropic/claude-opus-4-7" in unblinded
+    assert "gemini/gemini-3.1-pro-preview" in unblinded
+
+
+def test_manifest_entry_validates_error_requirement():
+    """Constructing an ERROR/TIMEOUT entry without an error string must fail."""
+    import pydantic
+
+    base = dict(
+        slug="x", status=Status.ERROR, resource_uri="consult://x", body_path="/tmp/x"
+    )
+    with pytest.raises(pydantic.ValidationError):
+        ManifestEntry(**base)
+    # With error, it succeeds
+    ManifestEntry(**base, error="auth failed")
+
+
+def test_run_handle_validates_partial_coupling():
+    """partial=True ⇔ partial_reason set."""
+    import pydantic
+
+    base = dict(run_id="r", artifacts_dir="/tmp/r", manifest=[], cost_usd=0.0, wall_ms=0)
+    with pytest.raises(pydantic.ValidationError):
+        RunHandle(**base, partial=True)  # no reason
+    with pytest.raises(pydantic.ValidationError):
+        RunHandle(**base, partial=False, partial_reason="oops")  # reason without partial
 
 
 # ---- Live tests (gated on API keys) ----------------------------------------
@@ -161,8 +337,7 @@ HAVE_KEYS = bool(
 @pytest.mark.skipif(not HAVE_KEYS, reason="no API keys present")
 def test_estimate_cost_smoke():
     specs = [ModelSpec(model="claude-haiku")]
-    est = estimate_cost(specs, "say hello in five words")
-    # Cost should be > 0 if LiteLLM knows the price; allow 0 since prices change
+    est, _ = estimate_cost(specs, "say hello in five words")
     assert est >= 0
 
 

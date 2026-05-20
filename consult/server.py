@@ -1,7 +1,7 @@
 """MCP server entry point.
 
-Registers three tools — `panel`, `synthesise`, `consult` — and a resource
-handler for `consult://runs/<id>/responses/<slug>` URIs.
+Registers four tools — `panel`, `synthesise`, `consult`, `refine` — and a
+resource handler for `consult://runs/<id>/responses/<slug>` URIs.
 """
 
 from __future__ import annotations
@@ -95,7 +95,7 @@ _SYNTH_SCHEMA = {
         "run_id": {"type": "string", "description": "A run_id returned by `panel` or `consult`."},
         "by_model": {
             "type": "string",
-            "description": "Synthesiser model (alias or LiteLLM ID). Defaults to gemini-pro.",
+            "description": "Synthesiser model (alias or LiteLLM ID). Defaults to the configured default synthesiser (see models.json → defaults.synthesiser).",
         },
         "rubric": {"type": "string", "description": "Custom rubric. Defaults to the consensus rubric."},
         "anonymised": {
