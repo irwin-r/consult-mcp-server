@@ -143,6 +143,17 @@ def render_attachment(item: Any) -> str:
             content = sources.resolve_git_diff(base, head, repo_path)
         except (ValueError, RuntimeError) as e:
             return f"\n## {label}\n[ERROR: {e}]\n"
+        # git_diff bypasses `_read_text_safely` because it doesn't come from
+        # a file path — apply the same size cap here so a thousand-commit
+        # diff can't OOM the server or blow the LLM's token budget. Encoded
+        # length matches the byte-level convention used in `_read_text_safely`.
+        cap = _max_bytes()
+        if len(content.encode("utf-8", errors="ignore")) > cap:
+            return (
+                f"\n## {label}\n"
+                f"[ERROR: diff {len(content)} chars exceeds "
+                f"CONSULT_ATTACHMENT_MAX_BYTES={cap}]\n"
+            )
     elif isinstance(item, dict) and item.get("path"):
         path = item["path"]
         label = item.get("label")

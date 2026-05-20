@@ -17,7 +17,7 @@ import time
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from . import capsule, registry, runner, synth
+from . import artifacts, capsule, registry, runner, synth
 from . import progress as progress_mod
 from .types import ModelSpec
 
@@ -218,25 +218,13 @@ async def sequence(
         cumulative_cost += synth_result.cost_usd
         if not synth_result.cost_known:
             cost_all_known = False
-        # A non-OK synth means the body is a "# Synthesis unavailable" /
-        # "# Synthesis empty" sentinel. Feeding that into the next step as
-        # `prior_synth` would make the panel hallucinate continuity from a
-        # failure marker — short-circuit here so the partial reason is the
-        # real cause, not a downstream mystery.
-        if synth_result.status is not synth.SynthStatus.OK:
-            partial_reason = (
-                f"step {i} synth status={synth_result.status.value}; "
-                "stopping chain rather than feeding a sentinel into the next step"
-            )
-            break
-        progress_done = step_base + panel_n * 2 + 1
-        await emit(progress_mod.SequenceStepCompleted(
-            done=progress_done, total=progress_total, step=i,
-        ))
-        # Persist the per-step total (synthesiser badge + true cost) on disk.
-        # Each step is its own run_id; without this `consult-ledger` reads
-        # the fanout-only cost and silently understates by capsule + synth.
-        from . import artifacts
+
+        # Persist + record the step regardless of synth status. Previously
+        # the synth-failure break ran BEFORE augment_manifest and
+        # steps.append, so a failed step's cost vanished from disk (ledger
+        # under-report) and the result's `steps` array omitted the run
+        # entirely. The break still fires below — but only after the step
+        # has been fully recorded.
         artifacts.augment_manifest(
             artifacts.load_run(handle.run_id),
             synthesiser=synth_alias,
@@ -254,6 +242,23 @@ async def sequence(
                 panel_size=len(handle.manifest),
             )
         )
+        # A non-OK synth means the body is a "# Synthesis unavailable" /
+        # "# Synthesis empty" sentinel. Feeding that into the next step as
+        # `prior_synth` would make the panel hallucinate continuity from a
+        # failure marker — break here so the partial reason is the real
+        # cause, not a downstream mystery. The break runs AFTER the step
+        # has been recorded so its cost still reaches the ledger.
+        if synth_result.status is not synth.SynthStatus.OK:
+            partial_reason = (
+                f"step {i} synth status={synth_result.status.value}; "
+                "stopping chain rather than feeding a sentinel into the next step"
+            )
+            break
+
+        progress_done = step_base + panel_n * 2 + 1
+        await emit(progress_mod.SequenceStepCompleted(
+            done=progress_done, total=progress_total, step=i,
+        ))
         prior_synth = synth_result.text
 
     wall_ms = int((time.time() - start) * 1000)

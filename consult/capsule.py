@@ -323,16 +323,24 @@ async def annotate(
     bundle = context.load_or_none(paths)
     original_question = bundle.prompt_for_downstream() if bundle else None
 
-    targets: list[ManifestEntry] = []
-    bodies: list[str] = []
-    for entry in handle.manifest:
-        if entry.status not in (Status.OK, Status.TRUNCATED):
-            continue
-        bodies.append(paths.response_text(entry.slug).read_text())
-        targets.append(entry)
+    targets: list[ManifestEntry] = [
+        entry for entry in handle.manifest
+        if entry.status in (Status.OK, Status.TRUNCATED)
+    ]
 
     if not targets:
         return handle
+
+    # Read all panellist bodies in parallel off the event loop. Previously
+    # this was a sequential blocking `read_text()` per entry, which on a
+    # 10-panellist run with sizable bodies could stall heartbeats and
+    # other awaits for hundreds of ms. `asyncio.gather` over
+    # `asyncio.to_thread` keeps the loop free while still preserving
+    # per-target ordering.
+    bodies: list[str] = await asyncio.gather(
+        *(asyncio.to_thread(paths.response_text(entry.slug).read_text)
+          for entry in targets)
+    )
 
     total = len(targets)
     done = 0

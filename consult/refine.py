@@ -424,8 +424,13 @@ def _apply_continuation(
         "# Synthesis unavailable",
         "# Synthesis empty",
     )
+    # `lstrip()` first — a future synth model might emit a BOM, leading
+    # newline, or shell-prompt-style preamble before the sentinel heading.
+    # Without it, a single stray whitespace would slip the sentinel past
+    # the check and feed "the prior run failed" verbatim to the new panel.
+    _sentinel_head = prior_synth_text.lstrip()
     for sentinel in _SYNTH_SENTINELS:
-        if prior_synth_text.startswith(sentinel):
+        if _sentinel_head.startswith(sentinel):
             raise ValueError(
                 f"continuation_id {continuation_id} has a sentinel synthesis "
                 f"({sentinel!r}) — the prior run did not produce real synthesis. "
@@ -642,15 +647,17 @@ async def refine(
             on_progress=make_phase_cb(round_base),
             prior_turns=prior_turns,
         )
-        final_manifest = handle.manifest
         # Short-circuit when fanout itself is partial. Running the arbiter
         # on a zero-usable-panel manifest just burns the arbiter's price for
         # a verdict that can only say "no signal" — and on a cap-exceeded
-        # fanout, it would push the spend further over. Surface the
-        # fanout reason verbatim so the caller knows it wasn't refine that
-        # aborted. Done BEFORE the cost rollup since on cap-exceeded fanout
-        # handle.cost_usd is 0 by construction; rolling up zeros is fine
-        # but the early break avoids the capsule call below.
+        # fanout, it would push the spend further over. Surface the fanout
+        # reason verbatim so the caller knows it wasn't refine that aborted.
+        #
+        # Preserve `final_manifest` from the last good round on partial
+        # break: a round-2 cap-exceeded fanout returns `manifest=[]`, and
+        # the previous unconditional `final_manifest = handle.manifest`
+        # would clobber round 1's good consensus with the empty failure
+        # manifest before the break fired.
         if handle.partial:
             cumulative_cost += handle.cost_usd
             if not handle.cost_known:
@@ -659,6 +666,7 @@ async def refine(
                 f"round {round_num} fanout partial: {handle.partial_reason}"
             )
             break
+        final_manifest = handle.manifest
         handle = await capsule.annotate(
             handle,
             on_progress=make_phase_cb(round_base + panel_n),

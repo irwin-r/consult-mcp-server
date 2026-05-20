@@ -459,7 +459,7 @@ def test_error_envelope_shape_round_trips():
     """The structured-error envelope must round-trip through JSON with the
     exact shape agents pattern-match against. Locks in the wire contract.
     """
-    from consult.errors import ConsultError, ErrorCode, ErrorEnvelope
+    from consult.mcp.errors import ConsultError, ErrorCode, ErrorEnvelope
 
     env = ErrorEnvelope(
         error=ConsultError(
@@ -499,9 +499,9 @@ async def test_handle_call_tool_wraps_value_error_in_envelope(monkeypatch):
     `structuredContent` on the wire — agents can branch on `error.code`
     without re-parsing the text body.
     """
-    from consult import server as server_mod
+    from consult.mcp import server as server_mod
 
-    async def bad_handler(args):
+    async def bad_handler(args, **_kwargs):
         raise ValueError("max_rounds must be between 1 and 3")
 
     monkeypatch.setitem(server_mod._HANDLERS, "refine", bad_handler)
@@ -519,9 +519,9 @@ async def test_handle_call_tool_wraps_key_error_as_unknown_model(monkeypatch):
     `synthesise(by_model="bogus")` would propagate that through. Must
     surface as `unknown_model`, not `invalid_input`.
     """
-    from consult import server as server_mod
+    from consult.mcp import server as server_mod
 
-    async def bad_handler(args):
+    async def bad_handler(args, **_kwargs):
         raise KeyError("Unknown model: bogus-alias")
 
     monkeypatch.setitem(server_mod._HANDLERS, "synthesise", bad_handler)
@@ -533,9 +533,9 @@ async def test_handle_call_tool_wraps_key_error_as_unknown_model(monkeypatch):
 @pytest.mark.asyncio
 async def test_handle_call_tool_wraps_file_not_found_as_run_not_found(monkeypatch):
     """`artifacts.load_run` raises FileNotFoundError on missing run_id."""
-    from consult import server as server_mod
+    from consult.mcp import server as server_mod
 
-    async def bad_handler(args):
+    async def bad_handler(args, **_kwargs):
         raise FileNotFoundError("Run not found: 20260520-foo")
 
     monkeypatch.setitem(server_mod._HANDLERS, "synthesise", bad_handler)
@@ -548,7 +548,7 @@ async def test_handle_call_tool_unknown_tool_returns_envelope():
     """Asking for a tool that doesn't exist returns an invalid_input
     envelope rather than raising a ValueError out the top.
     """
-    from consult import server as server_mod
+    from consult.mcp import server as server_mod
 
     payload = await server_mod.handle_call_tool("not-a-tool", {})
     assert payload["ok"] is False
@@ -561,9 +561,9 @@ async def test_handle_call_tool_unhandled_exception_becomes_internal_error(monke
     """Any unanticipated exception type from a handler must become an
     `internal_error` envelope rather than tearing out the MCP dispatch.
     """
-    from consult import server as server_mod
+    from consult.mcp import server as server_mod
 
-    async def bad_handler(args):
+    async def bad_handler(args, **_kwargs):
         raise RuntimeError("kaboom")
 
     monkeypatch.setitem(server_mod._HANDLERS, "panel", bad_handler)
@@ -578,11 +578,11 @@ async def test_handle_call_tool_success_path_returns_dict(monkeypatch):
     `structuredContent` on the response. Returning `list[TextContent]` would
     leave clients with only the JSON-text-blob fallback.
     """
-    from consult import server as server_mod
+    from consult.mcp import server as server_mod
 
     sentinel = {"run_id": "20260520-stub", "synthesis": "ok", "manifest": []}
 
-    async def fake_handler(args):
+    async def fake_handler(args, **_kwargs):
         return sentinel
 
     monkeypatch.setitem(server_mod._HANDLERS, "consult", fake_handler)
@@ -604,7 +604,7 @@ async def test_handle_list_tools_advertises_full_surface():
     """Pin the five-tool surface plus each tool's required input fields.
     Catches schema drift (e.g. dropping `prompt` from `panel`'s required
     list) that the type system can't see."""
-    from consult import server as server_mod
+    from consult.mcp import server as server_mod
 
     tools = await server_mod.handle_list_tools()
     by_name = {t.name: t for t in tools}
@@ -621,7 +621,7 @@ async def test_handle_list_tools_advertises_full_surface():
 async def test_handle_list_resources_surfaces_run_bodies(tmp_path, monkeypatch):
     """list_resources advertises each run's panellist bodies so MCP clients
     can discover them without prior knowledge of the URI grammar."""
-    from consult import server as server_mod
+    from consult.mcp import server as server_mod
 
     monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
     for i in range(2):
@@ -641,7 +641,7 @@ async def test_handle_list_resources_surfaces_run_bodies(tmp_path, monkeypatch):
 @pytest.mark.asyncio
 async def test_handle_list_resources_empty_dir_returns_empty(tmp_path, monkeypatch):
     """No runs on disk → no resources advertised. Don't crash."""
-    from consult import server as server_mod
+    from consult.mcp import server as server_mod
 
     monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
     assert await server_mod.handle_list_resources() == []
@@ -650,7 +650,7 @@ async def test_handle_list_resources_empty_dir_returns_empty(tmp_path, monkeypat
 @pytest.mark.asyncio
 async def test_handle_read_resource_returns_body_text(tmp_path, monkeypatch):
     """Happy path: read a body via its `consult://...` URI."""
-    from consult import server as server_mod
+    from consult.mcp import server as server_mod
 
     monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
     paths = artifacts.create_run()
@@ -667,7 +667,7 @@ async def test_handle_read_resource_missing_body_raises(tmp_path, monkeypatch):
     """Reading a slug whose body wasn't written must raise FileNotFoundError —
     the top-level dispatcher then maps to a RUN_NOT_FOUND envelope rather
     than returning a misleading empty body."""
-    from consult import server as server_mod
+    from consult.mcp import server as server_mod
 
     monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
     paths = artifacts.create_run()
@@ -683,12 +683,12 @@ async def test_handle_call_tool_dispatch_routes_each_tool_name(monkeypatch):
     """The dispatch chain in handle_call_tool must route each tool name to
     its corresponding _handle_*. A typo (e.g. `"Panel"` vs `"panel"`) here
     silently breaks one tool with no compile-time signal."""
-    from consult import server as server_mod
+    from consult.mcp import server as server_mod
 
     for tool_name in ("panel", "consult", "refine", "sequence", "synthesise"):
         called: list[str] = []
 
-        async def fake(args, _name=tool_name, _called=called):
+        async def fake(args, _name=tool_name, _called=called, **_kwargs):
             _called.append(_name)
             return {"routed": _name}
 
@@ -3257,7 +3257,7 @@ def test_sources_resolve_git_diff_against_real_repo(tmp_path, monkeypatch):
 async def test_handle_sequence_per_step_attachments(tmp_path, monkeypatch):
     """A sequence with object-form prompts can carry per-step attachments
     that override the top-level default."""
-    from consult.handlers import sequence as _handle_sequence
+    from consult.mcp.handlers import sequence as _handle_sequence
 
     # Stub out the underlying sequence to capture what prompts arrive.
     captured: dict[str, list[str]] = {}
@@ -3269,7 +3269,7 @@ async def test_handle_sequence_per_step_attachments(tmp_path, monkeypatch):
             steps=[], final_synthesis="", cost_usd=0.0, cost_known=True, wall_ms=0,
         )
 
-    monkeypatch.setattr("consult.handlers.sequence_mod.sequence", fake_sequence)
+    monkeypatch.setattr("consult.mcp.handlers.sequence_mod.sequence", fake_sequence)
 
     f_default = tmp_path / "default.txt"
     f_default.write_text("DEFAULT-CONTENT")
@@ -3902,9 +3902,9 @@ async def test_consult_handler_accumulates_synth_cost(tmp_path, monkeypatch):
     handler silently understated `cost_usd` (often the biggest line item).
     """
     from consult import capsule as capsule_mod
-    from consult import handlers
     from consult import runner as runner_mod
     from consult import synth as synth_mod
+    from consult.mcp import handlers
 
     monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
 
@@ -3950,9 +3950,9 @@ async def test_consult_handler_propagates_cost_known_from_handle(tmp_path, monke
     had partial pricing — the cap check was silently invalid.
     """
     from consult import capsule as capsule_mod
-    from consult import handlers
     from consult import runner as runner_mod
     from consult import synth as synth_mod
+    from consult.mcp import handlers
 
     monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
 
@@ -4222,11 +4222,17 @@ async def test_consult_handler_swallows_progress_callback_failure(tmp_path, monk
     """A progress-callback failure during the synth phase must NOT tear
     down the tool. Pre-fix the consult handler called `await base(event)`
     directly; a disconnected MCP session surfaced as INTERNAL_ERROR.
+
+    Post-handler/server cycle inversion: the callback is no longer pulled
+    from the MCP context inside the handler — the server builds it and
+    passes it in. The test now passes a crashy `on_progress` directly into
+    `handlers.consult` and asserts the synth-phase emit (`_safe_emit` in
+    `orchestrate.consult`) still swallows the failure.
     """
     from consult import capsule as capsule_mod
-    from consult import handlers
     from consult import runner as runner_mod
     from consult import synth as synth_mod
+    from consult.mcp import handlers
 
     monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
 
@@ -4253,23 +4259,17 @@ async def test_consult_handler_swallows_progress_callback_failure(tmp_path, monk
     async def fake_synth(*args, **kwargs):
         return synth_mod.SynthResult(text="ok")
 
-    async def crashy_cb():
-        async def inner(event):
-            raise RuntimeError("client disconnected")
-        return inner
-
-    cb = await crashy_cb()
+    async def crashy_cb(event):
+        raise RuntimeError("client disconnected")
 
     monkeypatch.setattr(runner_mod, "fanout", fake_fanout)
-    monkeypatch.setattr(handlers.runner, "fanout", fake_fanout)
     monkeypatch.setattr(capsule_mod, "annotate", fake_annotate)
-    monkeypatch.setattr(handlers.capsule, "annotate", fake_annotate)
     monkeypatch.setattr(synth_mod, "synthesise", fake_synth)
-    monkeypatch.setattr(handlers.synth, "synthesise", fake_synth)
-    monkeypatch.setattr(handlers, "_progress_callback", lambda: cb)
 
     # No exception should propagate; tool returns its normal payload.
-    result = await handlers.consult({"prompt": "p", "tier": "quick"})
+    result = await handlers.consult(
+        {"prompt": "p", "tier": "quick"}, on_progress=crashy_cb
+    )
     assert result["partial"] is False
     assert result["synthesis"] == "ok"
 
@@ -4412,8 +4412,8 @@ async def test_refine_rejects_typo_synthesiser_before_fanout(tmp_path, monkeypat
 
 
 async def test_consult_rejects_typo_synthesiser_before_fanout(tmp_path, monkeypatch):
-    from consult import handlers
     from consult import runner as runner_mod
+    from consult.mcp import handlers
 
     monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
     fanout_calls = {"n": 0}
@@ -4597,3 +4597,369 @@ async def test_synth_defensive_extraction_on_unexpected_shape(tmp_path, monkeypa
     # Did not crash. Sentinel text written.
     assert "# Synthesis unavailable" in result.text
     assert "unexpected response shape" in result.text
+
+
+# ---- Engine/MCP-separation tests ------------------------------------------
+# Lock in the post-refactor invariants: the engine doesn't import mcp.*,
+# the resource_uri formatter is overridable, and orchestrate.consult is
+# directly callable without the MCP adapter in the loop.
+
+
+def test_engine_modules_do_not_import_mcp_sdk():
+    """The engine (`consult.*` minus `consult.mcp.*`) must not transitively
+    pull in the `mcp` SDK. A regression would silently re-couple a library
+    consumer to a dependency they declined to install.
+    """
+    import importlib
+    import pkgutil
+
+    import consult
+
+    engine_modules: list[str] = []
+    for info in pkgutil.iter_modules(consult.__path__, prefix="consult."):
+        if info.name == "consult.mcp" or info.name.startswith("consult.mcp."):
+            continue
+        engine_modules.append(info.name)
+
+    # The engine surface actually used (filter out viewer-only deps).
+    expected_present = {
+        "consult.runner", "consult.refine", "consult.sequence",
+        "consult.synth", "consult.capsule", "consult.orchestrate",
+        "consult.artifacts", "consult.types", "consult.progress",
+        "consult.context", "consult.registry", "consult.attachments",
+    }
+    assert expected_present.issubset(set(engine_modules)), (
+        f"missing engine modules: {expected_present - set(engine_modules)}"
+    )
+
+    for mod_name in engine_modules:
+        mod = importlib.import_module(mod_name)
+        src = (Path(mod.__file__).read_text() if mod.__file__ else "")
+        for line in src.splitlines():
+            stripped = line.strip()
+            assert not stripped.startswith("import mcp"), (
+                f"{mod_name} imports mcp.* — broken engine/adapter boundary"
+            )
+            assert not stripped.startswith("from mcp"), (
+                f"{mod_name} imports from mcp — broken engine/adapter boundary"
+            )
+
+
+def test_resource_uri_formatter_override_round_trips(tmp_path, monkeypatch):
+    """A custom URI formatter applies to every new manifest entry; reset
+    restores the default. Used by non-MCP consumers (HTTP/library/CLI)
+    that want their own URI scheme on the manifest.
+    """
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    artifacts.set_resource_uri_formatter(
+        lambda run_id, slug: f"https://example.com/{run_id}/{slug}.txt"
+    )
+    try:
+        paths = artifacts.create_run()
+        uri = paths.resource_uri("alpha")
+        assert uri == f"https://example.com/{paths.run_id}/alpha.txt"
+    finally:
+        artifacts.reset_resource_uri_formatter()
+
+    # Default restored — new run gets the consult:// scheme again.
+    paths2 = artifacts.create_run()
+    assert paths2.resource_uri("alpha").startswith("consult://runs/")
+
+
+async def test_orchestrate_consult_runs_without_mcp_adapter(tmp_path, monkeypatch):
+    """The hero `orchestrate.consult()` is callable from any consumer with
+    no mcp.* import in the chain. Stubs the three engine primitives so the
+    test runs offline; the assertion is on the typed return shape, not
+    panel content.
+    """
+    from consult import capsule as capsule_mod
+    from consult import orchestrate
+    from consult import runner as runner_mod
+    from consult import synth as synth_mod
+    from consult.types import RunResult
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    monkeypatch.setattr(
+        registry, "resolve_tier", lambda t: ["model-a", "model-b"]
+    )
+    monkeypatch.setattr(
+        registry, "default_synthesiser", lambda: "model-synth"
+    )
+    monkeypatch.setattr(
+        registry, "resolve_model",
+        lambda alias: {"litellm_id": alias, "provider": "x"},
+    )
+
+    progress_events: list[str] = []
+
+    async def cb(event):
+        progress_events.append(event.kind)
+
+    async def fake_fanout(prompt, specs, **kwargs):
+        paths = artifacts.create_run()
+        return RunHandle(
+            run_id=paths.run_id,
+            artifacts_dir=str(paths.root),
+            manifest=[
+                ManifestEntry(
+                    slug="model-a", model_id="model-a", status=Status.OK,
+                    resource_uri=paths.resource_uri("model-a"),
+                    body_path=str(paths.response_text("model-a")),
+                    latency_ms=10, cost_usd=0.01, cost_known=True,
+                ),
+            ],
+            cost_usd=0.01, cost_known=True, wall_ms=10,
+        )
+
+    async def fake_annotate(handle, **kwargs):
+        return handle
+
+    async def fake_synth(*args, **kwargs):
+        return synth_mod.SynthResult(text="synthesised", cost_usd=0.02)
+
+    monkeypatch.setattr(runner_mod, "fanout", fake_fanout)
+    monkeypatch.setattr(capsule_mod, "annotate", fake_annotate)
+    monkeypatch.setattr(synth_mod, "synthesise", fake_synth)
+
+    result = await orchestrate.consult(
+        "what's the call?", tier="quick", on_progress=cb,
+    )
+    # Typed RunResult returned, not a dict — non-MCP consumers get the
+    # full Pydantic shape with structured access.
+    assert isinstance(result, RunResult)
+    assert result.synthesis == "synthesised"
+    assert result.partial is False
+    assert result.synthesiser == "model-synth"
+    # Synth cost rolled into the total: 0.01 (fanout) + 0.02 (synth).
+    assert abs(result.cost_usd - 0.03) < 1e-9
+    # Progress events flowed through (synth_started + synth_completed are
+    # emitted directly by orchestrate.consult; fanout/capsule's own events
+    # are stubbed out so they don't appear).
+    assert "synth_started" in progress_events
+    assert "synth_completed" in progress_events
+
+
+# ---- Iter8 regression tests ------------------------------------------------
+
+
+def test_attachment_git_diff_size_cap(monkeypatch, tmp_path):
+    """git_diff source must honour CONSULT_ATTACHMENT_MAX_BYTES.
+
+    Previously only file paths were size-capped; a multi-GB diff would
+    flow straight from `sources.resolve_git_diff` into the prompt and
+    OOM the server or blow the token budget.
+    """
+    from consult import attachments
+
+    # Tiny cap to make the test deterministic without generating a real
+    # large diff. Resolver is stubbed to return an oversized blob.
+    monkeypatch.setenv("CONSULT_ATTACHMENT_MAX_BYTES", "100")
+    monkeypatch.setattr(
+        attachments.sources, "resolve_git_diff",
+        lambda base, head, repo_path: "x" * 5000,
+    )
+    out = attachments.render_attachment(
+        {"source": "git_diff", "base": "main", "head": "HEAD"}
+    )
+    assert "[ERROR: diff" in out
+    assert "CONSULT_ATTACHMENT_MAX_BYTES=100" in out
+    # The oversized content itself must NOT appear in the rendered output.
+    assert "x" * 200 not in out
+
+
+def test_attachment_git_diff_under_cap_renders_normally(monkeypatch):
+    """Diffs under the cap render as a normal git_diff block."""
+    from consult import attachments
+
+    monkeypatch.setenv("CONSULT_ATTACHMENT_MAX_BYTES", "10000")
+    monkeypatch.setattr(
+        attachments.sources, "resolve_git_diff",
+        lambda base, head, repo_path: "diff --git a/x b/x\n+hello",
+    )
+    out = attachments.render_attachment(
+        {"source": "git_diff", "base": "main", "head": "HEAD"}
+    )
+    assert "[ERROR" not in out
+    assert "hello" in out
+
+
+@pytest.mark.asyncio
+async def test_sequence_persists_cost_on_synth_failure(tmp_path, monkeypatch):
+    """When a step's synth returns a non-OK status the loop breaks, but the
+    step's cost must still be persisted to disk and recorded in the
+    SequenceResult.steps array — otherwise the ledger silently
+    under-reports and the caller can't see the partial step.
+    """
+    from consult import capsule, runner
+    from consult import sequence as seq_mod
+    from consult import synth as synth_mod
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    monkeypatch.setenv("CONSULT_HEARTBEAT_INTERVAL_S", "0")
+    monkeypatch.setenv("CONSULT_TAIL_DROPOUT_S", "0")
+    monkeypatch.setattr(runner, "estimate_cost", lambda specs, prompt: (0.0, True))
+
+    async def fake_call(spec, slug, per_prompt, paths, provider_sems=None, **_):
+        await asyncio.to_thread(paths.response_text(slug).write_text, "body")
+        return ManifestEntry(
+            slug=slug, model_id="x/y", persona=None, status=Status.OK,
+            finish_reason="stop", resource_uri=paths.resource_uri(slug),
+            body_path=str(paths.response_text(slug)),
+            latency_ms=10, cost_usd=0.01, cost_known=True,
+        )
+
+    monkeypatch.setattr(runner, "_call_one", fake_call)
+
+    async def fake_annotate(handle, **kwargs):
+        return handle
+
+    monkeypatch.setattr(capsule, "annotate", fake_annotate)
+
+    # First step's synth fails; second step should never run because we
+    # break — but the first step MUST land in result.steps with the
+    # rolled-up cost (fanout 0.01 + synth 0.03 = 0.04).
+    async def fake_synth(run_id, **kwargs):
+        return synth_mod.SynthResult(
+            text="# Synthesis empty\n\nno content",
+            cost_usd=0.03,
+            cost_known=True,
+            status=synth_mod.SynthStatus.EMPTY,
+        )
+
+    monkeypatch.setattr(synth_mod, "synthesise", fake_synth)
+
+    result = await seq_mod.sequence(
+        ["step 1", "step 2"],
+        [ModelSpec(model="claude-haiku")],
+        max_run_usd=10.0,
+    )
+
+    assert result.partial is True
+    assert "synth status=EMPTY" in (result.partial_reason or "")
+    assert len(result.steps) == 1, "the failed step must still be in result.steps"
+    assert abs(result.steps[0].cost_usd - 0.04) < 1e-9, (
+        f"step cost should include fanout + synth, got {result.steps[0].cost_usd}"
+    )
+    # And the disk manifest must reflect the same total (ledger reads this).
+    step_paths = artifacts.load_run(result.steps[0].run_id)
+    manifest_on_disk = json.loads(step_paths.manifest_json.read_text())
+    assert abs(manifest_on_disk["cost_usd"] - 0.04) < 1e-9
+
+
+@pytest.mark.asyncio
+async def test_refine_preserves_final_manifest_when_late_round_partial(
+    tmp_path, monkeypatch
+):
+    """A round-N+1 fanout returning partial=True must not overwrite the
+    final_manifest from a successful round-N. Previously
+    `final_manifest = handle.manifest` was unconditional, so the empty
+    partial manifest clobbered the prior round's consensus.
+    """
+    from consult import capsule as capsule_mod
+    from consult import refine as refine_mod
+    from consult import runner
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    monkeypatch.setenv("CONSULT_HEARTBEAT_INTERVAL_S", "0")
+    monkeypatch.setenv("CONSULT_TAIL_DROPOUT_S", "0")
+    monkeypatch.setattr(runner, "estimate_cost", lambda specs, prompt: (0.0, True))
+
+    call_count = {"n": 0}
+
+    async def fake_fanout(prompt, specs, *, existing_paths=None, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            # Round 1: real, single-entry manifest
+            paths = existing_paths or artifacts.create_run()
+            entry = ManifestEntry(
+                slug="m-good",
+                model_id="x/y",
+                status=Status.OK,
+                resource_uri=paths.resource_uri("m-good"),
+                body_path=str(paths.response_text("m-good")),
+                latency_ms=10,
+                cost_usd=0.01,
+                cost_known=True,
+            )
+            await asyncio.to_thread(
+                paths.response_text("m-good").write_text, "good body"
+            )
+            return RunHandle(
+                run_id=paths.run_id,
+                artifacts_dir=str(paths.root),
+                manifest=[entry],
+                cost_usd=0.01,
+                cost_known=True,
+                wall_ms=10,
+                partial=False,
+            )
+        # Round 2: zero-usable partial — must NOT clobber round 1's manifest
+        paths = existing_paths or artifacts.create_run()
+        return RunHandle(
+            run_id=paths.run_id,
+            artifacts_dir=str(paths.root),
+            manifest=[],
+            cost_usd=0.0,
+            cost_known=True,
+            wall_ms=0,
+            partial=True,
+            partial_reason="zero usable panellists (2 returned: TIMEOUT)",
+        )
+
+    async def fake_annotate(handle, **kwargs):
+        # Pretend the extractor populated a usable capsule on round 1.
+        for entry in handle.manifest:
+            if entry.status == Status.OK and entry.capsule is None:
+                entry.capsule = Capsule(position="round 1 consensus", recommendation="ok")
+        return handle
+
+    async def fake_arbiter(question, round_num, manifest, *_, **__):
+        return ArbiterVerdict(
+            round=round_num, score=0.5, gaps=["needs more"],
+            next_round_focus="dig deeper", reasoning="not converged",
+            cost_usd=0.0, cost_known=True, parsed_ok=True,
+        )
+
+    async def fake_synth(run_id, **kwargs):
+        from consult import synth as synth_mod
+        return synth_mod.SynthResult(text="synthesised", cost_usd=0.0)
+
+    monkeypatch.setattr(runner, "fanout", fake_fanout)
+    monkeypatch.setattr(refine_mod.runner, "fanout", fake_fanout)
+    monkeypatch.setattr(capsule_mod, "annotate", fake_annotate)
+    monkeypatch.setattr(refine_mod, "_ask_arbiter", fake_arbiter)
+    monkeypatch.setattr(refine_mod.synth, "synthesise", fake_synth)
+
+    result = await refine_mod.refine(
+        "test", [ModelSpec(model="claude-haiku")], max_rounds=3, threshold=0.85,
+    )
+    # Partial because round 2 failed.
+    assert result.partial is True
+    # But final_manifest is the round-1 good manifest, NOT the empty
+    # partial from round 2.
+    assert len(result.final_manifest) == 1
+    assert result.final_manifest[0].slug == "m-good"
+    assert result.final_manifest[0].capsule is not None
+
+
+def test_refine_continuation_sentinel_check_handles_leading_whitespace(
+    tmp_path, monkeypatch
+):
+    """The sentinel check now lstrips before startswith, so a synthesis
+    file with a leading newline/BOM can't slip a sentinel past the
+    guard."""
+    from consult.refine import _apply_continuation
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    prior = artifacts.create_run()
+    prior.prompt_txt.write_text("prior question")
+    # Leading whitespace before the sentinel heading.
+    (prior.root / "synthesis.md").write_text("\n\n  # Synthesis empty\n\nno content")
+
+    with pytest.raises(ValueError, match="sentinel synthesis"):
+        _apply_continuation("follow-up", prior.run_id)
+
+
+# `asyncio` is imported lazily so the rest of the test module's existing
+# style stays intact.
+import asyncio  # noqa: E402
