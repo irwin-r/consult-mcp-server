@@ -227,8 +227,10 @@ async def test_refine_validates_max_rounds():
 
 
 def test_arbiter_json_extractor_tolerates_fences():
+    from consult.jsonparse import extract_json
+
     fenced = '```json\n{"score": 0.7, "gaps": ["x"], "next_round_focus": "", "reasoning": ""}\n```'
-    data = refine_mod._extract_json(fenced)
+    data = extract_json(fenced)
     assert data["score"] == 0.7
     assert data["gaps"] == ["x"]
 
@@ -352,6 +354,124 @@ def test_progress_event_message_for_every_kind():
     assert event_message(SynthCompleted(done=2, total=2)) == "synthesis complete"
     assert "step 3" in event_message(SequenceStepStarted(done=1, total=5, step=3))
     assert "step 3" in event_message(SequenceStepCompleted(done=2, total=5, step=3))
+
+
+def test_error_envelope_shape_round_trips():
+    """The structured-error envelope must round-trip through JSON with the
+    exact shape agents pattern-match against. Locks in the wire contract.
+    """
+    from consult.errors import ConsultError, ErrorCode, ErrorEnvelope
+
+    env = ErrorEnvelope(
+        error=ConsultError(
+            code=ErrorCode.INVALID_INPUT,
+            message="continuation_id not found: bogus",
+            run_id=None,
+        ),
+    )
+    payload = json.loads(env.model_dump_json())
+    assert payload == {
+        "ok": False,
+        "error": {
+            "code": "invalid_input",
+            "message": "continuation_id not found: bogus",
+            "run_id": None,
+        },
+    }
+
+    # run_id-carrying variant for mid-failure partial runs
+    env2 = ErrorEnvelope(
+        error=ConsultError(
+            code=ErrorCode.INTERNAL_ERROR,
+            message="boom",
+            run_id="20260520-010203-1234",
+        ),
+    )
+    payload2 = json.loads(env2.model_dump_json())
+    assert payload2["error"]["run_id"] == "20260520-010203-1234"
+
+
+@pytest.mark.asyncio
+async def test_handle_call_tool_wraps_value_error_in_envelope(monkeypatch):
+    """A handler raising ValueError must surface as `invalid_input` envelope,
+    not as a raw exception bubbling out of the MCP dispatch.
+    """
+    from consult import server as server_mod
+
+    async def bad_handler(args):
+        raise ValueError("max_rounds must be between 1 and 3")
+
+    monkeypatch.setattr(server_mod, "_handle_refine", bad_handler)
+
+    result = await server_mod.handle_call_tool("refine", {"prompt": "x", "models": []})
+    assert len(result) == 1
+    payload = json.loads(result[0].text)
+    assert payload["ok"] is False
+    assert payload["error"]["code"] == "invalid_input"
+    assert "max_rounds" in payload["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_handle_call_tool_wraps_key_error_as_unknown_model(monkeypatch):
+    """`registry.resolve_model` raises KeyError on a missing alias —
+    `synthesise(by_model="bogus")` would propagate that through. Must
+    surface as `unknown_model`, not `invalid_input`.
+    """
+    from consult import server as server_mod
+
+    async def bad_handler(args):
+        raise KeyError("Unknown model: bogus-alias")
+
+    monkeypatch.setattr(server_mod, "_handle_synth", bad_handler)
+    result = await server_mod.handle_call_tool("synthesise", {"run_id": "x"})
+    payload = json.loads(result[0].text)
+    assert payload["ok"] is False
+    assert payload["error"]["code"] == "unknown_model"
+
+
+@pytest.mark.asyncio
+async def test_handle_call_tool_wraps_file_not_found_as_run_not_found(monkeypatch):
+    """`artifacts.load_run` raises FileNotFoundError on missing run_id."""
+    from consult import server as server_mod
+
+    async def bad_handler(args):
+        raise FileNotFoundError("Run not found: 20260520-foo")
+
+    monkeypatch.setattr(server_mod, "_handle_synth", bad_handler)
+    result = await server_mod.handle_call_tool("synthesise", {"run_id": "20260520-foo"})
+    payload = json.loads(result[0].text)
+    assert payload["error"]["code"] == "run_not_found"
+
+
+@pytest.mark.asyncio
+async def test_handle_call_tool_unknown_tool_returns_envelope():
+    """Asking for a tool that doesn't exist returns an invalid_input
+    envelope rather than raising a ValueError out the top.
+    """
+    from consult import server as server_mod
+
+    result = await server_mod.handle_call_tool("not-a-tool", {})
+    payload = json.loads(result[0].text)
+    assert payload["ok"] is False
+    assert payload["error"]["code"] == "invalid_input"
+    assert "not-a-tool" in payload["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_handle_call_tool_unhandled_exception_becomes_internal_error(monkeypatch):
+    """Any unanticipated exception type from a handler must become an
+    `internal_error` envelope rather than tearing out the MCP dispatch.
+    """
+    from consult import server as server_mod
+
+    async def bad_handler(args):
+        raise RuntimeError("kaboom")
+
+    monkeypatch.setattr(server_mod, "_handle_panel", bad_handler)
+    result = await server_mod.handle_call_tool("panel", {"prompt": "x", "models": []})
+    payload = json.loads(result[0].text)
+    assert payload["error"]["code"] == "internal_error"
+    assert "kaboom" in payload["error"]["message"]
 
 
 def test_progress_event_round_trips_through_json():
@@ -690,13 +810,13 @@ async def test_capsule_extractor_omits_temperature_for_gemini(monkeypatch):
 
 def test_capsule_extract_json_recovers_prose_and_fences():
     """The capsule contract depends on this — one regex change breaks all callers."""
-    from consult.capsule import _extract_json
+    from consult.jsonparse import extract_json
 
-    assert _extract_json('{"score": 0.5}') == {"score": 0.5}
-    assert _extract_json('```json\n{"k": "v"}\n```') == {"k": "v"}
-    assert _extract_json('prefix\n{"k": 1}\nsuffix') == {"k": 1}
-    assert _extract_json("definitely not json") is None
-    assert _extract_json("") is None
+    assert extract_json('{"score": 0.5}') == {"score": 0.5}
+    assert extract_json('```json\n{"k": "v"}\n```') == {"k": "v"}
+    assert extract_json('prefix\n{"k": 1}\nsuffix') == {"k": 1}
+    assert extract_json("definitely not json") is None
+    assert extract_json("") is None
 
 
 def test_parse_resource_uri_rejects_malformed():
@@ -927,6 +1047,73 @@ def test_refine_result_validates_partial_coupling_and_surfaces_reason():
         RefineResult(**base, partial=True)  # no reason
     with pytest.raises(pydantic.ValidationError):
         RefineResult(**base, partial=False, partial_reason="oops")
+
+
+def test_internal_models_forbid_unknown_fields():
+    """`extra="forbid"` is the type-system half of the RefineResult silent-drop
+    fix: kwargs that don't match a field must raise instead of being dropped.
+    Locks the policy across every internal result/handle type so a future
+    field rename or unset model_config gets caught the moment it ships.
+    """
+    import pydantic
+
+    from consult.ledger import DailyLedger, LedgerRunEntry
+    from consult.progress import PanellistCompleted
+    from consult.sequence import SequenceResult, SequenceStep
+    from consult.types import (
+        ArbiterVerdict,
+        Capsule,
+        ManifestEntry,
+        ModelSpec,
+        RefineResult,
+        RunHandle,
+        RunResult,
+    )
+
+    cases: list[tuple[type, dict]] = [
+        (ModelSpec, {"model": "x"}),
+        (Capsule, {}),
+        (ManifestEntry, {
+            "slug": "s", "status": "OK", "resource_uri": "consult://x",
+            "body_path": "/tmp/x",
+        }),
+        (RunHandle, {
+            "run_id": "r", "artifacts_dir": "/tmp", "manifest": [],
+            "cost_usd": 0.0, "wall_ms": 0,
+        }),
+        (RunResult, {
+            "run_id": "r", "synthesis": "", "manifest": [],
+            "cost_usd": 0.0, "wall_ms": 0,
+        }),
+        (ArbiterVerdict, {"round": 1, "score": 0.5}),
+        (RefineResult, {
+            "run_id": "r", "rounds_completed": 0, "final_manifest": [],
+            "verdicts": [], "synthesis": "", "converged": False,
+            "threshold": 0.85, "cost_usd": 0.0, "wall_ms": 0,
+        }),
+        (SequenceStep, {
+            "step": 1, "run_id": "r", "synthesis": "", "cost_usd": 0.0,
+            "panel_size": 0,
+        }),
+        (SequenceResult, {
+            "final_synthesis": "", "cost_usd": 0.0, "wall_ms": 0,
+        }),
+        (LedgerRunEntry, {
+            "run_id": "r", "cost_usd": 0.0, "cost_known": True, "panel_size": 0,
+        }),
+        (DailyLedger, {
+            "date": "2026-01-01", "total_usd": 0.0, "total_known": True,
+        }),
+        (PanellistCompleted, {
+            "done": 0, "total": 0, "slug": "s", "status": "OK", "latency_ms": 0,
+        }),
+    ]
+    for cls, kwargs in cases:
+        # Sanity: the baseline kwargs construct successfully
+        cls(**kwargs)
+        # An unknown kwarg must be rejected, not silently dropped
+        with pytest.raises(pydantic.ValidationError):
+            cls(**kwargs, definitely_not_a_field="boom")
 
 
 # ---- Live tests (gated on API keys) ----------------------------------------

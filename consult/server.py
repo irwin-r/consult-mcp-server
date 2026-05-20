@@ -13,13 +13,12 @@ from pathlib import Path
 from typing import Any
 
 import dotenv
-from mcp.server import Server
+from mcp.server import NotificationOptions, Server
 from mcp.server.models import InitializationOptions
 from mcp.server.stdio import stdio_server
 from mcp.types import (
     AnyUrl,
     Resource,
-    ServerCapabilities,
     TextContent,
     Tool,
 )
@@ -27,6 +26,7 @@ from mcp.types import (
 from . import (
     artifacts,
     capsule,
+    errors,
     progress,
     registry,
     runner,
@@ -313,6 +313,23 @@ def _text_result(payload: dict | str) -> list[TextContent]:
     return [TextContent(type="text", text=json.dumps(payload, indent=2, default=str))]
 
 
+def _error_result(
+    code: errors.ErrorCode,
+    message: str,
+    run_id: str | None = None,
+) -> list[TextContent]:
+    """Wrap a failure in the standard `{"ok": false, "error": {...}}` envelope.
+
+    Returned by the top-level `handle_call_tool` try/except so every failure
+    mode an agent sees has the same shape — they can branch on `error.code`
+    instead of regex-matching free-text.
+    """
+    envelope = errors.ErrorEnvelope(
+        error=errors.ConsultError(code=code, message=message, run_id=run_id),
+    )
+    return [TextContent(type="text", text=envelope.model_dump_json(indent=2))]
+
+
 def _progress_callback():
     """Build a callback that converts a typed `ProgressEvent` into an MCP
     `notifications/progress` send. Returns None if the client didn't send a
@@ -351,33 +368,59 @@ def _progress_callback():
 
 @server.call_tool()
 async def handle_call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
-    if name == "panel":
-        return await _handle_panel(arguments)
-    if name == "synthesise":
-        return await _handle_synth(arguments)
-    if name == "consult":
-        return await _handle_consult(arguments)
-    if name == "refine":
-        return await _handle_refine(arguments)
-    if name == "sequence":
-        return await _handle_sequence(arguments)
-    raise ValueError(f"Unknown tool: {name}")
+    # All failures are funnelled into the structured `ErrorEnvelope` shape so
+    # the agent never has to parse free-text. Map known exception types to
+    # stable error codes; anything unhandled becomes INTERNAL_ERROR (and we
+    # log the traceback so the maintainer can find the bug).
+    try:
+        if name == "panel":
+            return await _handle_panel(arguments)
+        if name == "synthesise":
+            return await _handle_synth(arguments)
+        if name == "consult":
+            return await _handle_consult(arguments)
+        if name == "refine":
+            return await _handle_refine(arguments)
+        if name == "sequence":
+            return await _handle_sequence(arguments)
+        return _error_result(errors.ErrorCode.INVALID_INPUT, f"Unknown tool: {name}")
+    except ValueError as e:
+        # Caller-side problems: out-of-range params, bad continuation_id,
+        # empty prompt list, missing required fields, etc. All raised
+        # synchronously by the handler / library code before any model call.
+        return _error_result(errors.ErrorCode.INVALID_INPUT, str(e))
+    except KeyError as e:
+        # `registry.resolve_model` raises KeyError on unknown alias — relevant
+        # for `synthesise.by_model` and explicit `arbiter`/`synthesiser`
+        # overrides that don't go through `_call_one`'s per-spec ERROR path.
+        return _error_result(errors.ErrorCode.UNKNOWN_MODEL, str(e))
+    except FileNotFoundError as e:
+        # `artifacts.load_run` raises this when a run_id doesn't exist on
+        # disk. Relevant for `synthesise(run_id=...)` and any
+        # `continuation_id` that bypasses `_apply_continuation`'s wrapping.
+        return _error_result(errors.ErrorCode.RUN_NOT_FOUND, str(e))
+    except Exception as e:  # noqa: BLE001 — last-resort envelope
+        logger.exception("unhandled exception in tool %s", name)
+        return _error_result(
+            errors.ErrorCode.INTERNAL_ERROR,
+            f"{type(e).__name__}: {e}",
+        )
 
 
 async def _handle_panel(args: dict[str, Any]) -> list[TextContent]:
     prompt = _inline_attachments(args["prompt"], args.get("attachments"))
     specs = _specs_from_args(args["models"])
-    progress = _progress_callback()
+    progress_cb = _progress_callback()
     handle = await runner.fanout(
         prompt,
         specs,
         blinded=args.get("blinded", False),
         dry_run=args.get("dry_run", False),
         max_run_usd=args.get("max_run_usd"),
-        on_progress=progress,
+        on_progress=progress_cb,
     )
     if args.get("extract_capsules", True) and not handle.partial and handle.manifest:
-        handle = await capsule.annotate(handle, on_progress=progress)
+        handle = await capsule.annotate(handle, on_progress=progress_cb)
     return _text_result(handle.model_dump())
 
 
@@ -550,6 +593,11 @@ async def main() -> None:
             InitializationOptions(
                 server_name="consult",
                 server_version="0.1.0",
-                capabilities=ServerCapabilities(),
+                # Derive capabilities from the registered @list_tools /
+                # @list_resources / @read_resource handlers so the initialize
+                # response actually advertises tools+resources to the client.
+                # An empty ServerCapabilities() tells spec-compliant clients
+                # the server has neither, which suppresses tools/list polls.
+                capabilities=server.get_capabilities(NotificationOptions(), {}),
             ),
         )
