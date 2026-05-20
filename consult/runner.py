@@ -7,6 +7,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import random
 import re
 import time
 from collections.abc import Awaitable, Callable
@@ -114,6 +116,81 @@ def expand_specs(specs: list[ModelSpec]) -> list[ModelSpec]:
     return out
 
 
+def _rate_limit_class() -> type[BaseException]:
+    """Lazily resolve `litellm.exceptions.RateLimitError`. Returns a sentinel
+    class that nothing isinstance-matches if the symbol is missing — i.e.
+    the retry loop becomes a no-op rather than crashing on a broken import.
+    """
+    try:
+        from litellm import exceptions as lex
+        cls = getattr(lex, "RateLimitError", None)
+        if cls is not None:
+            return cls
+    except Exception:  # pragma: no cover — litellm always present in prod
+        pass
+
+    class _NeverRaised(BaseException):
+        pass
+
+    return _NeverRaised
+
+
+_RETRY_MAX_ATTEMPTS = 3
+_RETRY_BASE_DELAY_S = 2.0
+
+
+async def _acompletion_with_retry(*, timeout: float, **kwargs: Any) -> Any:
+    """`litellm.acompletion` with bounded, jittered retry on RateLimitError.
+
+    Only `RateLimitError` retries — auth, content-filter, bad-request, and
+    other terminal errors propagate immediately (retrying them just burns
+    spend). The total wall-clock (calls + sleeps) is bounded by `timeout`:
+    each attempt's `asyncio.wait_for` uses the *remaining* budget, so the
+    last retry can't push the run past the per-spec ceiling.
+
+    Configurable via env: `CONSULT_RETRY_MAX_ATTEMPTS` (default 3, set to 1
+    to disable), `CONSULT_RETRY_BASE_DELAY` (default 2.0s). Backoff is
+    `base * 2^attempt * (0.5 + random())` — exponential with ±50% jitter
+    so panels of N concurrently-rate-limited siblings don't retry in lockstep.
+    """
+    rate_cls = _rate_limit_class()
+    max_attempts = max(
+        1, int(os.environ.get("CONSULT_RETRY_MAX_ATTEMPTS", _RETRY_MAX_ATTEMPTS))
+    )
+    base_delay = float(
+        os.environ.get("CONSULT_RETRY_BASE_DELAY", _RETRY_BASE_DELAY_S)
+    )
+    model_label = kwargs.get("model", "?")
+
+    start = time.monotonic()
+    for attempt in range(max_attempts):
+        remaining = timeout - (time.monotonic() - start)
+        if remaining <= 0:
+            raise TimeoutError(
+                f"retry budget exhausted before attempt {attempt + 1}"
+            )
+        try:
+            return await asyncio.wait_for(
+                litellm.acompletion(**kwargs), timeout=remaining
+            )
+        except rate_cls as e:
+            if attempt == max_attempts - 1:
+                raise
+            delay = base_delay * (2 ** attempt) * (0.5 + random.random())
+            remaining_after = timeout - (time.monotonic() - start)
+            # Leave a 0.5s margin so the next attempt has time to start.
+            sleep_for = min(delay, remaining_after - 0.5)
+            if sleep_for <= 0:
+                raise
+            logger.warning(
+                "rate-limited on %s attempt %d/%d (%s); retry in %.2fs",
+                model_label, attempt + 1, max_attempts, type(e).__name__, sleep_for,
+            )
+            await asyncio.sleep(sleep_for)
+    # Unreachable — the loop either returns or raises above.
+    raise TimeoutError(f"retry budget exhausted ({timeout}s)")
+
+
 def _build_messages(prompt: str, provider: str) -> list[dict[str, Any]]:
     # Anthropic-only: mark the user prompt as a cache breakpoint. Repeat
     # panellists in the same fanout share the bulk of their prefix (base
@@ -218,14 +295,12 @@ async def _call_one(
 
     try:
         async with sem if sem is not None else nullcontext():
-            resp = await asyncio.wait_for(
-                litellm.acompletion(
-                    model=litellm_id,
-                    messages=_build_messages(per_slug_prompt, provider),
-                    max_tokens=budget,
-                    **extra,
-                ),
+            resp = await _acompletion_with_retry(
                 timeout=timeout,
+                model=litellm_id,
+                messages=_build_messages(per_slug_prompt, provider),
+                max_tokens=budget,
+                **extra,
             )
         # Persist raw response — use model_dump for Pydantic, fall back to dict
         try:

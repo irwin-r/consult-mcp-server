@@ -666,6 +666,97 @@ async def test_fanout_progress_callback_failure_does_not_abort_run(tmp_path, mon
 
 
 @pytest.mark.asyncio
+async def test_acompletion_with_retry_recovers_after_rate_limit(monkeypatch):
+    """One rate-limit followed by a success: the retry loop sleeps with
+    jittered backoff and returns the second response. Without retry, a
+    single 429 from a shared OpenAI key wastes the panel's full call cost.
+    """
+    from consult import runner
+
+    class _StubRateLimit(BaseException):
+        pass
+
+    monkeypatch.setattr(runner, "_rate_limit_class", lambda: _StubRateLimit)
+    monkeypatch.setenv("CONSULT_RETRY_MAX_ATTEMPTS", "3")
+    monkeypatch.setenv("CONSULT_RETRY_BASE_DELAY", "0.01")
+
+    attempts = 0
+
+    async def fake_acompletion(**kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise _StubRateLimit("rate-limited")
+
+        class _Resp:
+            class _Choice:
+                class _Msg:
+                    content = "ok"
+
+                message = _Msg()
+                finish_reason = "stop"
+
+            choices = [_Choice()]
+
+        return _Resp()
+
+    monkeypatch.setattr(runner.litellm, "acompletion", fake_acompletion)
+    resp = await runner._acompletion_with_retry(timeout=10.0, model="m", messages=[])
+    assert attempts == 2
+    assert resp.choices[0].message.content == "ok"
+
+
+@pytest.mark.asyncio
+async def test_acompletion_with_retry_exhausts_then_raises(monkeypatch):
+    """Persistent rate-limit across all attempts must re-raise the last
+    RateLimitError, not swallow it — the caller's `Status.RATE_LIMITED`
+    classification depends on the exception propagating out.
+    """
+    from consult import runner
+
+    class _StubRateLimit(BaseException):
+        pass
+
+    monkeypatch.setattr(runner, "_rate_limit_class", lambda: _StubRateLimit)
+    monkeypatch.setenv("CONSULT_RETRY_MAX_ATTEMPTS", "2")
+    monkeypatch.setenv("CONSULT_RETRY_BASE_DELAY", "0.01")
+
+    async def always_rate_limit(**kwargs):
+        raise _StubRateLimit("nope")
+
+    monkeypatch.setattr(runner.litellm, "acompletion", always_rate_limit)
+    with pytest.raises(_StubRateLimit):
+        await runner._acompletion_with_retry(timeout=10.0, model="m", messages=[])
+
+
+@pytest.mark.asyncio
+async def test_acompletion_with_retry_does_not_retry_non_rate_limit(monkeypatch):
+    """Auth/content-filter/bad-request errors must NOT trigger retry —
+    they aren't transient and retrying just burns spend.
+    """
+    from consult import runner
+
+    class _StubRateLimit(BaseException):
+        pass
+
+    monkeypatch.setattr(runner, "_rate_limit_class", lambda: _StubRateLimit)
+    monkeypatch.setenv("CONSULT_RETRY_MAX_ATTEMPTS", "3")
+    monkeypatch.setenv("CONSULT_RETRY_BASE_DELAY", "0.01")
+
+    attempts = 0
+
+    async def raise_auth_error(**kwargs):
+        nonlocal attempts
+        attempts += 1
+        raise RuntimeError("invalid api key")
+
+    monkeypatch.setattr(runner.litellm, "acompletion", raise_auth_error)
+    with pytest.raises(RuntimeError, match="invalid api key"):
+        await runner._acompletion_with_retry(timeout=10.0, model="m", messages=[])
+    assert attempts == 1
+
+
+@pytest.mark.asyncio
 async def test_fanout_caps_per_provider_concurrency(tmp_path, monkeypatch):
     """With CONSULT_PROVIDER_CONCURRENCY=anthropic:1, only one Anthropic
     panellist may be in-flight at a time even if the panel has 5 of them.
