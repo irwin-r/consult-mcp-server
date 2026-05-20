@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 from typing import Any
 
@@ -41,6 +42,43 @@ KEY_REASON: <one sentence — the single most important reason for your view>"""
 def _build_per_slug_prompt(base_prompt: str, stance_prompt: str) -> str:
     head = f"{stance_prompt}\n\n" if stance_prompt else ""
     return f"{head}{base_prompt}\n\n{_FOOTER}"
+
+
+_MODEL_COUNT_SUFFIX = re.compile(r"^(.+):(\d+)$")
+
+
+def expand_specs(specs: list[ModelSpec]) -> list[ModelSpec]:
+    """Expand `model:N` syntax into N copies of the spec.
+
+    A trailing `:<positive int>` on `spec.model` requests N instances of the
+    same model in the panel — useful for stochastic averaging (run the same
+    prompt N times and compare), or to grow a panel without adding new
+    aliases. The slug-disambiguation in `_make_slug` already appends an
+    index suffix when the same base name repeats, so no extra work needed
+    downstream.
+
+    Idempotent: passing already-expanded specs (no `:N` suffix on any
+    `model`) returns them unchanged. Bare model strings with internal
+    colons that aren't followed by digits (rare, but possible for raw
+    LiteLLM IDs) are left alone — the regex anchors to the end.
+
+    Raises `ValueError` if N < 1 (zero copies is almost certainly a typo).
+    """
+    out: list[ModelSpec] = []
+    for spec in specs:
+        m = _MODEL_COUNT_SUFFIX.match(spec.model)
+        if not m:
+            out.append(spec)
+            continue
+        base, count_str = m.group(1), m.group(2)
+        count = int(count_str)
+        if count < 1:
+            raise ValueError(
+                f"model:count must be ≥1 (got {spec.model!r})"
+            )
+        for _ in range(count):
+            out.append(ModelSpec(model=base, stance=spec.stance, slug=spec.slug))
+    return out
 
 
 def _build_messages(prompt: str, provider: str) -> list[dict[str, Any]]:
@@ -260,6 +298,9 @@ async def fanout(
     to write into an existing run dir (used by `refine` to keep all rounds
     under one run_id with round-suffixed slugs).
     """
+    # Resolve `model:N` sugar BEFORE estimate_cost so the cap reflects the
+    # real panel size, not the pre-expansion request count.
+    specs = expand_specs(specs)
     if existing_paths is None:
         paths = artifacts.create_run()
         paths.prompt_txt.write_text(prompt)

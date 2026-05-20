@@ -43,6 +43,41 @@ def test_stance_lookup_and_passthrough():
     assert registry.resolve_stance(None) == ""
 
 
+def test_expand_specs_multi_instance_and_passthrough():
+    """`model:N` sugar expands to N specs; bare model strings pass through.
+    Stance and custom slug are preserved on every expanded instance.
+    """
+    from consult.runner import expand_specs
+
+    raw = [
+        ModelSpec(model="claude-haiku:3", stance="skeptic"),
+        ModelSpec(model="gpt-pro"),
+        ModelSpec(model="openrouter/foo/bar"),  # no colon — passthrough
+    ]
+    expanded = expand_specs(raw)
+    assert len(expanded) == 5  # 3 + 1 + 1
+    assert [s.model for s in expanded] == [
+        "claude-haiku", "claude-haiku", "claude-haiku",
+        "gpt-pro",
+        "openrouter/foo/bar",
+    ]
+    # Stance survives expansion
+    assert all(s.stance == "skeptic" for s in expanded[:3])
+
+    # Idempotent: re-expanding already-expanded specs is a no-op
+    assert expand_specs(expanded) == expanded
+
+
+def test_expand_specs_rejects_zero_count():
+    """`model:0` is almost certainly a typo and must fail loudly rather
+    than silently dropping the spec from the panel.
+    """
+    from consult.runner import expand_specs
+
+    with pytest.raises(ValueError, match="must be ≥1"):
+        expand_specs([ModelSpec(model="claude-haiku:0")])
+
+
 def test_slug_and_prompt_assembly():
     spec = ModelSpec(model="claude-haiku", stance="security")
     assert _make_slug(spec, 0, blinded=False).startswith("claude-haiku")

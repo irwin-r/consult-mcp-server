@@ -308,6 +308,9 @@ async def refine(
         raise ValueError("threshold must be in [0.0, 1.0]")
 
     prompt = _apply_continuation(prompt, continuation_id)
+    # Resolve `model:N` sugar here too so `estimate_cost` (called before
+    # `fanout` in each round) sees the real expanded panel.
+    specs = runner.expand_specs(specs)
     arbiter_alias = arbiter or registry.default_synthesiser()
     synth_alias = synthesiser or arbiter_alias
 
