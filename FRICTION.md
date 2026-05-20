@@ -95,3 +95,28 @@ made about the codebase. Observations:
   same panel makes the "wait" feel uneven.
 - [meta] **No bug claims this pass.** The panel engaged with the external
   question, not the codebase, as intended.
+
+## 2026-05-20 — fourth dogfood pass (refine blinded on multi-tenant Postgres)
+
+Ran `refine` (code tier, blinded=True, max_rounds=2, ~$0.09) on a Postgres
+multi-tenancy question. 2/4 OK (gpt-codex + gpt-mini rate-limited again),
+score 0.40, refine stopped at round 1 with `partial_reason` correctly
+surfacing the pass-#2 fix:
+
+> "refusing further rounds: per-model pricing unknown for at least one
+> panellist, can't validate cap ($0.09 spent / $2.50 cap)"
+
+That's the partial_reason a132810 added, doing its job in real use. The
+caller can now see exactly why refine stopped early.
+
+- [meta] **Blinded mode works correctly.** Greek-alphabet slugs assigned
+  (`panelist-alpha` … `panelist-delta`), `model_id=None` on every manifest
+  entry, synthesis anonymised (refers to "panelist-alpha" etc, never the
+  real model). No friction in this path.
+- [meta] **No panel-claimed bugs.** Panel engaged with the external
+  Postgres question; unanimous on (A) shared-schema + RLS with steel-manned
+  dissent for database-per-tenant. Refine-level disagreement was about
+  bottleneck mechanics, not about anything in the codebase.
+
+**Counter: 2 consecutive passes with no panel-claimed bugs.** Switching to
+deferred-from-v1 feature work next pass.
