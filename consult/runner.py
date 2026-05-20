@@ -21,7 +21,14 @@ from typing import Any
 import litellm
 
 from . import artifacts, context, registry
-from .progress import PanellistCompleted, PanellistPartial, ProgressEvent
+from .progress import (
+    Heartbeat,
+    PanellistCompleted,
+    PanellistPartial,
+    PanellistStarted,
+    PhaseStarted,
+    ProgressEvent,
+)
 from .status import classify
 from .types import ManifestEntry, ModelSpec, RunHandle, Status
 
@@ -232,7 +239,16 @@ def _make_slug(spec: ModelSpec, idx: int, blinded: bool) -> str:
     return f"{base}-{idx}" if idx > 0 else base
 
 
-_STREAM_PARTIAL_INTERVAL_S = float(os.environ.get("CONSULT_STREAM_PARTIAL_INTERVAL_S", 1.0))
+_STREAM_PARTIAL_INTERVAL_S_DEFAULT = 1.0
+
+
+def _stream_partial_interval_s() -> float:
+    """Read at call time so test monkeypatching of the env var works."""
+    return float(
+        os.environ.get(
+            "CONSULT_STREAM_PARTIAL_INTERVAL_S", _STREAM_PARTIAL_INTERVAL_S_DEFAULT
+        )
+    )
 
 
 async def _stream_acompletion(
@@ -258,6 +274,7 @@ async def _stream_acompletion(
     chunks: list[Any] = []
     body = ""
     last_emit = time.monotonic()
+    partial_interval = _stream_partial_interval_s()
 
     async def _read():
         nonlocal body, last_emit
@@ -270,22 +287,33 @@ async def _stream_acompletion(
             if delta:
                 body += delta
             now = time.monotonic()
-            if on_partial is not None and (now - last_emit) >= _STREAM_PARTIAL_INTERVAL_S:
+            if on_partial is not None and (now - last_emit) >= partial_interval:
                 last_emit = now
                 try:
                     await on_partial(len(body), int((time.time() - start) * 1000))
                 except Exception as e:  # noqa: BLE001 — best-effort
-                    logger.debug("partial callback failed: %s", e)
+                    # `warning` (not `debug`) so a bug in the callback shows
+                    # up in default log configs; the call site still doesn't
+                    # abort the panel.
+                    logger.warning("partial callback failed: %s", e)
 
     await asyncio.wait_for(_read(), timeout=timeout)
 
     # Reconstruct a single ModelResponse so the rest of `_call_one` can
-    # treat the streamed call identically to the non-streamed path.
+    # treat the streamed call identically to the non-streamed path. If
+    # the builder fails (unsupported chunk shape, partial stream, etc),
+    # RAISE rather than returning `chunks[-1]` — `chunks[-1]` is a raw
+    # streaming chunk that `classify()` and `litellm.completion_cost()`
+    # would mishandle, silently dropping the body. The exception will
+    # propagate to `_call_one`'s outer try/except, which surfaces the
+    # panellist as Status.ERROR with a clear error string.
     try:
         return litellm.stream_chunk_builder(chunks, messages=kwargs.get("messages"))
-    except Exception as e:  # noqa: BLE001
-        logger.warning("stream_chunk_builder failed: %s — using last chunk", e)
-        return chunks[-1] if chunks else None
+    except Exception as e:
+        raise RuntimeError(
+            f"stream_chunk_builder failed after {len(chunks)} chunks: "
+            f"{type(e).__name__}: {e}"
+        ) from e
 
 
 async def _call_one(
@@ -503,6 +531,7 @@ async def fanout(
     existing_paths: artifacts.RunPaths | None = None,
     on_progress: ProgressCallback | None = None,
     stream: bool = False,
+    capsule_kind: str = "decision",
 ) -> RunHandle:
     """Parallel fan-out. Creates a fresh run by default. Pass `existing_paths`
     to write into an existing run dir (used by `refine` to keep all rounds
@@ -528,8 +557,13 @@ async def fanout(
         # Single immutable per-run context bundle. Downstream stages
         # (synth, capsule, arbiter) load this rather than re-receiving
         # the prompt — keeps the blinding scrub centralised and avoids
-        # silent prompt-prompt skew across stages.
-        context.write(paths, context.build(prompt, blinded=blinded))
+        # silent prompt-prompt skew across stages. `capsule_kind` is
+        # persisted here so a `continuation_id` can inherit the prior
+        # run's shape without the caller having to specify it again.
+        context.write(
+            paths,
+            context.build(prompt, blinded=blinded, capsule_kind=capsule_kind),
+        )
     else:
         paths = existing_paths
 
@@ -587,9 +621,68 @@ async def fanout(
     start = time.time()
     total = len(specs)
     done = 0
+    started = 0
+    # The heartbeat reads these to summarise live state. Mutation is
+    # confined to `_run_one` and the slow-tail dropout block — both run in
+    # the same event loop so atomicity between awaits is enough; no lock.
+    completed_entries: list[ManifestEntry] = []
+    pending_slugs_set: set[str] = set(slugs)
+
+    async def _safe_notify(event: ProgressEvent) -> None:
+        """Wrapper that swallows callback exceptions. Progress is best-effort:
+        a notification failure (closed session, slow client, raising user
+        callback) must never tear down the real work.
+        """
+        if on_progress is None:
+            return
+        try:
+            await on_progress(event)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("on_progress callback failed (%s): %s", event.kind, e)
+
+    # PhaseStarted("fanout"): emitted before any panellist begins, so the
+    # parent sees fanout starting rather than receiving silence until the
+    # first panellist completes.
+    phase_event = PhaseStarted(done=0, total=total, phase="fanout")
+    _append_progress_log(paths.root, phase_event)
+    await _safe_notify(phase_event)
+
+    # Heartbeat task: periodic liveness pulse. Set CONSULT_HEARTBEAT_INTERVAL_S=0
+    # to disable (used in tests that mock _call_one to instant returns).
+    hb_interval = float(os.environ.get("CONSULT_HEARTBEAT_INTERVAL_S", 5.0))
+    heartbeat_task: asyncio.Task[None] | None = None
+    if hb_interval > 0:
+        async def _heartbeat_loop() -> None:
+            while True:
+                await asyncio.sleep(hb_interval)
+                elapsed_ms = int((time.time() - start) * 1000)
+                cost_so_far = sum((e.cost_usd or 0.0) for e in completed_entries)
+                cost_known = all(e.cost_known for e in completed_entries)
+                pending = sorted(pending_slugs_set)
+                event = Heartbeat(
+                    done=done,
+                    total=total,
+                    elapsed_ms=elapsed_ms,
+                    cost_so_far_usd=cost_so_far,
+                    cost_known=cost_known,
+                    pending_count=len(pending),
+                    pending_slugs=pending,
+                )
+                _append_progress_log(paths.root, event)
+                await _safe_notify(event)
+        heartbeat_task = asyncio.create_task(_heartbeat_loop())
 
     async def _run_one(spec: ModelSpec, slug: str, per_prompt: str) -> ManifestEntry:
-        nonlocal done
+        nonlocal done, started
+        # PanellistStarted: fires BEFORE the LiteLLM call so the parent
+        # sees which slugs are in flight, not just which have completed.
+        started += 1
+        started_event = PanellistStarted(
+            done=done, total=total, slug=slug, started_count=started,
+        )
+        _append_progress_log(paths.root, started_event)
+        await _safe_notify(started_event)
+
         # When streaming is enabled, wire each panellist's mid-stream chunk
         # callback to emit `PanellistPartial` events. Throttled to
         # ~1 chunk/sec by `_STREAM_PARTIAL_INTERVAL_S` so the progress
@@ -597,30 +690,25 @@ async def fanout(
         on_partial: Callable[[int, int], Awaitable[None]] | None = None
         if stream and on_progress is not None:
             async def _emit_partial(chars: int, elapsed_ms: int) -> None:
-                try:
-                    await on_progress(PanellistPartial(
-                        done=done, total=total, slug=slug,
-                        chars_so_far=chars, elapsed_ms=elapsed_ms,
-                    ))
-                except Exception as e:  # noqa: BLE001
-                    logger.debug("PanellistPartial callback failed: %s", e)
+                await _safe_notify(PanellistPartial(
+                    done=done, total=total, slug=slug,
+                    chars_so_far=chars, elapsed_ms=elapsed_ms,
+                ))
             on_partial = _emit_partial
         entry = await _call_one(
             spec, slug, per_prompt, paths, provider_sems,
             stream=stream, on_partial=on_partial,
         )
         done += 1
-        if on_progress is not None:
-            try:
-                await on_progress(PanellistCompleted(
-                    done=done,
-                    total=total,
-                    slug=slug,
-                    status=entry.status.value,
-                    latency_ms=entry.latency_ms,
-                ))
-            except Exception as e:  # noqa: BLE001 — notification is best-effort
-                logger.debug("on_progress callback failed: %s", e)
+        completed_entries.append(entry)
+        pending_slugs_set.discard(slug)
+        await _safe_notify(PanellistCompleted(
+            done=done,
+            total=total,
+            slug=slug,
+            status=entry.status.value,
+            latency_ms=entry.latency_ms,
+        ))
         return entry
 
     # Slow-tail dropout: once most of the panel has returned, cancel the
@@ -634,91 +722,98 @@ async def fanout(
     tail_k_frac = float(os.environ.get("CONSULT_TAIL_K_FRAC", 0.2))
     enable_dropout = total >= 4 and tail_dropout_s > 0 and 0 < tail_k_frac < 1.0
 
-    if not enable_dropout:
-        coros = [
-            _run_one(spec, slug, per_prompt)
-            for spec, slug, per_prompt in zip(specs, slugs, per_prompts, strict=True)
-        ]
-        manifest = list(await asyncio.gather(*coros))
-    else:
-        task_list: list[asyncio.Task[ManifestEntry]] = []
-        task_meta: dict[asyncio.Task[ManifestEntry], tuple[str, ModelSpec]] = {}
-        for spec, slug, per_prompt in zip(specs, slugs, per_prompts, strict=True):
-            t = asyncio.create_task(_run_one(spec, slug, per_prompt))
-            task_list.append(t)
-            task_meta[t] = (slug, spec)
+    try:
+        if not enable_dropout:
+            coros = [
+                _run_one(spec, slug, per_prompt)
+                for spec, slug, per_prompt in zip(specs, slugs, per_prompts, strict=True)
+            ]
+            manifest = list(await asyncio.gather(*coros))
+        else:
+            task_list: list[asyncio.Task[ManifestEntry]] = []
+            task_meta: dict[asyncio.Task[ManifestEntry], tuple[str, ModelSpec]] = {}
+            for spec, slug, per_prompt in zip(specs, slugs, per_prompts, strict=True):
+                t = asyncio.create_task(_run_one(spec, slug, per_prompt))
+                task_list.append(t)
+                task_meta[t] = (slug, spec)
 
-        completed_tasks: set[asyncio.Task[ManifestEntry]] = set()
-        pending: set[asyncio.Task[ManifestEntry]] = set(task_list)
-        k = max(1, math.ceil(total * tail_k_frac))
-        trigger = max(1, total - k)
+            completed_tasks: set[asyncio.Task[ManifestEntry]] = set()
+            pending: set[asyncio.Task[ManifestEntry]] = set(task_list)
+            k = max(1, math.ceil(total * tail_k_frac))
+            trigger = max(1, total - k)
 
-        while len(completed_tasks) < trigger and pending:
-            done_set, pending = await asyncio.wait(
-                pending, return_when=asyncio.FIRST_COMPLETED
-            )
-            completed_tasks.update(done_set)
+            while len(completed_tasks) < trigger and pending:
+                done_set, pending = await asyncio.wait(
+                    pending, return_when=asyncio.FIRST_COMPLETED
+                )
+                completed_tasks.update(done_set)
 
-        if pending:
-            logger.info(
-                "slow-tail dropout: %d/%d complete, waiting up to %.1fs for %d stragglers",
-                len(completed_tasks), total, tail_dropout_s, len(pending),
-            )
-            done_set, pending = await asyncio.wait(pending, timeout=tail_dropout_s)
-            completed_tasks.update(done_set)
+            if pending:
+                logger.info(
+                    "slow-tail dropout: %d/%d complete, waiting up to %.1fs for %d stragglers",
+                    len(completed_tasks), total, tail_dropout_s, len(pending),
+                )
+                done_set, pending = await asyncio.wait(pending, timeout=tail_dropout_s)
+                completed_tasks.update(done_set)
 
-        drop_entries: dict[asyncio.Task[ManifestEntry], ManifestEntry] = {}
-        for t in pending:
-            t.cancel()
-        for t in pending:
-            slug, spec = task_meta[t]
-            try:
-                # A task may complete in the race between asyncio.wait
-                # returning and t.cancel(); in that case _run_one already
-                # ran its progress emission and we keep its result.
-                await t
-                completed_tasks.add(t)
-                continue
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
-                pass
-            latency_ms = int((time.time() - start) * 1000)
-            if not paths.response_text(slug).exists():
-                paths.response_text(slug).write_text("")
-            entry = ManifestEntry(
-                slug=slug,
-                model_id=None,
-                persona=spec.stance if spec.stance else None,
-                status=Status.TIMEOUT,
-                finish_reason=None,
-                resource_uri=paths.resource_uri(slug),
-                body_path=str(paths.response_text(slug)),
-                latency_ms=latency_ms,
-                cost_known=True,  # no billable call landed
-                error=f"slow-tail dropout after {tail_dropout_s}s",
-                confidence=None,
-                capsule=None,
-            )
-            drop_entries[t] = entry
-            done += 1
-            if on_progress is not None:
+            drop_entries: dict[asyncio.Task[ManifestEntry], ManifestEntry] = {}
+            for t in pending:
+                t.cancel()
+            for t in pending:
+                slug, spec = task_meta[t]
                 try:
-                    await on_progress(PanellistCompleted(
-                        done=done, total=total, slug=slug,
-                        status=Status.TIMEOUT.value, latency_ms=latency_ms,
-                    ))
-                except Exception as e:  # noqa: BLE001
-                    logger.debug("on_progress callback failed in slow-tail: %s", e)
-            _append_progress_log(paths.root, PanellistCompleted(
-                done=0, total=0, slug=slug,
-                status=Status.TIMEOUT.value, latency_ms=latency_ms,
-            ))
+                    # A task may complete in the race between asyncio.wait
+                    # returning and t.cancel(); in that case _run_one already
+                    # ran its progress emission and we keep its result.
+                    await t
+                    completed_tasks.add(t)
+                    continue
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    pass
+                latency_ms = int((time.time() - start) * 1000)
+                if not paths.response_text(slug).exists():
+                    paths.response_text(slug).write_text("")
+                entry = ManifestEntry(
+                    slug=slug,
+                    model_id=None,
+                    persona=spec.stance if spec.stance else None,
+                    status=Status.TIMEOUT,
+                    finish_reason=None,
+                    resource_uri=paths.resource_uri(slug),
+                    body_path=str(paths.response_text(slug)),
+                    latency_ms=latency_ms,
+                    cost_known=True,  # no billable call landed
+                    error=f"slow-tail dropout after {tail_dropout_s}s",
+                    confidence=None,
+                    capsule=None,
+                )
+                drop_entries[t] = entry
+                done += 1
+                completed_entries.append(entry)
+                pending_slugs_set.discard(slug)
+                await _safe_notify(PanellistCompleted(
+                    done=done, total=total, slug=slug,
+                    status=Status.TIMEOUT.value, latency_ms=latency_ms,
+                ))
+                _append_progress_log(paths.root, PanellistCompleted(
+                    done=0, total=0, slug=slug,
+                    status=Status.TIMEOUT.value, latency_ms=latency_ms,
+                ))
 
-        manifest = []
-        for t in task_list:
-            if t in drop_entries:
-                manifest.append(drop_entries[t])
-            else:
-                manifest.append(t.result())
+            manifest = []
+            for t in task_list:
+                if t in drop_entries:
+                    manifest.append(drop_entries[t])
+                else:
+                    manifest.append(t.result())
+    finally:
+        if heartbeat_task is not None:
+            heartbeat_task.cancel()
+            try:
+                await heartbeat_task
+            except asyncio.CancelledError:
+                pass
+
     wall_ms = int((time.time() - start) * 1000)
 
     # If blinded, scrub model_id from the manifest (kept in registry_snapshot for audit)

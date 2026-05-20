@@ -10,10 +10,12 @@ diff into its own context window to pass it across the MCP boundary.
 Untrusted strings (refs, paths) flow from the MCP caller to a subprocess
 exec. Three layers of defence:
 
-1. **Ref validation** — refs must match `^[A-Za-z0-9._/+-]+$`. This
-   blocks every shell metacharacter (semicolon, pipe, ampersand, dollar,
-   backtick, newline, etc) and is well-aligned with `git check-ref-format`
-   (which is even stricter; we defer the final word to git itself).
+1. **Ref validation** — refs must match the `_REF_RE` regex. This blocks
+   every shell metacharacter (semicolon, pipe, ampersand, dollar, backtick,
+   newline, etc) AND rejects a leading `-` so a ref cannot smuggle a git
+   option through as a positional arg (e.g. `base="--no-index"`).
+   Well-aligned with `git check-ref-format` (which is even stricter; we
+   defer the final word to git itself).
 2. **Repo-path containment** — the requested `repo_path` must resolve
    under one of the directories named in `CONSULT_TRUSTED_REPO_ROOTS`
    (colon-separated). Default: the current working directory only.
@@ -39,8 +41,10 @@ logger = logging.getLogger(__name__)
 
 # Allows `~` and `^` for relative refs like `HEAD~1` / `HEAD^`. Neither is
 # a shell metacharacter when subprocess.run uses shell=False + arg list, so
-# they're safe to permit.
-_REF_RE = re.compile(r"^[A-Za-z0-9._/+~^-]+$")
+# they're safe to permit. The leading character cannot be `-` — otherwise
+# a "ref" like `--no-index` becomes `git diff --no-index..HEAD`, smuggling
+# a git option through as a positional arg.
+_REF_RE = re.compile(r"^[A-Za-z0-9._/+~^][A-Za-z0-9._/+~^-]*$")
 _DEFAULT_GIT_TIMEOUT_S = float(os.environ.get("CONSULT_GIT_TIMEOUT_S", 30.0))
 
 
@@ -56,8 +60,9 @@ def _trusted_roots() -> list[Path]:
 def _validate_ref(ref: str, *, field: str) -> None:
     if not _REF_RE.fullmatch(ref):
         raise ValueError(
-            f"invalid {field} {ref!r}: must match [A-Za-z0-9._/+-]+ "
-            "(no shell metacharacters)"
+            f"invalid {field} {ref!r}: must match {_REF_RE.pattern} "
+            "(no shell metacharacters; leading '-' rejected to block git "
+            "option injection)"
         )
 
 
@@ -90,8 +95,13 @@ def resolve_git_diff(
     repo = _validate_repo_path(repo_path)
     git = shutil.which("git") or "git"
     try:
+        # `--` after the diff range forces git to stop interpreting any
+        # subsequent arg as an option. Belt-and-braces with the ref regex's
+        # leading-dash rejection: even if a future regex change re-admits
+        # a `-`, the `--` separator keeps the ref from being interpreted
+        # as a git option.
         result = subprocess.run(
-            [git, "diff", f"{base}..{head}"],
+            [git, "diff", f"{base}..{head}", "--"],
             cwd=repo,
             capture_output=True,
             text=True,

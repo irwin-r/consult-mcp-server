@@ -214,7 +214,15 @@ _REFINE_SCHEMA = {
             "description": "Hard cap on rounds. 1-5; default 3.",
         },
         "blinded": {"type": "boolean", "default": False},
-        "attachments": {"type": "array", "items": {"type": "string"}},
+        "attachments": {
+            "type": "array",
+            "items": _ATTACHMENT_SCHEMA_ITEMS,
+            "description": (
+                "Each entry is either an absolute file path (string), a labelled "
+                "file `{path, label?, kind?}`, or a server-resolved source "
+                "`{source: \"git_diff\", base, head, repo_path?, label?}`."
+            ),
+        },
         "max_run_usd": {"type": "number"},
         "synthesiser": {
             "type": "string",
@@ -299,39 +307,26 @@ _SEQUENCE_SCHEMA = {
         },
         "synthesiser": {"type": "string", "description": "Per-step synth model."},
         "blinded": {"type": "boolean", "default": False},
-        "attachments": {"type": "array", "items": {"type": "string"}},
+        "attachments": {
+            "type": "array",
+            "items": _ATTACHMENT_SCHEMA_ITEMS,
+            "description": (
+                "Default attachments for every step. Each entry is a string path, "
+                "a labelled file `{path, label?, kind?}`, or a git_diff source "
+                "`{source: \"git_diff\", base, head, repo_path?, label?}`. "
+                "Steps with object form may override these per-step."
+            ),
+        },
         "max_run_usd": {
             "type": "number",
             "description": "Cap across the whole sequence (cumulative, not per-step).",
         },
-    },
-}
-
-
-_TIER_NAMES = list(registry.models_config().get("tiers", {}).keys())
-
-_CONSULT_SCHEMA = {
-    "type": "object",
-    "required": ["prompt"],
-    "properties": {
-        "prompt": {"type": "string"},
-        "tier": {
-            "type": "string",
-            "enum": _TIER_NAMES or ["quick", "standard", "deep"],
-            "default": "standard" if "standard" in _TIER_NAMES else (_TIER_NAMES[0] if _TIER_NAMES else "standard"),
-        },
-        "roles": {
-            "type": "object",
-            "additionalProperties": {"type": "string"},
-            "description": "Map model alias → stance key. Defaults to neutral.",
-        },
-        "attachments": {"type": "array", "items": {"type": "string"}},
-        "synthesiser": {"type": "string", "description": "Override synth model."},
         "rubric": {
             "type": "string",
             "description": (
                 "Rubric name (e.g. 'consensus', 'code_review', 'research_brief', "
-                "'critique') or a literal rubric string. Defaults to 'consensus'."
+                "'critique') or a literal rubric string. Applies to every step's "
+                "synthesis. Defaults to 'consensus'."
             ),
         },
         "capsule_kind": {
@@ -339,14 +334,76 @@ _CONSULT_SCHEMA = {
             "enum": ["decision", "review", "research"],
             "default": "decision",
             "description": (
-                "Shape of the extracted capsule. 'decision' (default), 'review' for "
-                "code reviews, 'research' for evidence-gathering panels."
+                "Capsule shape for every step. 'decision' (default), 'review', "
+                "or 'research'."
             ),
         },
-        "blinded": {"type": "boolean", "default": False},
-        "max_run_usd": {"type": "number"},
     },
 }
+
+
+def _tier_names() -> list[str]:
+    """Read tier names at call time so test monkeypatching of the registry
+    config (and any future live-reload of models.json) is honoured. The
+    registry already caches the config via `lru_cache`, so this is cheap.
+    """
+    return list(registry.models_config().get("tiers", {}).keys())
+
+
+def _consult_schema() -> dict[str, Any]:
+    """Build the `consult` schema at call time. The tier enum is derived
+    from the live registry so adding a tier to models.json doesn't require
+    a restart to expose it through MCP."""
+    tier_names = _tier_names()
+    default_tier = (
+        "standard" if "standard" in tier_names
+        else (tier_names[0] if tier_names else "standard")
+    )
+    return {
+        "type": "object",
+        "required": ["prompt"],
+        "properties": {
+            "prompt": {"type": "string"},
+            "tier": {
+                "type": "string",
+                "enum": tier_names or ["quick", "standard", "deep"],
+                "default": default_tier,
+            },
+            "roles": {
+                "type": "object",
+                "additionalProperties": {"type": "string"},
+                "description": "Map model alias → stance key. Defaults to neutral.",
+            },
+            "attachments": {
+                "type": "array",
+                "items": _ATTACHMENT_SCHEMA_ITEMS,
+                "description": (
+                    "Each entry is either an absolute file path (string), a labelled "
+                    "file `{path, label?, kind?}`, or a server-resolved source "
+                    "`{source: \"git_diff\", base, head, repo_path?, label?}`."
+                ),
+            },
+            "synthesiser": {"type": "string", "description": "Override synth model."},
+            "rubric": {
+                "type": "string",
+                "description": (
+                    "Rubric name (e.g. 'consensus', 'code_review', 'research_brief', "
+                    "'critique') or a literal rubric string. Defaults to 'consensus'."
+                ),
+            },
+            "capsule_kind": {
+                "type": "string",
+                "enum": ["decision", "review", "research"],
+                "default": "decision",
+                "description": (
+                    "Shape of the extracted capsule. 'decision' (default), 'review' for "
+                    "code reviews, 'research' for evidence-gathering panels."
+                ),
+            },
+            "blinded": {"type": "boolean", "default": False},
+            "max_run_usd": {"type": "number"},
+        },
+    }
 
 
 # ---- Tool listing -----------------------------------------------------------
@@ -378,7 +435,7 @@ async def handle_list_tools() -> list[Tool]:
                 "Hero tool: parallel panel + server-side synthesis. Returns synthesis "
                 "+ manifest. Use for 'just give me the answer' workflows."
             ),
-            inputSchema=_CONSULT_SCHEMA,
+            inputSchema=_consult_schema(),
         ),
         Tool(
             name="refine",
@@ -579,6 +636,7 @@ async def _handle_panel(args: dict[str, Any]) -> dict[str, Any]:
     prompt = _inline_attachments(args["prompt"], args.get("attachments"))
     specs = _specs_from_args(args["models"])
     progress_cb = _progress_callback()
+    kind = args.get("capsule_kind", "decision")
     handle = await runner.fanout(
         prompt,
         specs,
@@ -586,11 +644,10 @@ async def _handle_panel(args: dict[str, Any]) -> dict[str, Any]:
         dry_run=args.get("dry_run", False),
         max_run_usd=args.get("max_run_usd"),
         on_progress=progress_cb,
+        capsule_kind=kind,
     )
     if args.get("extract_capsules", True) and not handle.partial and handle.manifest:
-        handle = await capsule.annotate(
-            handle, on_progress=progress_cb, kind=args.get("capsule_kind", "decision")
-        )
+        handle = await capsule.annotate(handle, on_progress=progress_cb, kind=kind)
     return handle.model_dump()
 
 
@@ -640,12 +697,14 @@ async def _handle_consult(args: dict[str, Any]) -> dict[str, Any]:
 
         return cb
 
+    kind = args.get("capsule_kind", "decision")
     handle = await runner.fanout(
         prompt,
         specs,
         blinded=args.get("blinded", False),
         max_run_usd=args.get("max_run_usd"),
         on_progress=phase(),
+        capsule_kind=kind,
     )
     if handle.partial or not handle.manifest:
         # Return a real `RunResult` so the partial response has the same shape
@@ -666,9 +725,7 @@ async def _handle_consult(args: dict[str, Any]) -> dict[str, Any]:
         )
         return partial.model_dump()
     offset = len(specs)
-    handle = await capsule.annotate(
-        handle, on_progress=phase(), kind=args.get("capsule_kind", "decision")
-    )
+    handle = await capsule.annotate(handle, on_progress=phase(), kind=kind)
     offset = len(specs) * 2
     if base is not None:
         await base(progress.SynthStarted(done=offset, total=overall_total))
@@ -719,6 +776,8 @@ async def _handle_sequence(args: dict[str, Any]) -> dict[str, Any]:
         synthesiser=args.get("synthesiser"),
         blinded=args.get("blinded", False),
         max_run_usd=args.get("max_run_usd"),
+        capsule_kind=args.get("capsule_kind", "decision"),
+        rubric=args.get("rubric"),
         on_progress=_progress_callback(),
     )
     return result.model_dump()
@@ -738,7 +797,10 @@ async def _handle_refine(args: dict[str, Any]) -> dict[str, Any]:
         synthesiser=args.get("synthesiser"),
         continuation_id=args.get("continuation_id"),
         rubric=args.get("rubric"),
-        capsule_kind=args.get("capsule_kind", "decision"),
+        # Pass None when the MCP caller didn't specify, so refine inherits
+        # from the prior run's bundle (continuation case) instead of
+        # silently defaulting back to "decision".
+        capsule_kind=args.get("capsule_kind"),
         on_progress=_progress_callback(),
     )
     return result.model_dump()

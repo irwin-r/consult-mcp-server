@@ -78,6 +78,8 @@ async def sequence(
     synthesiser: str | None = None,
     blinded: bool = False,
     max_run_usd: float | None = None,
+    capsule_kind: str = "decision",
+    rubric: str | None = None,
     on_progress: runner.ProgressCallback | None = None,
 ) -> SequenceResult:
     """Run `prompts` as a chain where step i sees step i-1's synthesis."""
@@ -160,6 +162,7 @@ async def sequence(
             blinded=blinded,
             max_run_usd=cap - cumulative_cost,
             on_progress=phase_cb(step_base),
+            capsule_kind=capsule_kind,
         )
         if handle.partial or not handle.manifest:
             partial_reason = (
@@ -170,6 +173,7 @@ async def sequence(
         handle = await capsule.annotate(
             handle,
             on_progress=phase_cb(step_base + panel_n),
+            kind=capsule_kind,
         )
         cumulative_cost += handle.cost_usd
         if not handle.cost_known:
@@ -178,7 +182,7 @@ async def sequence(
         progress_done = step_base + panel_n * 2
         await emit(progress_mod.SynthStarted(done=progress_done, total=progress_total))
         step_synth = await synth.synthesise(
-            handle.run_id, by_model=synth_alias, anonymised=blinded
+            handle.run_id, by_model=synth_alias, anonymised=blinded, rubric=rubric
         )
         progress_done = step_base + panel_n * 2 + 1
         await emit(progress_mod.SequenceStepCompleted(

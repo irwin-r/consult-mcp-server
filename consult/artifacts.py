@@ -114,6 +114,31 @@ def write_manifest(paths: RunPaths, payload: dict) -> None:
     paths.manifest_json.write_text(json.dumps(payload, indent=2, default=str))
 
 
+def augment_manifest(paths: RunPaths, **fields: object) -> None:
+    """Merge fields into the existing manifest.json.
+
+    Used after synth/refine to persist metadata that wasn't available at
+    fanout time — `synthesiser` is the canonical example: the consult
+    handler picks the synth model after the panel returns, but the manifest
+    is written during `runner.fanout` before that decision exists.
+
+    Single-writer per run dir (each run_id is unique), so no locking. Best
+    effort: if the manifest is missing or malformed, no-op rather than
+    raise — augmentation is a UX nicety for downstream viewers, not a
+    correctness boundary.
+    """
+    if not paths.manifest_json.exists():
+        return
+    try:
+        current = json.loads(paths.manifest_json.read_text())
+    except (OSError, json.JSONDecodeError):
+        return
+    if not isinstance(current, dict):
+        return
+    current.update(fields)
+    paths.manifest_json.write_text(json.dumps(current, indent=2, default=str))
+
+
 def parse_resource_uri(uri: str) -> tuple[str, str]:
     """Parse `consult://runs/<id>/responses/<slug>` → (run_id, slug)."""
     if not uri.startswith("consult://runs/"):

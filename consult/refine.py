@@ -25,9 +25,12 @@ from . import progress as progress_mod
 from .jsonparse import extract_json
 from .types import (
     ArbiterVerdict,
+    Capsule,
     ManifestEntry,
     ModelSpec,
     RefineResult,
+    ResearchCapsule,
+    ReviewCapsule,
     Status,
 )
 
@@ -88,6 +91,62 @@ Specifically focus on: {focus}
 Now give your refined answer to the original question, addressing the gaps. \
 Be concrete; don't simply restate the prior position."""
 
+def _capsule_summary(cap: Capsule | ReviewCapsule | ResearchCapsule) -> str:
+    """One-line summary of any capsule kind. Used in arbiter prompts where
+    a position-like signal is needed regardless of `capsule_kind`."""
+    if isinstance(cap, ReviewCapsule):
+        n = len(cap.findings)
+        if not n:
+            return cap.overall_verdict
+        sev_counts: dict[str, int] = {}
+        for f in cap.findings:
+            sev_counts[f.severity] = sev_counts.get(f.severity, 0) + 1
+        sev_str = ", ".join(f"{v}× {k}" for k, v in sorted(sev_counts.items()))
+        return f"{cap.overall_verdict} ({n} findings: {sev_str})"
+    if isinstance(cap, ResearchCapsule):
+        return (
+            f"{len(cap.claims)} claims, "
+            f"{len(cap.uncertainties)} uncertainties, "
+            f"{len(cap.evidence)} evidence items"
+        )
+    # Decision capsule
+    return cap.position or "(no position)"
+
+
+def _capsule_detail(cap: Capsule | ReviewCapsule | ResearchCapsule) -> str:
+    """Multi-line detail rendering for the arbiter's capsules section.
+
+    Each capsule kind gets a different layout — review surfaces top
+    findings, research surfaces top claims, decision keeps the original
+    recommendation/key_points shape.
+    """
+    if isinstance(cap, ReviewCapsule):
+        lines: list[str] = [f"  overall_verdict: {cap.overall_verdict}"]
+        if cap.findings:
+            lines.append(f"  findings ({len(cap.findings)}; showing up to 5):")
+            for f in cap.findings[:5]:
+                loc = f.file or "(no file)"
+                if f.line_range:
+                    loc += f":{f.line_range[0]}-{f.line_range[1]}"
+                lines.append(f"    - [{f.severity}/{f.category}] {loc} — {f.summary}")
+        return "\n".join(lines)
+    if isinstance(cap, ResearchCapsule):
+        parts: list[str] = []
+        if cap.claims:
+            parts.append("  claims: " + "; ".join(cap.claims[:3]))
+        if cap.uncertainties:
+            parts.append("  uncertainties: " + "; ".join(cap.uncertainties[:3]))
+        if cap.evidence:
+            parts.append("  evidence: " + "; ".join(cap.evidence[:3]))
+        return "\n".join(parts) or "  (no claims extracted)"
+    # Decision capsule
+    bullets = "; ".join(cap.key_points[:3]) if cap.key_points else "(no key points)"
+    return (
+        f"  recommendation: {cap.recommendation}\n"
+        f"  key_points: {bullets}"
+    )
+
+
 def _format_capsules(manifest: list[ManifestEntry]) -> str:
     lines = []
     for m in manifest:
@@ -99,9 +158,8 @@ def _format_capsules(manifest: list[ManifestEntry]) -> str:
             lines.append(f"- {m.slug}: (no capsule extracted)")
             continue
         conf = f" conf={c.confidence:.2f}" if c.confidence is not None else ""
-        bullets = "; ".join(c.key_points[:3]) if c.key_points else "(no key points)"
         lines.append(
-            f"- {m.slug}{conf}: {c.position}\n  recommendation: {c.recommendation}\n  key_points: {bullets}"
+            f"- {m.slug}{conf}: {_capsule_summary(c)}\n{_capsule_detail(c)}"
         )
     return "\n".join(lines)
 
@@ -111,7 +169,7 @@ def _format_positions(manifest: list[ManifestEntry]) -> str:
     for m in manifest:
         if not m.capsule or m.status not in (Status.OK, Status.TRUNCATED):
             continue
-        lines.append(f"- {m.slug}: {m.capsule.position}")
+        lines.append(f"- {m.slug}: {_capsule_summary(m.capsule)}")
     return "\n".join(lines) or "(none extracted)"
 
 
@@ -150,24 +208,28 @@ def _format_position_diff(
     lines: list[str] = []
     for base, cur in current_by_base.items():
         assert cur.capsule is not None  # _by_base filters None capsules
+        cur_summary = _capsule_summary(cur.capsule)
         old = prior_by_base.get(base)
         if old and old.capsule:
-            if old.capsule.position == cur.capsule.position:
-                lines.append(f"- {base}: unchanged — {cur.capsule.position}")
+            old_summary = _capsule_summary(old.capsule)
+            if old_summary == cur_summary:
+                lines.append(f"- {base}: unchanged — {cur_summary}")
             else:
                 lines.append(
                     f"- {base}:\n"
-                    f"    before: {old.capsule.position}\n"
-                    f"    after:  {cur.capsule.position}"
+                    f"    before: {old_summary}\n"
+                    f"    after:  {cur_summary}"
                 )
         else:
-            lines.append(f"- {base} (new this round): {cur.capsule.position}")
+            lines.append(f"- {base} (new this round): {cur_summary}")
     # Surface panellists that dropped out this round — their disappearance
     # is signal the arbiter should weigh ("3 of 5 now agree, but 2 of 5
     # are missing this round so consensus is weaker than it looks").
     for base, old in prior_by_base.items():
         if base not in current_by_base and old.capsule:
-            lines.append(f"- {base} (dropped this round, last position): {old.capsule.position}")
+            lines.append(
+                f"- {base} (dropped this round, last position): {_capsule_summary(old.capsule)}"
+            )
     return "\n".join(lines) or "(no comparable positions)"
 
 
@@ -369,13 +431,32 @@ async def refine(
     synthesiser: str | None = None,
     continuation_id: str | None = None,
     rubric: str | None = None,
-    capsule_kind: str = "decision",
+    capsule_kind: str | None = None,
     on_progress: runner.ProgressCallback | None = None,
 ) -> RefineResult:
     if max_rounds < 1 or max_rounds > 5:
         raise ValueError("max_rounds must be between 1 and 5")
     if not 0.0 <= threshold <= 1.0:
         raise ValueError("threshold must be in [0.0, 1.0]")
+
+    # Resolve capsule_kind precedence: explicit caller value > inherited
+    # from prior run's ContextBundle (when continuation_id is set) >
+    # "decision" default. Without this, a continuation that started as
+    # review/research silently switches back to decision on the next
+    # round, producing wrong-shape capsules.
+    resolved_kind = capsule_kind
+    if resolved_kind is None and continuation_id:
+        try:
+            prior_paths = artifacts.load_run(continuation_id)
+            prior_bundle = context.load_or_none(prior_paths)
+            if prior_bundle is not None:
+                resolved_kind = prior_bundle.capsule_kind
+        except FileNotFoundError:
+            # `_apply_continuation` raises with a clearer message below;
+            # don't pre-empt that here.
+            pass
+    if resolved_kind is None:
+        resolved_kind = "decision"
 
     prompt = _apply_continuation(prompt, continuation_id)
     # Resolve `model:N` sugar here too so `estimate_cost` (called before
@@ -390,7 +471,10 @@ async def refine(
     # Per-run context bundle. Refine creates its own run dir then calls
     # `runner.fanout` with `existing_paths=` so we own the bundle write
     # here — runner skips it when given an existing path.
-    context.write(paths, context.build(prompt, blinded=blinded))
+    context.write(
+        paths,
+        context.build(prompt, blinded=blinded, capsule_kind=resolved_kind),
+    )
     cap = max_run_usd if max_run_usd is not None else registry.default_max_run_usd()
 
     start = time.time()
@@ -463,7 +547,7 @@ async def refine(
         handle = await capsule.annotate(
             handle,
             on_progress=make_phase_cb(round_base + panel_n),
-            kind=capsule_kind,
+            kind=resolved_kind,
         )
         final_manifest = handle.manifest
         cumulative_cost += handle.cost_usd

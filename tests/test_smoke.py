@@ -288,16 +288,25 @@ async def test_fanout_dry_run_returns_partial():
 
 @pytest.mark.asyncio
 async def test_fanout_emits_progress_callbacks(tmp_path, monkeypatch):
-    """fanout must call on_progress once per panellist with a typed
-    `PanellistCompleted` event carrying monotonically increasing `done`.
-    The "A" half of the A + D progress design.
+    """fanout emits a layered progress stream:
+    - one `PhaseStarted(phase="fanout")` before any panellist begins
+    - one `PanellistStarted` per panellist (before its network call)
+    - one `PanellistCompleted` per panellist (after the call returns)
+    Heartbeat ticks are disabled (interval=0) so the assertions stay
+    deterministic; a separate test covers the heartbeat path.
     """
     from consult import runner
-    from consult.progress import PanellistCompleted, ProgressEvent
+    from consult.progress import (
+        PanellistCompleted,
+        PanellistStarted,
+        PhaseStarted,
+        ProgressEvent,
+    )
     from consult.runner import fanout
 
     monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
     monkeypatch.setattr(runner, "estimate_cost", lambda specs, prompt: (0.0, True))
+    monkeypatch.setenv("CONSULT_HEARTBEAT_INTERVAL_S", "0")
 
     async def fake_call(spec, slug, per_prompt, paths, provider_sems=None, **_):
         return ManifestEntry(
@@ -328,13 +337,23 @@ async def test_fanout_emits_progress_callbacks(tmp_path, monkeypatch):
     handle = await fanout("p", specs, on_progress=on_progress)
     assert handle.partial is False
 
-    # 3 panellists ⇒ 3 PanellistCompleted events; each has total=3,
-    # done ∈ {1, 2, 3} (gather order is non-deterministic).
-    assert len(events) == 3
-    assert all(isinstance(e, PanellistCompleted) for e in events)
-    assert {e.done for e in events} == {1, 2, 3}
-    assert all(e.total == 3 for e in events)
-    assert all(e.status == "OK" for e in events)
+    # First event must be the phase boundary so the parent sees fanout
+    # begin before any panellist completion fires.
+    assert isinstance(events[0], PhaseStarted)
+    assert events[0].phase == "fanout"
+    assert events[0].total == 3
+
+    started = [e for e in events if isinstance(e, PanellistStarted)]
+    completed = [e for e in events if isinstance(e, PanellistCompleted)]
+
+    assert len(started) == 3
+    assert {e.started_count for e in started} == {1, 2, 3}
+    assert all(e.total == 3 for e in started)
+
+    assert len(completed) == 3
+    assert {e.done for e in completed} == {1, 2, 3}
+    assert all(e.total == 3 for e in completed)
+    assert all(e.status == "OK" for e in completed)
 
 
 def test_append_progress_log_writes_jsonl(tmp_path):
@@ -370,7 +389,10 @@ def test_progress_event_message_for_every_kind():
     from consult.progress import (
         ArbiterScored,
         CapsuleExtracted,
+        Heartbeat,
         PanellistCompleted,
+        PanellistStarted,
+        PhaseStarted,
         SequenceStepCompleted,
         SequenceStepStarted,
         SynthCompleted,
@@ -389,6 +411,33 @@ def test_progress_event_message_for_every_kind():
     assert event_message(SynthCompleted(done=2, total=2)) == "synthesis complete"
     assert "step 3" in event_message(SequenceStepStarted(done=1, total=5, step=3))
     assert "step 3" in event_message(SequenceStepCompleted(done=2, total=5, step=3))
+
+    started_msg = event_message(PanellistStarted(
+        done=0, total=3, slug="alpha", started_count=1,
+    ))
+    assert "alpha" in started_msg
+    assert "1/3" in started_msg
+
+    assert event_message(PhaseStarted(done=0, total=3, phase="fanout")) == "phase: fanout"
+    assert event_message(PhaseStarted(done=3, total=6, phase="capsules")) == "phase: capsules"
+
+    hb_msg = event_message(Heartbeat(
+        done=1, total=3, elapsed_ms=12_500,
+        cost_so_far_usd=0.0234, cost_known=True,
+        pending_count=2, pending_slugs=["gpt-pro", "claude-opus"],
+    ))
+    assert "12s" in hb_msg or "13s" in hb_msg
+    assert "$0.0234" in hb_msg
+    assert "2 pending" in hb_msg
+    assert "gpt-pro" in hb_msg
+
+    # Cost-unknown variant uses ≥ prefix to mark the total as a lower bound.
+    hb_unknown = event_message(Heartbeat(
+        done=1, total=3, elapsed_ms=1000,
+        cost_so_far_usd=0.5, cost_known=False,
+        pending_count=0, pending_slugs=[],
+    ))
+    assert "≥$0.5000" in hb_unknown
 
 
 def test_error_envelope_shape_round_trips():
@@ -647,7 +696,14 @@ def test_progress_event_round_trips_through_json():
     """
     from pydantic import TypeAdapter
 
-    from consult.progress import CapsuleExtracted, PanellistCompleted, ProgressEvent
+    from consult.progress import (
+        CapsuleExtracted,
+        Heartbeat,
+        PanellistCompleted,
+        PanellistStarted,
+        PhaseStarted,
+        ProgressEvent,
+    )
 
     adapter = TypeAdapter(ProgressEvent)
     p = PanellistCompleted(done=1, total=2, slug="x", status="OK", latency_ms=10)
@@ -658,6 +714,25 @@ def test_progress_event_round_trips_through_json():
     c = CapsuleExtracted(done=1, total=2, slug="x")
     parsed = adapter.validate_json(c.model_dump_json())
     assert isinstance(parsed, CapsuleExtracted)
+
+    s = PanellistStarted(done=0, total=2, slug="alpha", started_count=1)
+    parsed = adapter.validate_json(s.model_dump_json())
+    assert isinstance(parsed, PanellistStarted)
+    assert parsed.started_count == 1
+
+    ph = PhaseStarted(done=0, total=3, phase="capsules")
+    parsed = adapter.validate_json(ph.model_dump_json())
+    assert isinstance(parsed, PhaseStarted)
+    assert parsed.phase == "capsules"
+
+    hb = Heartbeat(
+        done=1, total=3, elapsed_ms=2500,
+        cost_so_far_usd=0.01, cost_known=True,
+        pending_count=2, pending_slugs=["a", "b"],
+    )
+    parsed = adapter.validate_json(hb.model_dump_json())
+    assert isinstance(parsed, Heartbeat)
+    assert parsed.pending_slugs == ["a", "b"]
 
 
 @pytest.mark.asyncio
@@ -698,6 +773,143 @@ async def test_fanout_progress_callback_failure_does_not_abort_run(tmp_path, mon
     assert handle.partial is False
     assert len(handle.manifest) == 1
     assert handle.manifest[0].status is Status.OK
+
+
+@pytest.mark.asyncio
+async def test_fanout_emits_heartbeat_while_panellists_in_flight(tmp_path, monkeypatch):
+    """With a short heartbeat interval and an artificially slow panellist,
+    at least one `Heartbeat` event must fire before the panellist completes
+    — proving the "still working" liveness pulse works.
+
+    The heartbeat snapshot shows the in-flight slug as pending and elapsed
+    time greater than the interval.
+    """
+    import asyncio as _asyncio
+
+    from consult import runner
+    from consult.progress import Heartbeat, ProgressEvent
+    from consult.runner import fanout
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    monkeypatch.setattr(runner, "estimate_cost", lambda specs, prompt: (0.0, True))
+    monkeypatch.setenv("CONSULT_HEARTBEAT_INTERVAL_S", "0.05")
+
+    async def fake_call(spec, slug, per_prompt, paths, provider_sems=None, **_):
+        await _asyncio.sleep(0.2)
+        paths.response_text(slug).write_text("body")
+        return ManifestEntry(
+            slug=slug, model_id="x/y", persona=None, status=Status.OK,
+            finish_reason="stop", resource_uri=paths.resource_uri(slug),
+            body_path=str(paths.response_text(slug)),
+            latency_ms=200, cost_usd=0.01, cost_known=True,
+        )
+
+    monkeypatch.setattr(runner, "_call_one", fake_call)
+
+    events: list[ProgressEvent] = []
+
+    async def on_progress(event: ProgressEvent) -> None:
+        events.append(event)
+
+    handle = await fanout(
+        "p", [ModelSpec(model="claude-haiku", slug="alpha")],
+        on_progress=on_progress,
+    )
+    assert handle.partial is False
+
+    heartbeats = [e for e in events if isinstance(e, Heartbeat)]
+    assert heartbeats, f"expected at least one Heartbeat, got: {[e.kind for e in events]}"
+    hb = heartbeats[0]
+    assert hb.elapsed_ms >= 50  # at least one interval
+    assert hb.pending_count == 1
+    assert hb.pending_slugs == ["alpha"]
+    # Cost-so-far is 0 before any panellist returns.
+    assert hb.cost_so_far_usd == 0.0
+
+
+@pytest.mark.asyncio
+async def test_fanout_heartbeat_disabled_when_interval_zero(tmp_path, monkeypatch):
+    """`CONSULT_HEARTBEAT_INTERVAL_S=0` disables the heartbeat task so tests
+    (and clients that don't want the pulse) get a clean event stream.
+    """
+    import asyncio as _asyncio
+
+    from consult import runner
+    from consult.progress import Heartbeat, ProgressEvent
+    from consult.runner import fanout
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    monkeypatch.setattr(runner, "estimate_cost", lambda specs, prompt: (0.0, True))
+    monkeypatch.setenv("CONSULT_HEARTBEAT_INTERVAL_S", "0")
+
+    async def fake_call(spec, slug, per_prompt, paths, provider_sems=None, **_):
+        await _asyncio.sleep(0.1)
+        paths.response_text(slug).write_text("body")
+        return ManifestEntry(
+            slug=slug, model_id="x/y", persona=None, status=Status.OK,
+            finish_reason="stop", resource_uri=paths.resource_uri(slug),
+            body_path=str(paths.response_text(slug)),
+            latency_ms=100, cost_usd=0.0, cost_known=True,
+        )
+
+    monkeypatch.setattr(runner, "_call_one", fake_call)
+
+    events: list[ProgressEvent] = []
+
+    async def on_progress(event: ProgressEvent) -> None:
+        events.append(event)
+
+    await fanout(
+        "p", [ModelSpec(model="claude-haiku")],
+        on_progress=on_progress,
+    )
+    assert not any(isinstance(e, Heartbeat) for e in events)
+
+
+@pytest.mark.asyncio
+async def test_capsule_annotate_emits_phase_started(tmp_path, monkeypatch):
+    """`capsule.annotate` emits `PhaseStarted(phase="capsules")` so the
+    parent sees the capsule phase begin rather than only learning when
+    the first extraction completes.
+    """
+    from consult import capsule as capsule_mod
+    from consult.progress import CapsuleExtracted, PhaseStarted, ProgressEvent
+    from consult.types import Capsule
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    paths = artifacts.create_run()
+    paths.prompt_txt.write_text("hello")
+
+    entry = ManifestEntry(
+        slug="alpha", model_id="x/y", persona=None, status=Status.OK,
+        finish_reason="stop", resource_uri=paths.resource_uri("alpha"),
+        body_path=str(paths.response_text("alpha")), latency_ms=10,
+        cost_usd=0.0, cost_known=True,
+    )
+    paths.response_text("alpha").write_text("body content")
+
+    handle = RunHandle(
+        run_id=paths.run_id, artifacts_dir=str(paths.root),
+        manifest=[entry], cost_usd=0.0, cost_known=True,
+        wall_ms=10, partial=False, blinded=False,
+    )
+
+    async def fake_extract_one(body, ext_id, timeout, original_question, *, kind="decision"):
+        return Capsule(position="x", recommendation="y", confidence=0.5), 0.0, True
+
+    monkeypatch.setattr(capsule_mod, "_extract_one", fake_extract_one)
+
+    events: list[ProgressEvent] = []
+
+    async def on_progress(event: ProgressEvent) -> None:
+        events.append(event)
+
+    await capsule_mod.annotate(handle, on_progress=on_progress)
+
+    assert isinstance(events[0], PhaseStarted)
+    assert events[0].phase == "capsules"
+    # Followed by the per-capsule extraction events.
+    assert any(isinstance(e, CapsuleExtracted) for e in events)
 
 
 @pytest.mark.asyncio
@@ -1686,8 +1898,8 @@ def test_viewer_render_run_panel_includes_core_sections(tmp_path, monkeypatch):
     # Panel run: no synthesis section, no arbiter section, but core panellist
     # card is present with the capsule fields surfaced.
     assert "panel" in text.lower()
-    assert "Synthesis" not in text
-    assert "Arbiter rounds" not in text
+    assert "<h2>Synthesis</h2>" not in text
+    assert "<h2>Arbiter rounds</h2>" not in text
     assert "alpha" in text
     assert "supports A" in text
     assert "ship A" in text
@@ -2306,6 +2518,295 @@ def test_refine_format_position_diff_shows_changes_and_unchanged():
     assert "gamma (dropped this round" in out
 
 
+def test_refine_format_position_diff_handles_review_capsules():
+    """Regression: `_format_position_diff` previously read `capsule.position`
+    directly, which crashes on ReviewCapsule (no `position` field). Must
+    work across all capsule kinds via `_capsule_summary`."""
+    from consult.refine import _format_position_diff
+    from consult.types import Finding, ManifestEntry, ReviewCapsule, Status
+
+    def entry(slug: str, verdict: str, findings: int) -> ManifestEntry:
+        return ManifestEntry(
+            slug=slug, status=Status.OK,
+            resource_uri=f"consult://runs/x/responses/{slug}",
+            body_path=f"/x/{slug}",
+            capsule=ReviewCapsule(
+                overall_verdict=verdict,
+                findings=[
+                    Finding(
+                        severity="blocker", category="security",
+                        summary=f"finding {i}", suggestion="fix it",
+                    )
+                    for i in range(findings)
+                ],
+            ),
+        )
+
+    prior = [entry("alpha.r1", "changes_requested", 3)]
+    current = [entry("alpha.r2", "ship", 0)]
+    # Must not raise AttributeError; previous code did because
+    # ReviewCapsule has no `.position` field.
+    out = _format_position_diff(prior, current)
+    assert "alpha" in out
+    assert "changes_requested" in out
+    assert "ship" in out
+
+
+def test_refine_format_position_diff_handles_research_capsules():
+    """Regression: same as review, but for ResearchCapsule."""
+    from consult.refine import _format_position_diff
+    from consult.types import ManifestEntry, ResearchCapsule, Status
+
+    def entry(slug: str, n_claims: int) -> ManifestEntry:
+        return ManifestEntry(
+            slug=slug, status=Status.OK,
+            resource_uri=f"consult://runs/x/responses/{slug}",
+            body_path=f"/x/{slug}",
+            capsule=ResearchCapsule(
+                claims=[f"claim {i}" for i in range(n_claims)],
+                evidence=["e"],
+                uncertainties=["u"],
+            ),
+        )
+
+    prior = [entry("alpha.r1", 2)]
+    current = [entry("alpha.r2", 5)]
+    out = _format_position_diff(prior, current)
+    assert "alpha" in out
+    assert "claims" in out
+
+
+def test_refine_format_capsules_handles_review_kind():
+    """`_format_capsules` must render review-kind capsules without
+    crashing on the missing `position` / `recommendation` fields."""
+    from consult.refine import _format_capsules
+    from consult.types import Finding, ManifestEntry, ReviewCapsule, Status
+
+    m = ManifestEntry(
+        slug="alpha", status=Status.OK,
+        resource_uri="consult://runs/x/responses/alpha",
+        body_path="/x/alpha",
+        capsule=ReviewCapsule(
+            overall_verdict="changes_requested",
+            findings=[
+                Finding(
+                    severity="blocker", file="src/auth.py",
+                    line_range=(42, 58), category="security",
+                    summary="SQL injection in login",
+                    suggestion="use parameterised query",
+                ),
+            ],
+        ),
+    )
+    out = _format_capsules([m])
+    assert "changes_requested" in out
+    assert "SQL injection" in out
+
+
+def test_context_bundle_persists_capsule_kind(tmp_path, monkeypatch):
+    """ContextBundle records `capsule_kind` so a continuation can inherit
+    it without the caller having to re-specify."""
+    from consult import context as ctx
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    paths = artifacts.create_run()
+    ctx.write(paths, ctx.build("the prompt", blinded=False, capsule_kind="review"))
+
+    loaded = ctx.load_or_none(paths)
+    assert loaded is not None
+    assert loaded.capsule_kind == "review"
+
+
+def test_context_bundle_v1_loads_with_default_kind(tmp_path, monkeypatch):
+    """Legacy bundles (schema_version=1) had no `capsule_kind` field. The
+    Pydantic default makes them load as `capsule_kind="decision"` without
+    raising."""
+    from consult import context as ctx
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    paths = artifacts.create_run()
+    (paths.root / "context.json").write_text(
+        '{"schema_version": 1, "prompt": "p", "prompt_scrubbed": "p", "blinded": false}'
+    )
+    loaded = ctx.load_or_none(paths)
+    assert loaded is not None
+    assert loaded.capsule_kind == "decision"
+
+
+@pytest.mark.asyncio
+async def test_refine_inherits_capsule_kind_from_continuation(tmp_path, monkeypatch):
+    """When `capsule_kind` is not passed and `continuation_id` is, refine
+    should pick up the prior run's capsule_kind from its ContextBundle."""
+    from consult import context as ctx
+    from consult import refine as refine_mod
+    from consult.types import ArbiterVerdict, ManifestEntry, ModelSpec, RunHandle, Status
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    prior = artifacts.create_run()
+    prior.prompt_txt.write_text("prior question")
+    ctx.write(prior, ctx.build("prior question", blinded=False, capsule_kind="review"))
+    (prior.root / "synthesis.md").write_text("prior synthesis")
+
+    captured: dict[str, str] = {}
+
+    async def fake_fanout(prompt, specs, **kwargs):
+        return RunHandle(
+            run_id=prior.run_id,
+            artifacts_dir=str(prior.root),
+            manifest=[ManifestEntry(
+                slug="alpha.r1", status=Status.OK,
+                resource_uri="consult://runs/x/responses/alpha.r1",
+                body_path="/x", latency_ms=10, cost_known=True,
+            )],
+            cost_usd=0.0, cost_known=True, wall_ms=0,
+        )
+
+    async def fake_annotate(handle, **kwargs):
+        captured["annotate_kind"] = kwargs.get("kind", "?")
+        return handle
+
+    async def fake_arbiter(*args, **kwargs):
+        return ArbiterVerdict(round=1, score=1.0, parsed_ok=True)
+
+    async def fake_synth(*args, **kwargs):
+        return "synthesised"
+
+    monkeypatch.setattr("consult.refine.runner.fanout", fake_fanout)
+    monkeypatch.setattr("consult.refine.capsule.annotate", fake_annotate)
+    monkeypatch.setattr("consult.refine._ask_arbiter", fake_arbiter)
+    monkeypatch.setattr("consult.refine.synth.synthesise", fake_synth)
+
+    # Implicit inheritance — caller doesn't pass capsule_kind
+    await refine_mod.refine(
+        "follow-up", [ModelSpec(model="claude-haiku")],
+        threshold=0.5, max_rounds=1, continuation_id=prior.run_id,
+    )
+    assert captured.get("annotate_kind") == "review"
+
+    # Explicit override
+    captured.clear()
+    await refine_mod.refine(
+        "follow-up", [ModelSpec(model="claude-haiku")],
+        threshold=0.5, max_rounds=1, continuation_id=prior.run_id,
+        capsule_kind="research",
+    )
+    assert captured.get("annotate_kind") == "research"
+
+
+@pytest.mark.asyncio
+async def test_stream_acompletion_raises_on_builder_failure(monkeypatch):
+    """SECURITY/CORRECTNESS: when `stream_chunk_builder` fails, the
+    streaming variant must raise rather than return a malformed partial
+    chunk that downstream `classify()` and `completion_cost()` would
+    mishandle."""
+    import litellm
+
+    from consult.runner import _stream_acompletion
+
+    class _FakeAsyncStream:
+        def __init__(self, chunks):
+            self.chunks = chunks
+            self._i = 0
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if self._i >= len(self.chunks):
+                raise StopAsyncIteration
+            c = self.chunks[self._i]
+            self._i += 1
+            return c
+
+    async def fake_acompletion(**kwargs):
+        return _FakeAsyncStream([{"raw": "chunk1"}, {"raw": "chunk2"}])
+
+    def fake_builder(chunks, messages=None):
+        raise ValueError("builder unsupported chunk shape")
+
+    monkeypatch.setattr(litellm, "acompletion", fake_acompletion)
+    monkeypatch.setattr(litellm, "stream_chunk_builder", fake_builder)
+
+    with pytest.raises(RuntimeError, match="stream_chunk_builder failed"):
+        await _stream_acompletion(
+            timeout=10.0, on_partial=None, start=0.0,
+            model="x/y", messages=[], max_tokens=100,
+        )
+
+
+def test_synth_build_input_rubric_with_literal_braces_does_not_crash():
+    """Regression: `_build_input` previously used `.format(n=...)`, which
+    crashes when a user-supplied rubric contains literal `{}` (e.g. a JSON
+    example). Switched to `.replace("{n}", ...)`."""
+    from consult.synth import _build_input
+
+    rubric_with_braces = (
+        "You have {n} responses.\n\nExpected JSON shape: "
+        "{ \"verdict\": \"ship\" }"
+    )
+    manifest = [
+        {"slug": "alpha", "model_id": "x", "persona": None,
+         "confidence": None, "status": "OK"},
+    ]
+    out = _build_input(
+        manifest, {"alpha": "body"}, rubric=rubric_with_braces, anonymised=False
+    )
+    assert "1 responses" in out
+    assert '{ "verdict": "ship" }' in out
+
+
+def test_context_brand_regex_includes_registry_models():
+    """The brand regex is derived from `registry.models_config()` so adding
+    a model to models.json extends scrub coverage automatically. `sonnet`,
+    `codex`, and other tier suffixes are picked up via alias parsing."""
+    from consult import context as ctx
+
+    text = "Compare claude-sonnet against gpt-codex for refactoring."
+    out = ctx.scrub_brands(text)
+    assert "claude" not in out.lower()
+    assert "sonnet" not in out.lower()
+    assert "gpt" not in out.lower()
+    assert "codex" not in out.lower()
+
+
+def test_context_trim_synth_input_proportional_hard_trim_on_large_panel():
+    """When N panellists × per-body floor exceeds the budget, the hard-trim
+    pass shrinks bodies proportionally so the overall input fits."""
+    from consult import context as ctx
+
+    # 20 bodies × 10000 chars = 200000; budget 50000. Floor (5000) × 20 =
+    # 100000, still over budget. Hard-trim kicks in.
+    bodies = {f"slug-{i}": "X" * 10_000 for i in range(20)}
+    new_prompt, new_bodies = ctx.trim_synth_input(
+        original_prompt=None, bodies=bodies, overall_budget=50_000,
+    )
+    total = sum(len(b) for b in new_bodies.values())
+    # Allow a small overhead per body for trim markers
+    assert total <= 50_000 + 30 * 200, (total, "should fit within budget + marker overhead")
+
+
+def test_capsule_review_extraction_prompt_directs_enumeration():
+    """The review-kind extraction prompt must explicitly tell the extractor
+    to enumerate every distinct finding (regression: cheap extractors
+    returned `findings=[]` when given detailed reviews)."""
+    from consult.capsule import _CAPSULE_PROMPT_HEAD_REVIEW
+
+    head = _CAPSULE_PROMPT_HEAD_REVIEW.lower()
+    assert "enumerate" in head
+    assert "every distinct" in head
+    assert "🔴" in _CAPSULE_PROMPT_HEAD_REVIEW
+    assert "blocker" in head
+
+
+def test_capsule_review_kind_uses_larger_token_budget():
+    """ReviewCapsule extraction needs more output tokens than decision
+    (a thorough review can produce 20+ findings, each ~150 chars)."""
+    from consult.capsule import _MAX_TOKENS_BY_KIND
+
+    assert _MAX_TOKENS_BY_KIND["review"] >= 2000
+    assert _MAX_TOKENS_BY_KIND["review"] > _MAX_TOKENS_BY_KIND["decision"]
+
+
 def test_runner_writes_context_bundle_at_run_init(tmp_path, monkeypatch):
     """`runner.fanout` writes context.json alongside prompt.txt — every
     fresh run has a bundle downstream stages can load.
@@ -2628,13 +3129,51 @@ def test_sources_validate_ref_rejects_shell_metachars():
     from consult.sources import _validate_ref
 
     # Valid refs
-    for good in ("main", "refs/heads/feature/x", "v1.0.0", "abc123", "feat+x"):
+    for good in ("main", "refs/heads/feature/x", "v1.0.0", "abc123", "feat+x", "HEAD~1", "HEAD^"):
         _validate_ref(good, field="base")
 
-    # Invalid refs — anything outside [A-Za-z0-9._/+-] is rejected
+    # Invalid refs — anything outside [A-Za-z0-9._/+~^-] is rejected
     for bad in ("main; rm -rf /", "main$(id)", "main`whoami`", "main|cat", "main\nfoo"):
         with pytest.raises(ValueError, match="invalid base"):
             _validate_ref(bad, field="base")
+
+
+def test_sources_validate_ref_rejects_leading_dash_git_option_injection():
+    """SECURITY: a ref must not start with `-`, otherwise it would be
+    interpreted as a git option (`base="--no-index"` becomes
+    `git diff --no-index..HEAD`)."""
+    from consult.sources import _validate_ref
+
+    for bad in ("-rf", "--no-index", "-h", "--exec=evil"):
+        with pytest.raises(ValueError, match="invalid base"):
+            _validate_ref(bad, field="base")
+
+
+def test_sources_resolve_git_diff_uses_double_dash_separator(monkeypatch, tmp_path):
+    """`git diff` is invoked with a trailing `--` so a future regex
+    relaxation can't smuggle an option through. Belt and braces."""
+    import subprocess
+
+    from consult import sources
+
+    captured: dict[str, list[str]] = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return subprocess.CompletedProcess(
+            args=cmd, returncode=0, stdout="diff body", stderr=""
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setenv("CONSULT_TRUSTED_REPO_ROOTS", str(tmp_path))
+
+    sources.resolve_git_diff("main", "HEAD", repo_path=str(tmp_path))
+
+    assert "--" in captured["cmd"], captured["cmd"]
+    # `--` should be AFTER the diff range, not before
+    range_idx = next(i for i, a in enumerate(captured["cmd"]) if a == "main..HEAD")
+    dashdash_idx = captured["cmd"].index("--")
+    assert dashdash_idx > range_idx
 
 
 def test_sources_validate_repo_path_enforces_trusted_roots(tmp_path, monkeypatch):

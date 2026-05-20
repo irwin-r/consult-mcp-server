@@ -19,7 +19,7 @@ import litellm
 
 from . import artifacts, context, registry
 from .jsonparse import extract_json
-from .progress import CapsuleExtracted
+from .progress import CapsuleExtracted, PhaseStarted
 from .runner import ProgressCallback, _append_progress_log
 from .types import AnyCapsule, Capsule, ManifestEntry, ResearchCapsule, ReviewCapsule, RunHandle, Status
 
@@ -52,7 +52,17 @@ Rules:
 
 _CAPSULE_PROMPT_HEAD_REVIEW = """\
 You will be given one panellist's review of a code artefact (PR diff, file, or codebase).
-Extract a structured review capsule. Return EXACTLY a JSON object with these keys:
+Your job is to ENUMERATE every distinct finding the panellist raised — one Finding object per issue, suggestion, or praise item. Do not summarise, do not merge similar items, do not drop items because they "seem minor". Aim for completeness — if the panellist listed 12 issues, return 12 findings.
+
+Scan the body for any of:
+- Bulleted or numbered lists of issues
+- Markdown headers naming files, sections, or severities (e.g. "## Blockers", "### Bug:", "🔴 path.py:42")
+- Severity prefixes: "Blocker:", "Critical:", "Major:", "Minor:", "Nit:", "Praise:", "🔴", "🟡", "🟢"
+- Phrases naming specific code: "in file X", "function Y", "lines A-B", "the foo helper"
+- Recommendations: "should", "consider", "suggest", "would improve"
+- A final verdict line: SHIP / CHANGES_REQUESTED / DISCUSS
+
+Return EXACTLY a JSON object with these keys:
 
 {
   "kind": "review",
@@ -71,11 +81,13 @@ Extract a structured review capsule. Return EXACTLY a JSON object with these key
 }
 
 Rules:
-- findings: one per distinct issue the panellist raised. Praise items go in findings with severity="praise".
-- file: null if the finding is general, otherwise the path verbatim from the panellist
+- findings: 0 to 30 entries. One per distinct item — DO NOT collapse multiple findings into one. Praise items go in findings with severity="praise".
+- file: null if the finding is general, otherwise the path verbatim from the panellist (e.g. "consult/refine.py")
 - line_range: [start, end] when given; null otherwise. Use start=end for a single line.
-- summary and suggestion: ≤ 30 words each. Prefer concrete suggestions over vague hand-waving.
-- overall_verdict: the panellist's overall recommendation if stated; default "discuss".
+- severity: pick the closest match. If the panellist labels something "🔴" or "Critical" it's "blocker"; "🟡" or "Major" is "major"; "🟢" or "Minor"/"Nit" is "minor"/"nit"; positive remarks are "praise".
+- category: pick the most apt label. Default to "correctness" if unsure.
+- summary and suggestion: ≤ 30 words each. Prefer concrete suggestions over vague hand-waving. If the panellist did not propose a fix, leave suggestion empty.
+- overall_verdict: the panellist's overall recommendation if stated explicitly; default "discuss" if unstated.
 - confidence: parse from a "CONFIDENCE:" line in the body if present, else null
 - Output JSON only, no commentary, no markdown fences.
 
@@ -116,10 +128,15 @@ _RESPONSE_FORMAT_BY_KIND: dict[str, type] = {
     "research": ResearchCapsule,
 }
 
-_EMPTY_BY_KIND: dict[str, type] = {
-    "decision": Capsule,
-    "review": ReviewCapsule,
-    "research": ResearchCapsule,
+# Per-kind max-output budget. Review capsules can enumerate ~20-30 findings
+# at ~80-150 chars each, so 800 tokens (which `litellm` caps near 600 chars)
+# leaves the extractor producing `findings=[]` on detailed reviews. 4000
+# tokens covers a thorough panel review. Research capsules are more bounded
+# (claims/evidence are short lists) but still benefit from more headroom.
+_MAX_TOKENS_BY_KIND: dict[str, int] = {
+    "decision": 800,
+    "review": 4000,
+    "research": 2000,
 }
 
 _CAPSULE_PROMPT_RESPONSE_MARKER = "PANELLIST RESPONSE:\n"
@@ -202,7 +219,7 @@ async def _extract_one(
     kwargs: dict[str, Any] = {
         "model": extractor_id,
         "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": 800,
+        "max_tokens": _MAX_TOKENS_BY_KIND.get(kind, 800),
         "response_format": capsule_cls,
     }
     if "gemini" not in extractor_id.lower():
@@ -296,6 +313,18 @@ async def annotate(
 
     total = len(targets)
     done = 0
+
+    # PhaseStarted("capsules"): so the parent sees the capsule phase begin
+    # rather than only learning when the first extraction completes. The
+    # consult flow's progress wrapper shifts done/total into the overall
+    # bucket; callers that don't wrap get the per-phase counter.
+    phase_event = PhaseStarted(done=0, total=total, phase="capsules")
+    _append_progress_log(paths.root, phase_event)
+    if on_progress is not None:
+        try:
+            await on_progress(phase_event)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("capsule phase on_progress failed: %s", e)
 
     async def _run(body: str, slug: str) -> tuple[AnyCapsule, float | None, bool]:
         nonlocal done

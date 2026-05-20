@@ -71,7 +71,11 @@ def _build_input(
     original_prompt: str | None = None,
 ) -> str:
     usable = [m for m in manifest if m["status"] in (Status.OK.value, Status.TRUNCATED.value)]
-    header = rubric.format(n=len(usable))
+    # `str.replace` (not `str.format`) so a user-supplied rubric in
+    # ~/.consult/rubrics/ that contains literal `{` / `}` characters (a JSON
+    # example, a template marker for another tool) doesn't crash with
+    # `KeyError`. Only the `{n}` placeholder is meaningful here.
+    header = rubric.replace("{n}", str(len(usable)))
     blocks = []
     for entry in usable:
         slug = entry["slug"]
