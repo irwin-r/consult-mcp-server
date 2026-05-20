@@ -17,6 +17,7 @@ import litellm
 logger = logging.getLogger(__name__)
 
 from . import artifacts, registry
+from .runner import _build_messages
 from .types import Status
 
 _DEFAULT_RUBRIC = """\
@@ -94,6 +95,7 @@ async def synthesise(
     litellm_id = entry["litellm_id"]
     budget = max(entry.get("default_budget_tokens", 16000), 16000)
     timeout = entry.get("default_timeout_s", 300)
+    provider = entry.get("provider", "")
 
     # Containment: a synthesiser failure must not tear down the parent request
     # (consult / refine). Persist a clear sentinel to synthesis.md so the run
@@ -102,7 +104,7 @@ async def synthesise(
         resp = await asyncio.wait_for(
             litellm.acompletion(
                 model=litellm_id,
-                messages=[{"role": "user", "content": synth_input}],
+                messages=_build_messages(synth_input, provider),
                 max_tokens=budget,
             ),
             timeout=timeout,

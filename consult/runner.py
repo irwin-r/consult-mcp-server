@@ -37,6 +37,21 @@ def _build_per_slug_prompt(base_prompt: str, stance_prompt: str) -> str:
     return f"{head}{base_prompt}\n\n{_FOOTER}"
 
 
+def _build_messages(prompt: str, provider: str) -> list[dict[str, Any]]:
+    # Anthropic-only: mark the user prompt as a cache breakpoint. Repeat
+    # panellists in the same fanout share the bulk of their prefix (base
+    # prompt + footer; stance varies). Without cache_control LiteLLM
+    # serialises a plain string and no caching is requested.
+    if provider == "anthropic":
+        return [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt, "cache_control": {"type": "ephemeral"}}
+            ],
+        }]
+    return [{"role": "user", "content": prompt}]
+
+
 def _make_slug(spec: ModelSpec, idx: int, blinded: bool) -> str:
     if blinded:
         # alpha, beta, gamma, delta, epsilon, zeta, eta, theta, iota, kappa, lambda, mu
@@ -72,6 +87,7 @@ async def _call_one(
     litellm_id = entry["litellm_id"]
     budget = entry.get("default_budget_tokens", 8000)
     timeout = entry.get("default_timeout_s", 180)
+    provider = entry.get("provider", "")
 
     extra: dict[str, Any] = {}
     if "reasoning_effort" in entry:
@@ -92,7 +108,7 @@ async def _call_one(
         resp = await asyncio.wait_for(
             litellm.acompletion(
                 model=litellm_id,
-                messages=[{"role": "user", "content": per_slug_prompt}],
+                messages=_build_messages(per_slug_prompt, provider),
                 max_tokens=budget,
                 **extra,
             ),
