@@ -121,3 +121,29 @@ caller can now see exactly why refine stopped early.
 
 **Counter: 2 consecutive passes with no panel-claimed bugs.** Switching to
 deferred-from-v1 feature work next pass.
+
+## 2026-05-20 — pass #14 (live sequence test post-features)
+
+After all deferred-v1 features landed, ran the `sequence` tool live (code
+tier, 3 steps) to validate pass #10's work end-to-end. Found a real bug —
+caught by dogfooding, not by the integration tests.
+
+- [bug] **Sequence stopped at step 1 because of partial pricing**. sequence.py
+  inherited refine's `if not est_known and i > 1: break` check, which made
+  step 2+ refuse whenever any panellist had unmapped LiteLLM pricing (almost
+  every openrouter model). The reasoning was wrong for sequence's semantics:
+  unlike refine (where an arbiter could extend rounds unboundedly), sequence
+  iterates a fixed user-supplied step list. The cumulative-cost check at the
+  top of every step + the `max_run_usd = cap - cumulative_cost` passed into
+  each `runner.fanout` already provided the cap guarantee. The extra
+  est_known check just refused legitimate work — refine's protection,
+  miscopied. RESOLVED: dropped the est_known short-circuit from sequence.py;
+  partial pricing now just propagates `cost_known=False` to the result. New
+  test `test_sequence_continues_through_partial_pricing` locks the fixed
+  behaviour: 3-step sequence with `est_known=False` from every step now
+  completes all three.
+- [meta] **The dogfood loop continues to pay**. Pass #10 wrote sequence with
+  integration tests that mocked everything; pass #14 was the first live
+  panel test and immediately surfaced the inherited-too-much-of-refine bug.
+  Worth keeping a live-smoke pass routinely after copying logic between
+  similar modules.

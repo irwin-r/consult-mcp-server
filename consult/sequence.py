@@ -126,12 +126,15 @@ async def sequence(
                 f"${estimate:.2f}, cap ${cap:.2f}"
             )
             break
-        if not est_known and i > 1:
-            partial_reason = (
-                f"refusing further steps: per-model pricing unknown at step {i}, "
-                f"can't validate cap (${cumulative_cost:.2f} spent / ${cap:.2f} cap)"
-            )
-            break
+        # Unlike refine — where a runaway arbiter could keep extending rounds —
+        # sequence has a fixed, user-supplied step list. Partial-pricing is
+        # already handled by the cumulative-cost check above + the per-step
+        # `max_run_usd=cap-cumulative_cost` passed into fanout. Refusing on
+        # est_known=False (as refine does) was over-conservative — the user
+        # asked for N specific steps, surfacing cost_known=False at the end
+        # is enough signal.
+        if not est_known:
+            cost_all_known = False
 
         handle = await runner.fanout(
             full_prompt,

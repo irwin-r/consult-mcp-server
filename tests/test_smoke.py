@@ -505,6 +505,66 @@ async def test_sequence_chains_synthesis_across_steps(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_sequence_continues_through_partial_pricing(tmp_path, monkeypatch):
+    """Unlike refine (where an arbiter can extend rounds indefinitely),
+    sequence has a fixed user-supplied step list — partial pricing must
+    NOT abort step 2+, since the cumulative-cost check + per-step
+    `max_run_usd=cap-cumulative_cost` already provide the cap guarantee.
+    Regression guard: pass #14 found that copying refine's est_known
+    refusal into sequence made multi-step runs stop at step 1 whenever
+    any panellist had unmapped pricing (which is most of them on
+    openrouter).
+    """
+    from consult import capsule as capsule_mod
+    from consult import runner as runner_mod
+    from consult import sequence as sequence_mod
+    from consult import synth as synth_mod
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    # Return est_known=False to simulate the openrouter unknown-pricing case.
+    monkeypatch.setattr(
+        runner_mod, "estimate_cost", lambda specs, prompt: (0.0, False)
+    )
+
+    async def fake_fanout(prompt, specs, **kwargs):
+        paths = artifacts.create_run()
+        return RunHandle(
+            run_id=paths.run_id,
+            artifacts_dir=str(paths.root),
+            manifest=[
+                ManifestEntry(
+                    slug="alpha", model_id="x/y", status=Status.OK,
+                    finish_reason="stop",
+                    resource_uri=paths.resource_uri("alpha"),
+                    body_path=str(paths.response_text("alpha")),
+                    latency_ms=1, cost_usd=0.01, cost_known=False,
+                )
+            ],
+            cost_usd=0.01, cost_known=False, wall_ms=1, partial=False,
+        )
+
+    async def fake_annotate(handle, **kwargs):
+        return handle
+
+    async def fake_synth(run_id, **kwargs):
+        return "X"
+
+    monkeypatch.setattr(runner_mod, "fanout", fake_fanout)
+    monkeypatch.setattr(capsule_mod, "annotate", fake_annotate)
+    monkeypatch.setattr(synth_mod, "synthesise", fake_synth)
+
+    result = await sequence_mod.sequence(
+        ["q1", "q2", "q3"],
+        [ModelSpec(model="claude-haiku")],
+    )
+    # All three steps must complete despite est_known=False.
+    assert len(result.steps) == 3
+    assert result.partial is False
+    # cost_known must propagate as False so the caller still knows.
+    assert result.cost_known is False
+
+
+@pytest.mark.asyncio
 async def test_sequence_rejects_empty_inputs():
     """Empty prompts list or empty specs list is a usage error."""
     from consult import sequence as sequence_mod
