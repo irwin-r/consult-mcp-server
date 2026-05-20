@@ -83,7 +83,30 @@ async def _call_one(
     per_slug_prompt: str,
     paths: artifacts.RunPaths,
 ) -> ManifestEntry:
-    entry = registry.resolve_model(spec.model)
+    # An unknown alias must fail this single panellist, not the whole panel.
+    # `asyncio.gather` without return_exceptions=True would otherwise cancel
+    # every sibling call when the KeyError propagates out.
+    try:
+        entry = registry.resolve_model(spec.model)
+    except KeyError as e:
+        paths.response_text(slug).write_text("")
+        return ManifestEntry(
+            slug=slug,
+            model_id=None,
+            persona=spec.stance if spec.stance else None,
+            status=Status.ERROR,
+            finish_reason=None,
+            resource_uri=paths.resource_uri(slug),
+            body_path=str(paths.response_text(slug)),
+            latency_ms=0,
+            tokens_in=None,
+            tokens_out=None,
+            cost_usd=None,
+            cost_known=True,
+            error=str(e),
+            confidence=None,
+            capsule=None,
+        )
     litellm_id = entry["litellm_id"]
     budget = entry.get("default_budget_tokens", 8000)
     timeout = entry.get("default_timeout_s", 180)
@@ -182,13 +205,18 @@ def estimate_cost(specs: list[ModelSpec], prompt: str) -> tuple[float, bool]:
     costs conservatively (a panel with even one unknown-cost spec cannot be
     validated against `max_run_usd`).
 
-    Unknown-alias errors are re-raised (they're a configuration bug, not a
-    pricing gap).
+    Unknown-alias specs are treated as cost-unknown (rather than raising) so
+    a single typo can't abort the panel here; `_call_one` surfaces the alias
+    as a per-spec Status.ERROR.
     """
     total = 0.0
     all_known = True
     for spec in specs:
-        entry = registry.resolve_model(spec.model)  # may raise KeyError — bubble up
+        try:
+            entry = registry.resolve_model(spec.model)
+        except KeyError:
+            all_known = False
+            continue
         litellm_id = entry["litellm_id"]
         try:
             tin = litellm.token_counter(model=litellm_id, text=prompt)

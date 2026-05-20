@@ -166,6 +166,34 @@ async def test_fanout_dry_run_returns_partial():
 
 
 @pytest.mark.asyncio
+async def test_call_one_unknown_alias_returns_error_entry(tmp_path, monkeypatch):
+    """An unknown alias must surface as a per-spec Status.ERROR rather than
+    crashing the panel. Regression guard: KeyError out of `resolve_model`
+    previously propagated through `asyncio.gather` and aborted every sibling.
+    """
+    from consult.runner import _call_one
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    paths = artifacts.create_run()
+    spec = ModelSpec(model="definitely-not-a-real-alias")
+    entry = await _call_one(spec, "bogus-0", "prompt", paths)
+    assert entry.status is Status.ERROR
+    assert entry.error and "definitely-not-a-real-alias" in entry.error
+    assert entry.model_id is None
+    assert entry.cost_known is True  # no call was billable
+
+
+def test_estimate_cost_skips_unknown_alias_without_raising():
+    """Unknown aliases mark cost_known=False but must not raise — `fanout`
+    relies on this so a typo doesn't abort the run before any panel work.
+    """
+    specs = [ModelSpec(model="claude-haiku"), ModelSpec(model="bogus-xyz")]
+    total, all_known = estimate_cost(specs, "hello")
+    assert total >= 0.0
+    assert all_known is False
+
+
+@pytest.mark.asyncio
 async def test_fanout_cost_cap_returns_partial(monkeypatch):
     """Setting max_run_usd to 0 must abort before any model call."""
     from consult import runner
