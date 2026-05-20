@@ -251,10 +251,12 @@ async def test_fanout_dry_run_returns_partial():
 
 @pytest.mark.asyncio
 async def test_fanout_emits_progress_callbacks(tmp_path, monkeypatch):
-    """fanout must call on_progress once per panellist with monotonically
-    increasing `done`. The "A" half of the A + D progress design.
+    """fanout must call on_progress once per panellist with a typed
+    `PanellistCompleted` event carrying monotonically increasing `done`.
+    The "A" half of the A + D progress design.
     """
     from consult import runner
+    from consult.progress import PanellistCompleted, ProgressEvent
     from consult.runner import fanout
 
     monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
@@ -276,10 +278,10 @@ async def test_fanout_emits_progress_callbacks(tmp_path, monkeypatch):
 
     monkeypatch.setattr(runner, "_call_one", fake_call)
 
-    progress: list[tuple[int, int, str]] = []
+    events: list[ProgressEvent] = []
 
-    async def on_progress(done: int, total: int, msg: str) -> None:
-        progress.append((done, total, msg))
+    async def on_progress(event: ProgressEvent) -> None:
+        events.append(event)
 
     specs = [
         ModelSpec(model="claude-haiku"),
@@ -289,31 +291,87 @@ async def test_fanout_emits_progress_callbacks(tmp_path, monkeypatch):
     handle = await fanout("p", specs, on_progress=on_progress)
     assert handle.partial is False
 
-    # 3 panellists ⇒ 3 progress ticks, each with total=3, done counter
-    # 1→2→3 (order may interleave with gather, so check set semantics).
-    assert len(progress) == 3
-    assert {p[0] for p in progress} == {1, 2, 3}
-    assert all(p[1] == 3 for p in progress)
+    # 3 panellists ⇒ 3 PanellistCompleted events; each has total=3,
+    # done ∈ {1, 2, 3} (gather order is non-deterministic).
+    assert len(events) == 3
+    assert all(isinstance(e, PanellistCompleted) for e in events)
+    assert {e.done for e in events} == {1, 2, 3}
+    assert all(e.total == 3 for e in events)
+    assert all(e.status == "OK" for e in events)
 
 
 def test_append_progress_log_writes_jsonl(tmp_path):
-    """The "D" half: a tailable JSONL log in the run dir, written by both
-    fanout and capsule.annotate so a client tailing the file gets a unified
-    timeline even when MCP notifications/progress isn't subscribed.
+    """The "D" half: a tailable JSONL log in the run dir. Each line is one
+    event.model_dump() with a `ts` prepended so programmatic consumers can
+    parse by `kind` without scraping free-text.
     """
+    from consult.progress import CapsuleExtracted, PanellistCompleted
     from consult.runner import _append_progress_log
 
-    _append_progress_log(tmp_path, {"kind": "panellist", "slug": "haiku", "status": "OK"})
-    _append_progress_log(tmp_path, {"kind": "capsule", "slug": "haiku"})
+    _append_progress_log(tmp_path, PanellistCompleted(
+        done=1, total=2, slug="haiku", status="OK", latency_ms=42,
+    ))
+    _append_progress_log(tmp_path, CapsuleExtracted(done=1, total=2, slug="haiku"))
 
     lines = (tmp_path / "_progress.log").read_text().splitlines()
     assert len(lines) == 2
     parsed = [json.loads(line) for line in lines]
-    assert parsed[0]["kind"] == "panellist"
+    assert parsed[0]["kind"] == "panellist_completed"
     assert parsed[0]["slug"] == "haiku"
     assert parsed[0]["status"] == "OK"
+    assert parsed[0]["latency_ms"] == 42
     assert "ts" in parsed[0]
-    assert parsed[1]["kind"] == "capsule"
+    assert parsed[1]["kind"] == "capsule_extracted"
+    assert parsed[1]["slug"] == "haiku"
+
+
+def test_progress_event_message_for_every_kind():
+    """Wire-format message must cover every event kind. New events must
+    extend `event_message` — this test fails fast if a kind is added
+    without updating the helper.
+    """
+    from consult.progress import (
+        ArbiterScored,
+        CapsuleExtracted,
+        PanellistCompleted,
+        SequenceStepCompleted,
+        SequenceStepStarted,
+        SynthCompleted,
+        SynthStarted,
+        event_message,
+    )
+
+    assert "OK" in event_message(PanellistCompleted(
+        done=1, total=2, slug="x", status="OK", latency_ms=1,
+    ))
+    assert "capsule" in event_message(CapsuleExtracted(done=1, total=2, slug="x"))
+    assert "r2 arbiter" in event_message(ArbiterScored(
+        done=1, total=2, round=2, score=0.5,
+    ))
+    assert event_message(SynthStarted(done=1, total=2)) == "synthesising"
+    assert event_message(SynthCompleted(done=2, total=2)) == "synthesis complete"
+    assert "step 3" in event_message(SequenceStepStarted(done=1, total=5, step=3))
+    assert "step 3" in event_message(SequenceStepCompleted(done=2, total=5, step=3))
+
+
+def test_progress_event_round_trips_through_json():
+    """JSONL log line → dict → discriminated-union dispatch. Pydantic's
+    `discriminator='kind'` on `ProgressEvent` enables programmatic consumers
+    to parse one line and get a typed object back.
+    """
+    from pydantic import TypeAdapter
+
+    from consult.progress import CapsuleExtracted, PanellistCompleted, ProgressEvent
+
+    adapter = TypeAdapter(ProgressEvent)
+    p = PanellistCompleted(done=1, total=2, slug="x", status="OK", latency_ms=10)
+    parsed = adapter.validate_json(p.model_dump_json())
+    assert isinstance(parsed, PanellistCompleted)
+    assert parsed.slug == "x"
+
+    c = CapsuleExtracted(done=1, total=2, slug="x")
+    parsed = adapter.validate_json(c.model_dump_json())
+    assert isinstance(parsed, CapsuleExtracted)
 
 
 @pytest.mark.asyncio
@@ -343,7 +401,7 @@ async def test_fanout_progress_callback_failure_does_not_abort_run(tmp_path, mon
 
     monkeypatch.setattr(runner, "_call_one", fake_call)
 
-    async def bad_progress(done, total, msg):
+    async def bad_progress(event):
         raise RuntimeError("client went away")
 
     handle = await fanout(

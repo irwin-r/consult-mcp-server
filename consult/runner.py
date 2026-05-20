@@ -17,28 +17,31 @@ from typing import Any
 import litellm
 
 from . import artifacts, registry
+from .progress import PanellistCompleted, ProgressEvent
 from .status import classify
 from .types import ManifestEntry, ModelSpec, RunHandle, Status
 
 logger = logging.getLogger(__name__)
 
-# Async progress callback signature: (completed, total, message). Wrapped at
-# each call site in a try/except so a notification failure never aborts the
-# real work (best-effort observability, not a hard contract).
-ProgressCallback = Callable[[int, int, str], Awaitable[None]]
+# Async progress callback. Receives a typed `ProgressEvent`; the server-side
+# adapter (server._progress_callback) converts to the MCP wire shape. Wrapped
+# at each call site in a try/except so a notification failure never aborts
+# the real work (best-effort observability, not a hard contract).
+ProgressCallback = Callable[[ProgressEvent], Awaitable[None]]
 
 
-def _append_progress_log(run_root: Path, entry: dict[str, Any]) -> None:
+def _append_progress_log(run_root: Path, event: ProgressEvent) -> None:
     """Append a JSONL line to `<run>/_progress.log` for client-less tailing.
 
     Always on — gives mid-run observability via `tail -f` even when the MCP
-    client didn't ask for `notifications/progress`. A write error here is
-    logged at debug and swallowed; the progress log is best-effort.
+    client didn't ask for `notifications/progress`. Each line is the event's
+    `model_dump()` with a `ts` field prepended; a write error here is logged
+    at debug and swallowed.
     """
-    entry = {"ts": datetime.now(UTC).isoformat(), **entry}
+    payload: dict[str, Any] = {"ts": datetime.now(UTC).isoformat(), **event.model_dump()}
     try:
         with (run_root / "_progress.log").open("a") as fh:
-            fh.write(json.dumps(entry) + "\n")
+            fh.write(json.dumps(payload) + "\n")
     except OSError as e:  # pragma: no cover — log-write failure is benign
         logger.debug("progress log write failed: %s", e)
 
@@ -248,18 +251,20 @@ async def _call_one(
     # manifest. Use info-level so production stays quiet by default.
     logger.info("panellist %s: %s in %dms", slug, status.value, latency_ms)
 
-    # Per-run progress log (kind=panellist) — always on, tailable as
-    # JSONL even if the MCP client didn't subscribe to notifications/progress.
-    # See pass #2's panel synthesis: "A + D" — progress notifications PLUS
-    # a local log file as the fallback when the in-band path fails.
+    # Per-run progress log — always on, tailable as JSONL even if the MCP
+    # client didn't subscribe to notifications/progress. The typed event
+    # makes programmatic consumers easy; (done, total) here are placeholders
+    # since `_call_one` doesn't know the panel size — the wrapper in `fanout`
+    # constructs the real progress event for the callback path.
     _append_progress_log(
         paths.root,
-        {
-            "kind": "panellist",
-            "slug": slug,
-            "status": status.value,
-            "latency_ms": latency_ms,
-        },
+        PanellistCompleted(
+            done=0,
+            total=0,
+            slug=slug,
+            status=status.value,
+            latency_ms=latency_ms,
+        ),
     )
 
     persona_label = spec.stance if spec.stance else None
@@ -408,7 +413,13 @@ async def fanout(
         done += 1
         if on_progress is not None:
             try:
-                await on_progress(done, total, f"{slug}: {entry.status.value}")
+                await on_progress(PanellistCompleted(
+                    done=done,
+                    total=total,
+                    slug=slug,
+                    status=entry.status.value,
+                    latency_ms=entry.latency_ms,
+                ))
             except Exception as e:  # noqa: BLE001 — notification is best-effort
                 logger.debug("on_progress callback failed: %s", e)
         return entry

@@ -22,6 +22,7 @@ from typing import Any
 import litellm
 
 from . import artifacts, capsule, registry, runner, synth
+from . import progress as progress_mod
 from .types import (
     ArbiterVerdict,
     ManifestEntry,
@@ -336,21 +337,25 @@ async def refine(
     progress_total = max_rounds * (panel_n * 2 + 1) + 1  # rounds × (fanout+capsule+arbiter) + synth
     progress_done = 0
 
-    async def notify(msg: str) -> None:
+    async def emit(event: progress_mod.ProgressEvent) -> None:
         if on_progress is not None:
             try:
-                await on_progress(progress_done, progress_total, msg)
+                await on_progress(event)
             except Exception as e:  # noqa: BLE001
                 logger.debug("refine on_progress failed: %s", e)
 
-    def make_phase_cb(base: int, label: str) -> runner.ProgressCallback | None:
+    def make_phase_cb(base: int) -> runner.ProgressCallback | None:
+        """Wrap a child event by shifting its `done`/`total` into the outer
+        refine-wide bucket. Event identity (kind + payload) is preserved.
+        """
         if on_progress is None:
             return None
 
-        async def cb(done: int, _local_total: int, msg: str) -> None:
+        async def cb(event: progress_mod.ProgressEvent) -> None:
             nonlocal progress_done
-            progress_done = base + done
-            await notify(f"{label}: {msg}")
+            progress_done = base + event.done
+            shifted = event.model_copy(update={"done": progress_done, "total": progress_total})
+            await emit(shifted)
 
         return cb
 
@@ -380,22 +385,23 @@ async def refine(
             round_specs,
             blinded=blinded,
             existing_paths=paths,
-            on_progress=make_phase_cb(round_base, f"r{round_num} fanout"),
+            on_progress=make_phase_cb(round_base),
         )
         handle = await capsule.annotate(
             handle,
-            on_progress=make_phase_cb(round_base + panel_n, f"r{round_num} capsules"),
+            on_progress=make_phase_cb(round_base + panel_n),
         )
         final_manifest = handle.manifest
         cumulative_cost += handle.cost_usd
         if not handle.cost_known:
             cost_all_known = False
 
-        progress_done = round_base + panel_n * 2
-        await notify(f"r{round_num} arbiter")
         verdict = await _ask_arbiter(prompt, round_num, handle.manifest, arbiter_alias)
         progress_done = round_base + panel_n * 2 + 1
-        await notify(f"r{round_num} arbiter score={verdict.score:.2f}")
+        await emit(progress_mod.ArbiterScored(
+            done=progress_done, total=progress_total,
+            round=round_num, score=verdict.score,
+        ))
         verdicts.append(verdict)
         if verdict.cost_usd:
             cumulative_cost += verdict.cost_usd
@@ -421,10 +427,10 @@ async def refine(
     # Synthesise from the final round
     if final_manifest:
         progress_done = progress_total - 1
-        await notify("synthesising")
+        await emit(progress_mod.SynthStarted(done=progress_done, total=progress_total))
         text = await synth.synthesise(paths.run_id, by_model=synth_alias)
         progress_done = progress_total
-        await notify("synthesis complete")
+        await emit(progress_mod.SynthCompleted(done=progress_done, total=progress_total))
     else:
         text = "(no rounds completed — see partial_reason)"
 

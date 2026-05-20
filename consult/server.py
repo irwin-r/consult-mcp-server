@@ -27,6 +27,7 @@ from mcp.types import (
 from . import (
     artifacts,
     capsule,
+    progress,
     registry,
     runner,
     synth,
@@ -313,12 +314,16 @@ def _text_result(payload: dict | str) -> list[TextContent]:
 
 
 def _progress_callback():
-    """Build a callback that forwards `(done, total, msg)` tuples as MCP
-    `notifications/progress`. Returns None if the client didn't send a
+    """Build a callback that converts a typed `ProgressEvent` into an MCP
+    `notifications/progress` send. Returns None if the client didn't send a
     `progressToken` (so nothing is sent at all — silent for non-subscribers).
 
-    The token is opaque to us; we echo whatever the client supplied. Any
-    notification failure (e.g. closed session) is caught upstream by the
+    The wire-format message string is derived from the event via
+    `progress.event_message()`; the event's `done` and `total` populate the
+    `progress` / `total` fields. The token is opaque to us; we echo what the
+    client supplied.
+
+    Any notification failure (e.g. closed session) is caught upstream by the
     per-callsite try/except so it never aborts the underlying tool call.
     """
     try:
@@ -330,12 +335,12 @@ def _progress_callback():
         return None
     session = ctx.session
 
-    async def notify(done: int, total: int, message: str) -> None:
+    async def notify(event: progress.ProgressEvent) -> None:
         await session.send_progress_notification(
             progress_token=token,
-            progress=float(done),
-            total=float(total),
-            message=message,
+            progress=float(event.done),
+            total=float(event.total),
+            message=progress.event_message(event),
         )
 
     return notify
@@ -399,17 +404,22 @@ async def _handle_consult(args: dict[str, Any]) -> list[TextContent]:
 
     # consult has three phases (fanout → capsules → synth). MCP progress
     # is monotonic, so wrap each phase callback with an offset into a
-    # single growing total.
+    # single growing total. Events keep their identity (PanellistCompleted,
+    # CapsuleExtracted) — only `done`/`total` get shifted into the outer
+    # consult-wide bucket.
     base = _progress_callback()
     overall_total = len(specs) * 2 + 1  # fanout + capsules + synth
     offset = 0
 
-    def phase(label: str):
+    def phase():
         if base is None:
             return None
 
-        async def cb(done: int, _local_total: int, msg: str) -> None:
-            await base(offset + done, overall_total, f"{label}: {msg}")
+        async def cb(event: progress.ProgressEvent) -> None:
+            shifted = event.model_copy(
+                update={"done": offset + event.done, "total": overall_total},
+            )
+            await base(shifted)
 
         return cb
 
@@ -418,22 +428,22 @@ async def _handle_consult(args: dict[str, Any]) -> list[TextContent]:
         specs,
         blinded=args.get("blinded", False),
         max_run_usd=args.get("max_run_usd"),
-        on_progress=phase("fanout"),
+        on_progress=phase(),
     )
     if handle.partial or not handle.manifest:
         return _text_result(
             {"partial": True, "reason": handle.partial_reason, "manifest": []}
         )
     offset = len(specs)
-    handle = await capsule.annotate(handle, on_progress=phase("capsules"))
+    handle = await capsule.annotate(handle, on_progress=phase())
     offset = len(specs) * 2
     if base is not None:
-        await base(offset, overall_total, "synthesising")
+        await base(progress.SynthStarted(done=offset, total=overall_total))
     synthesis = await synth.synthesise(
         handle.run_id, by_model=synth_alias, anonymised=args.get("blinded", False)
     )
     if base is not None:
-        await base(overall_total, overall_total, "synthesis complete")
+        await base(progress.SynthCompleted(done=overall_total, total=overall_total))
     result = RunResult(
         run_id=handle.run_id,
         synthesis=synthesis,

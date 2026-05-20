@@ -19,6 +19,7 @@ from typing import Any
 import litellm
 
 from . import artifacts, registry
+from .progress import CapsuleExtracted
 from .runner import ProgressCallback, _append_progress_log
 from .types import Capsule, ManifestEntry, RunHandle, Status
 
@@ -186,10 +187,11 @@ async def annotate(
         nonlocal done
         result = await _extract_one(body, ext_id, timeout)
         done += 1
-        _append_progress_log(paths.root, {"kind": "capsule", "slug": slug})
+        event = CapsuleExtracted(done=done, total=total, slug=slug)
+        _append_progress_log(paths.root, event)
         if on_progress is not None:
             try:
-                await on_progress(done, total, f"capsule {slug}")
+                await on_progress(event)
             except Exception as e:  # noqa: BLE001 — best-effort
                 logger.debug("capsule on_progress failed: %s", e)
         return result

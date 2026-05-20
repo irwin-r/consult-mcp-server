@@ -18,6 +18,7 @@ import time
 from pydantic import BaseModel, Field, model_validator
 
 from . import capsule, registry, runner, synth
+from . import progress as progress_mod
 from .types import ModelSpec
 
 logger = logging.getLogger(__name__)
@@ -97,21 +98,25 @@ async def sequence(
     progress_total = total * (panel_n * 2 + 1)
     progress_done = 0
 
-    async def notify(msg: str) -> None:
+    async def emit(event: progress_mod.ProgressEvent) -> None:
         if on_progress is not None:
             try:
-                await on_progress(progress_done, progress_total, msg)
+                await on_progress(event)
             except Exception as e:  # noqa: BLE001
                 logger.debug("sequence on_progress failed: %s", e)
 
-    def phase_cb(base: int, label: str) -> runner.ProgressCallback | None:
+    def phase_cb(base: int) -> runner.ProgressCallback | None:
+        """Shift a child event's `done`/`total` into the sequence-wide bucket
+        while preserving its identity (PanellistCompleted, CapsuleExtracted).
+        """
         if on_progress is None:
             return None
 
-        async def cb(done: int, _local_total: int, msg: str) -> None:
+        async def cb(event: progress_mod.ProgressEvent) -> None:
             nonlocal progress_done
-            progress_done = base + done
-            await notify(f"{label}: {msg}")
+            progress_done = base + event.done
+            shifted = event.model_copy(update={"done": progress_done, "total": progress_total})
+            await emit(shifted)
 
         return cb
 
@@ -136,12 +141,15 @@ async def sequence(
         if not est_known:
             cost_all_known = False
 
+        await emit(progress_mod.SequenceStepStarted(
+            done=step_base, total=progress_total, step=i,
+        ))
         handle = await runner.fanout(
             full_prompt,
             specs,
             blinded=blinded,
             max_run_usd=cap - cumulative_cost,
-            on_progress=phase_cb(step_base, f"step {i} fanout"),
+            on_progress=phase_cb(step_base),
         )
         if handle.partial or not handle.manifest:
             partial_reason = (
@@ -151,19 +159,21 @@ async def sequence(
 
         handle = await capsule.annotate(
             handle,
-            on_progress=phase_cb(step_base + panel_n, f"step {i} capsules"),
+            on_progress=phase_cb(step_base + panel_n),
         )
         cumulative_cost += handle.cost_usd
         if not handle.cost_known:
             cost_all_known = False
 
         progress_done = step_base + panel_n * 2
-        await notify(f"step {i} synthesising")
+        await emit(progress_mod.SynthStarted(done=progress_done, total=progress_total))
         step_synth = await synth.synthesise(
             handle.run_id, by_model=synth_alias, anonymised=blinded
         )
         progress_done = step_base + panel_n * 2 + 1
-        await notify(f"step {i} complete")
+        await emit(progress_mod.SequenceStepCompleted(
+            done=progress_done, total=progress_total, step=i,
+        ))
 
         steps.append(
             SequenceStep(
