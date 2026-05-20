@@ -16,13 +16,14 @@ Existing options each fall short:
 
 ## Surface
 
-Three tools, deliberately small:
+Four tools:
 
 | Tool | When |
 |---|---|
 | `panel(prompt, models, blinded?, ...)` → manifest | Parent wants to synthesise itself from rich capsules |
 | `synthesise(run_id, by_model?)` → markdown | Collapse a prior run via a flagship |
 | `consult(prompt, tier?, roles?)` → synthesis + manifest | "Just give me the answer" |
+| `refine(prompt, models, arbiter, threshold, max_rounds)` → result + verdicts | Iterate to consensus; arbiter scores sufficiency per round |
 
 Plus MCP resources at `consult://runs/<id>/responses/<slug>` for direct body access.
 
@@ -109,7 +110,7 @@ Lower-level — returns the manifest, you synthesise yourself.
 
 ## What's in scope for v1
 
-- 3 tools: `panel`, `synthesise`, `consult`
+- 4 tools: `panel`, `synthesise`, `consult`, `refine`
 - LiteLLM provider layer (no custom HTTP)
 - Rich manifest capsules
 - MCP Resources for bodies
@@ -119,10 +120,9 @@ Lower-level — returns the manifest, you synthesise yourself.
 - Parametric `usable()` viability check
 - Status enum: OK / TRUNCATED / MALFORMED / EMPTY / REFUSED / CONTENT_FILTERED / RATE_LIMITED / TIMEOUT / ERROR
 
-## Cut from v1 (defer to v1.1 / v2)
+## Cut from v1 (defer to v2)
 
 - `sequence` (chained models)
-- `refine` (consortium-style loop)
 - Auto-retry on token exhaustion (cost bomb — return TRUNCATED, let the parent decide)
 - Streaming progress notifications
 - Daily cost ledger
@@ -139,6 +139,7 @@ consult/
   runner.py        # asyncio.gather + LiteLLM fanout
   capsule.py       # post-fanout structured extraction
   synth.py         # flagship synthesiser pass
+  refine.py        # iterative arbiter-driven loop (max 3 rounds)
   registry.py      # models.json + stances.json loader
   artifacts.py     # ~/.consult/runs/<id>/ layout + resource URIs
   status.py        # LiteLLM response → Status

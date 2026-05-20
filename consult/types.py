@@ -114,3 +114,40 @@ class RunResult(BaseModel):
     cost_usd: float
     wall_ms: int
     partial: bool = False
+
+
+class ArbiterVerdict(BaseModel):
+    """The arbiter's per-round assessment of panel sufficiency.
+
+    `score` is a sufficiency rating (1.0 = strong consensus, ready to ship)
+    rather than absolute truth. `gaps` and `next_round_focus` feed the next
+    round's prompt.
+    """
+
+    round: int
+    score: float = Field(..., ge=0.0, le=1.0)
+    gaps: list[str] = Field(default_factory=list)
+    next_round_focus: str = ""
+    reasoning: str = ""
+    cost_usd: float | None = None
+
+
+class RefineResult(BaseModel):
+    """Returned by `refine`. Carries the final round's manifest, the arbiter
+    verdicts for every round, and the final synthesis.
+
+    Per-round transcripts live as MCP resources at
+    consult://runs/<id>/responses/<slug>.r<n>
+    """
+
+    run_id: str
+    rounds_completed: int
+    final_manifest: list[ManifestEntry]
+    verdicts: list[ArbiterVerdict]
+    synthesis: str
+    converged: bool = Field(..., description="True if score >= threshold")
+    threshold: float
+    cost_usd: float
+    wall_ms: int
+    partial: bool = False
+    partial_reason: str | None = None

@@ -166,11 +166,19 @@ async def fanout(
     blinded: bool = False,
     dry_run: bool = False,
     max_run_usd: float | None = None,
+    existing_paths: artifacts.RunPaths | None = None,
 ) -> RunHandle:
-    paths = artifacts.create_run()
-    paths.prompt_txt.write_text(prompt)
-    # Snapshot the registry so replays are stable
-    paths.registry_snapshot.write_text(json.dumps(registry.models_config(), indent=2))
+    """Parallel fan-out. Creates a fresh run by default. Pass `existing_paths`
+    to write into an existing run dir (used by `refine` to keep all rounds
+    under one run_id with round-suffixed slugs).
+    """
+    if existing_paths is None:
+        paths = artifacts.create_run()
+        paths.prompt_txt.write_text(prompt)
+        # Snapshot the registry so replays are stable
+        paths.registry_snapshot.write_text(json.dumps(registry.models_config(), indent=2))
+    else:
+        paths = existing_paths
 
     # Estimate cost up front; if dry_run, return immediately with empty manifest
     estimate = estimate_cost(specs, prompt)

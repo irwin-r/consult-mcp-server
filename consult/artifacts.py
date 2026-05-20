@@ -51,6 +51,10 @@ class RunPaths:
         return self.root / "capsules"
 
     @property
+    def arbiters(self) -> Path:
+        return self.root / "arbiters"
+
+    @property
     def manifest_json(self) -> Path:
         return self.root / "manifest.json"
 
@@ -77,6 +81,9 @@ class RunPaths:
     def resource_uri(self, slug: str) -> str:
         return f"consult://runs/{self.run_id}/responses/{slug}"
 
+    def arbiter_for(self, round_num: int) -> Path:
+        return self.arbiters / f"round-{round_num}.json"
+
 
 def create_run() -> RunPaths:
     rid = new_run_id()
@@ -86,6 +93,7 @@ def create_run() -> RunPaths:
     paths.prompts.mkdir()
     paths.responses.mkdir()
     paths.capsules.mkdir()
+    paths.arbiters.mkdir()
     return paths
 
 

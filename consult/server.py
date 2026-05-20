@@ -24,7 +24,7 @@ from mcp.types import (
     Tool,
 )
 
-from . import artifacts, capsule, registry, runner, synth
+from . import artifacts, capsule, refine as refine_mod, registry, runner, synth
 from .types import ModelSpec, RunResult
 
 logger = logging.getLogger("consult")
@@ -106,6 +106,52 @@ _SYNTH_SCHEMA = {
     },
 }
 
+_REFINE_SCHEMA = {
+    "type": "object",
+    "required": ["prompt", "models"],
+    "properties": {
+        "prompt": {"type": "string"},
+        "models": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+                "type": "object",
+                "required": ["model"],
+                "properties": {
+                    "model": {"type": "string"},
+                    "stance": {"type": "string"},
+                    "slug": {"type": "string"},
+                },
+            },
+        },
+        "arbiter": {
+            "type": "string",
+            "description": "Arbiter model alias. Defaults to the default synthesiser.",
+        },
+        "threshold": {
+            "type": "number",
+            "default": 0.85,
+            "minimum": 0.0,
+            "maximum": 1.0,
+            "description": "Sufficiency score (0..1) above which the loop stops early.",
+        },
+        "max_rounds": {
+            "type": "integer",
+            "default": 3,
+            "minimum": 1,
+            "maximum": 3,
+            "description": "Hard cap on rounds. Cannot exceed 3.",
+        },
+        "blinded": {"type": "boolean", "default": False},
+        "attachments": {"type": "array", "items": {"type": "string"}},
+        "max_run_usd": {"type": "number"},
+        "synthesiser": {
+            "type": "string",
+            "description": "Final synthesis model. Defaults to the arbiter.",
+        },
+    },
+}
+
 _CONSULT_SCHEMA = {
     "type": "object",
     "required": ["prompt"],
@@ -160,6 +206,15 @@ async def handle_list_tools() -> list[Tool]:
             ),
             inputSchema=_CONSULT_SCHEMA,
         ),
+        Tool(
+            name="refine",
+            description=(
+                "Consortium-style iterative consultation. Fans out, asks an arbiter "
+                "to score sufficiency, refines with another round if below threshold. "
+                "Hard cap at 3 rounds. Per-round transcripts available as MCP resources."
+            ),
+            inputSchema=_REFINE_SCHEMA,
+        ),
     ]
 
 
@@ -200,6 +255,8 @@ async def handle_call_tool(name: str, arguments: dict[str, Any]) -> list[TextCon
         return await _handle_synth(arguments)
     if name == "consult":
         return await _handle_consult(arguments)
+    if name == "refine":
+        return await _handle_refine(arguments)
     raise ValueError(f"Unknown tool: {name}")
 
 
@@ -260,6 +317,22 @@ async def _handle_consult(args: dict[str, Any]) -> list[TextContent]:
         cost_usd=handle.cost_usd,
         wall_ms=handle.wall_ms,
         partial=False,
+    )
+    return _text_result(result.model_dump())
+
+
+async def _handle_refine(args: dict[str, Any]) -> list[TextContent]:
+    prompt = _inline_attachments(args["prompt"], args.get("attachments"))
+    specs = _specs_from_args(args["models"])
+    result = await refine_mod.refine(
+        prompt,
+        specs,
+        arbiter=args.get("arbiter"),
+        threshold=args.get("threshold", 0.85),
+        max_rounds=args.get("max_rounds", 3),
+        blinded=args.get("blinded", False),
+        max_run_usd=args.get("max_run_usd"),
+        synthesiser=args.get("synthesiser"),
     )
     return _text_result(result.model_dump())
 

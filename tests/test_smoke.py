@@ -13,10 +13,10 @@ from pathlib import Path
 
 import pytest
 
-from consult import artifacts, registry
+from consult import artifacts, refine as refine_mod, registry
 from consult.runner import _build_per_slug_prompt, _make_slug, estimate_cost
 from consult.status import classify
-from consult.types import Capsule, ManifestEntry, ModelSpec, RunHandle, Status
+from consult.types import ArbiterVerdict, Capsule, ManifestEntry, ModelSpec, RunHandle, Status
 
 
 # ---- Pure-Python tests (no network) ----------------------------------------
@@ -100,6 +100,54 @@ def test_artifacts_create_and_uri():
     # cleanup
     import shutil
     shutil.rmtree(paths.root)
+
+
+# ---- Refine offline tests --------------------------------------------------
+
+
+def test_refine_suffix_specs_round_indexes_slugs():
+    specs = [ModelSpec(model="claude-haiku"), ModelSpec(model="grok", stance="contrarian")]
+    r2 = refine_mod._suffix_specs(specs, 2)
+    assert r2[0].slug.endswith(".r2")
+    assert r2[1].slug.endswith(".r2")
+    # Same model index should produce stable base slug
+    r2b = refine_mod._suffix_specs(specs, 2)
+    assert [s.slug for s in r2] == [s.slug for s in r2b]
+
+
+def test_refinement_prompt_includes_gaps_and_focus():
+    manifest = [
+        ManifestEntry(
+            slug="m-1.r1",
+            model_id="anthropic/x",
+            status=Status.OK,
+            resource_uri="consult://x",
+            body_path="/tmp/x",
+            capsule=Capsule(position="A says X", recommendation="do X"),
+        )
+    ]
+    verdict = ArbiterVerdict(
+        round=1, score=0.4, gaps=["cost not discussed"], next_round_focus="address cost"
+    )
+    out = refine_mod._build_refinement_prompt("Should we ship X?", 2, manifest, verdict)
+    assert "Should we ship X?" in out
+    assert "cost not discussed" in out
+    assert "address cost" in out
+    assert "m-1.r1" in out
+
+
+def test_refine_validates_max_rounds():
+    with pytest.raises(ValueError, match="max_rounds"):
+        asyncio.get_event_loop().run_until_complete(
+            refine_mod.refine("q", [ModelSpec(model="claude-haiku")], max_rounds=5)
+        )
+
+
+def test_arbiter_json_extractor_tolerates_fences():
+    fenced = '```json\n{"score": 0.7, "gaps": ["x"], "next_round_focus": "", "reasoning": ""}\n```'
+    data = refine_mod._extract_json(fenced)
+    assert data["score"] == 0.7
+    assert data["gaps"] == ["x"]
 
 
 # ---- Live tests (gated on API keys) ----------------------------------------
