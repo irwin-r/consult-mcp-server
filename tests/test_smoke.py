@@ -492,6 +492,119 @@ async def test_handle_call_tool_success_path_returns_dict(monkeypatch):
     assert isinstance(result, dict)
 
 
+# ---- MCP boundary tests ----------------------------------------------------
+# These exercise the @server.list_tools / @server.list_resources /
+# @server.read_resource handlers directly. Without them, a typo in tool name
+# or schema (or a broken URI grammar) silently breaks the MCP surface — the
+# unit tests on the underlying runner/refine/synth all pass, and the
+# offline test suite has nothing to fail on.
+
+
+@pytest.mark.asyncio
+async def test_handle_list_tools_advertises_full_surface():
+    """Pin the five-tool surface plus each tool's required input fields.
+    Catches schema drift (e.g. dropping `prompt` from `panel`'s required
+    list) that the type system can't see."""
+    from consult import server as server_mod
+
+    tools = await server_mod.handle_list_tools()
+    by_name = {t.name: t for t in tools}
+    assert set(by_name) == {"panel", "synthesise", "consult", "refine", "sequence"}
+    assert "prompt" in by_name["panel"].inputSchema["required"]
+    assert "models" in by_name["panel"].inputSchema["required"]
+    assert "prompt" in by_name["consult"].inputSchema["required"]
+    assert "prompt" in by_name["refine"].inputSchema["required"]
+    assert "prompts" in by_name["sequence"].inputSchema["required"]
+    assert "run_id" in by_name["synthesise"].inputSchema["required"]
+
+
+@pytest.mark.asyncio
+async def test_handle_list_resources_surfaces_run_bodies(tmp_path, monkeypatch):
+    """list_resources advertises each run's panellist bodies so MCP clients
+    can discover them without prior knowledge of the URI grammar."""
+    from consult import server as server_mod
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    for i in range(2):
+        run_dir = tmp_path / f"20260520-fake-{i}"
+        (run_dir / "responses").mkdir(parents=True)
+        for slug in ("alpha", "beta"):
+            (run_dir / "responses" / f"{slug}.txt").write_text("body")
+
+    resources = await server_mod.handle_list_resources()
+    uris = {str(r.uri) for r in resources}
+    assert len(uris) == 4
+    assert any(u.endswith("/responses/alpha") for u in uris)
+    assert any(u.endswith("/responses/beta") for u in uris)
+    assert all(r.mimeType == "text/plain" for r in resources)
+
+
+@pytest.mark.asyncio
+async def test_handle_list_resources_empty_dir_returns_empty(tmp_path, monkeypatch):
+    """No runs on disk → no resources advertised. Don't crash."""
+    from consult import server as server_mod
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    assert await server_mod.handle_list_resources() == []
+
+
+@pytest.mark.asyncio
+async def test_handle_read_resource_returns_body_text(tmp_path, monkeypatch):
+    """Happy path: read a body via its `consult://...` URI."""
+    from consult import server as server_mod
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    paths = artifacts.create_run()
+    paths.response_text("alpha").write_text("the body")
+
+    body = await server_mod.handle_read_resource(
+        f"consult://runs/{paths.run_id}/responses/alpha"
+    )
+    assert body == "the body"
+
+
+@pytest.mark.asyncio
+async def test_handle_read_resource_missing_body_raises(tmp_path, monkeypatch):
+    """Reading a slug whose body wasn't written must raise FileNotFoundError —
+    the top-level dispatcher then maps to a RUN_NOT_FOUND envelope rather
+    than returning a misleading empty body."""
+    from consult import server as server_mod
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    paths = artifacts.create_run()
+
+    with pytest.raises(FileNotFoundError):
+        await server_mod.handle_read_resource(
+            f"consult://runs/{paths.run_id}/responses/missing"
+        )
+
+
+@pytest.mark.asyncio
+async def test_handle_call_tool_dispatch_routes_each_tool_name(monkeypatch):
+    """The dispatch chain in handle_call_tool must route each tool name to
+    its corresponding _handle_*. A typo (e.g. `"Panel"` vs `"panel"`) here
+    silently breaks one tool with no compile-time signal."""
+    from consult import server as server_mod
+
+    routes = [
+        ("panel", "_handle_panel"),
+        ("consult", "_handle_consult"),
+        ("refine", "_handle_refine"),
+        ("sequence", "_handle_sequence"),
+        ("synthesise", "_handle_synth"),
+    ]
+    for tool_name, handler_name in routes:
+        called: list[str] = []
+
+        async def fake(args, _name=tool_name, _called=called):
+            _called.append(_name)
+            return {"routed": _name}
+
+        monkeypatch.setattr(server_mod, handler_name, fake)
+        await server_mod.handle_call_tool(tool_name, {})
+        assert called == [tool_name]
+
+
 def test_progress_event_round_trips_through_json():
     """JSONL log line → dict → discriminated-union dispatch. Pydantic's
     `discriminator='kind'` on `ProgressEvent` enables programmatic consumers
