@@ -4328,6 +4328,107 @@ async def test_refine_synth_call_passes_anonymised_when_blinded(tmp_path, monkey
     assert captured.get("anonymised") is True
 
 
+async def test_refine_passes_max_run_usd_to_nested_fanout(tmp_path, monkeypatch):
+    """A refine caller's `max_run_usd` must reach the per-round `runner.fanout`
+    call. Pre-fix the nested fanout fell back to `registry.default_max_run_usd()`
+    ($5) so a refine cap of $20 was silently downgraded.
+    """
+    from consult import capsule as capsule_mod
+    from consult import runner as runner_mod
+    from consult import synth as synth_mod
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    monkeypatch.setattr(runner_mod, "estimate_cost", lambda specs, prompt: (0.0, True))
+
+    seen_caps: list[float | None] = []
+
+    async def fake_fanout(prompt, specs, **kwargs):
+        seen_caps.append(kwargs.get("max_run_usd"))
+        paths = kwargs.get("existing_paths") or artifacts.create_run()
+        return RunHandle(
+            run_id=paths.run_id,
+            artifacts_dir=str(paths.root),
+            manifest=[
+                ManifestEntry(
+                    slug="x.r1", model_id="m/x", status=Status.OK,
+                    resource_uri=paths.resource_uri("x.r1"),
+                    body_path=str(paths.response_text("x.r1")),
+                    latency_ms=0, cost_usd=0.0, cost_known=True,
+                    confidence=None, capsule=None,
+                ),
+            ],
+            cost_usd=0.0, cost_known=True, wall_ms=0,
+        )
+
+    async def fake_annotate(handle, **kwargs):
+        return handle
+
+    async def fake_arbiter(*args, **kwargs):
+        return ArbiterVerdict(
+            round=1, score=1.0, gaps=[], reasoning="ok",
+            cost_usd=0.0, cost_known=True, parsed_ok=True,
+        )
+
+    async def fake_synth(*args, **kwargs):
+        return synth_mod.SynthResult(text="x")
+
+    monkeypatch.setattr(runner_mod, "fanout", fake_fanout)
+    monkeypatch.setattr(refine_mod.runner, "fanout", fake_fanout)
+    monkeypatch.setattr(capsule_mod, "annotate", fake_annotate)
+    monkeypatch.setattr(refine_mod.capsule, "annotate", fake_annotate)
+    monkeypatch.setattr(refine_mod, "_ask_arbiter", fake_arbiter)
+    monkeypatch.setattr(refine_mod.synth, "synthesise", fake_synth)
+
+    await refine_mod.refine(
+        "q", [ModelSpec(model="claude-haiku")],
+        threshold=0.5, max_rounds=1, max_run_usd=20.0,
+    )
+    assert seen_caps and seen_caps[0] == pytest.approx(20.0)
+
+
+async def test_refine_rejects_typo_synthesiser_before_fanout(tmp_path, monkeypatch):
+    """A typo in `synthesiser` must surface KeyError BEFORE any fanout
+    spend. Pre-fix the typo crashed only on the synth phase, after the
+    entire parallel panel had already been billed.
+    """
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    fanout_calls = {"n": 0}
+
+    async def fake_fanout(*args, **kwargs):
+        fanout_calls["n"] += 1
+        raise AssertionError("fanout must not be reached on typo")
+
+    monkeypatch.setattr(refine_mod.runner, "fanout", fake_fanout)
+    with pytest.raises(KeyError):
+        await refine_mod.refine(
+            "q", [ModelSpec(model="claude-haiku")],
+            arbiter="totally-not-a-real-alias",
+            threshold=0.5, max_rounds=1,
+        )
+    assert fanout_calls["n"] == 0
+
+
+async def test_consult_rejects_typo_synthesiser_before_fanout(tmp_path, monkeypatch):
+    from consult import handlers
+    from consult import runner as runner_mod
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    fanout_calls = {"n": 0}
+
+    async def fake_fanout(*args, **kwargs):
+        fanout_calls["n"] += 1
+        raise AssertionError("fanout must not be reached on typo")
+
+    monkeypatch.setattr(runner_mod, "fanout", fake_fanout)
+    monkeypatch.setattr(handlers.runner, "fanout", fake_fanout)
+    with pytest.raises(KeyError):
+        await handlers.consult({
+            "prompt": "p", "tier": "quick",
+            "synthesiser": "totally-not-a-real-alias",
+        })
+    assert fanout_calls["n"] == 0
+
+
 async def test_synth_defensive_extraction_on_unexpected_shape(tmp_path, monkeypatch):
     """A non-conformant provider response must surface the unavailable
     sentinel, not AttributeError/IndexError straight out of `synthesise`.

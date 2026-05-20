@@ -509,6 +509,14 @@ async def refine(
     specs = runner.expand_specs(specs)
     arbiter_alias = arbiter or registry.default_synthesiser()
     synth_alias = synthesiser or arbiter_alias
+    # Fail fast on a typo'd arbiter/synthesiser alias BEFORE we spend on
+    # fanout + capsule extraction. Without this the run burns through the
+    # parallel panel and only crashes when the round-1 arbiter call
+    # reaches `registry.resolve_model`. KeyError surfaces as
+    # ErrorCode.UNKNOWN_MODEL at the MCP boundary.
+    registry.resolve_model(arbiter_alias)
+    if synth_alias != arbiter_alias:
+        registry.resolve_model(synth_alias)
 
     paths = artifacts.create_run()
     paths.prompt_txt.write_text(prompt)
@@ -610,10 +618,15 @@ async def refine(
 
         round_base = (round_num - 1) * (panel_n * 2 + 1)
         round_specs = _suffix_specs(specs, round_num)
+        # Pass the remaining budget so fanout's internal cap matches the
+        # refine cap — without this the nested call falls back to
+        # `registry.default_max_run_usd()` and a caller's higher refine
+        # cap (e.g. $20) is silently downgraded to the default ($5).
         handle = await runner.fanout(
             round_prompt,
             round_specs,
             blinded=blinded,
+            max_run_usd=cap - cumulative_cost,
             existing_paths=paths,
             on_progress=make_phase_cb(round_base),
             prior_turns=prior_turns,

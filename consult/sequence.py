@@ -101,6 +101,10 @@ async def sequence(
     specs = runner.expand_specs(specs)
 
     synth_alias = synthesiser or registry.default_synthesiser()
+    # Fail fast on a typo'd synthesiser alias BEFORE the first step's
+    # fanout spends money. KeyError surfaces as UNKNOWN_MODEL at the MCP
+    # boundary; an inline-burned panel would be wasted spend.
+    registry.resolve_model(synth_alias)
     cap = max_run_usd if max_run_usd is not None else registry.default_max_run_usd()
 
     start = time.time()

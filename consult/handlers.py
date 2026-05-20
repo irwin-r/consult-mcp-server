@@ -141,6 +141,10 @@ async def consult(args: dict[str, Any]) -> dict[str, Any]:
     tier_models = registry.resolve_tier(tier)
     roles = args.get("roles") or {}
     synth_alias = args.get("synthesiser") or registry.default_synthesiser()
+    # Fail fast on a typo'd synthesiser alias BEFORE we spend the panel
+    # cost. `registry.resolve_model` raises KeyError on an unknown alias,
+    # which the MCP layer maps to ErrorCode.UNKNOWN_MODEL.
+    registry.resolve_model(synth_alias)
 
     # Exclude the synthesiser from the panel to avoid self-inclusion bias
     panel_aliases = [m for m in tier_models if m != synth_alias]
