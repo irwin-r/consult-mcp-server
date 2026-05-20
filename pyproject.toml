@@ -22,6 +22,7 @@ dev = [
 [project.scripts]
 consult-mcp = "consult.__main__:cli"
 consult-ledger = "consult.ledger:cli"
+consult-view = "consult.viewer:cli"
 
 [build-system]
 requires = ["hatchling"]

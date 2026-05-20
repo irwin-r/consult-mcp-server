@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import re
 from enum import StrEnum
 from math import ceil
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 # Forbid unknown fields by default. Pydantic v2's default `extra="ignore"`
 # silently drops kwargs that don't match a field — the same mechanism that
@@ -16,6 +17,14 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 # site. Set per-class (not via a shared base) to keep types.py self-contained
 # and avoid surprising inheritance interactions with downstream validators.
 _STRICT = ConfigDict(extra="forbid")
+
+# Slug regex shared between ModelSpec input validation and artifacts.py
+# path construction. Module-level so it doesn't collide with Pydantic's
+# private-attribute treatment of class-level underscore names. The leading
+# alphanumeric anchor rejects values like `..`, `--foo`, or `.hidden` —
+# pure-punctuation slugs could still escape an artifact dir (`..`) or set
+# shell-hostile traps for downstream tools.
+_SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
 class Status(StrEnum):
@@ -41,6 +50,23 @@ class ModelSpec(BaseModel):
     slug: str | None = Field(
         None, description="Override slug. Otherwise derived from model + index."
     )
+
+    # Slug is interpolated into filesystem paths (`responses/<slug>.txt`)
+    # and resource URIs. Reject anything that could escape the artifact
+    # directory at construction time so the input boundary is the failure
+    # point, not the deep path-build inside `_call_one`. `artifacts.py`
+    # also enforces the same regex defensively when paths are built.
+    @field_validator("slug")
+    @classmethod
+    def _validate_slug(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        if not _SLUG_RE.fullmatch(v):
+            raise ValueError(
+                f"slug {v!r} must match {_SLUG_RE.pattern} "
+                "(no path separators or special characters)"
+            )
+        return v
 
 
 class Capsule(BaseModel):
@@ -160,7 +186,7 @@ class ManifestEntry(BaseModel):
     latency_ms: int | None = Field(None, ge=0)
     tokens_in: int | None = Field(None, ge=0)
     tokens_out: int | None = Field(None, ge=0)
-    cost_usd: float | None = Field(None, ge=0.0)
+    cost_usd: float | None = Field(0.0, ge=0.0)
     cost_known: bool = True
     error: str | None = None
 
@@ -183,6 +209,16 @@ class ManifestEntry(BaseModel):
         if self.status in (Status.ERROR, Status.TIMEOUT) and not self.error:
             raise ValueError(
                 f"ManifestEntry with status={self.status.value} must carry an error message"
+            )
+        # Cost invariant: cost_usd=None must imply cost_known=False. The
+        # opposite (a known cost we couldn't look up) is nonsensical and
+        # would silently understate ledger totals — a future code path
+        # returning `cost_usd=None, cost_known=True` would be reported as
+        # a free call. Catching it at construction prevents the silent
+        # misreport from ever landing on disk.
+        if self.cost_usd is None and self.cost_known:
+            raise ValueError(
+                "ManifestEntry with cost_usd=None must have cost_known=False"
             )
         return self
 
@@ -231,6 +267,12 @@ class RunHandle(BaseModel):
         """Parametric viability check.
 
         Defaults: min_ok = max(2, ceil(len(manifest) * 0.6)); min_providers = min(2, panel_size).
+
+        Blinded panels strip `model_id` from every entry by design, so the
+        provider-diversity check is skipped under `blinded=True` — otherwise
+        a fully-OK blinded panel would always fail `usable()`. The diversity
+        signal lives in `registry_snapshot.json` for audit; check it there
+        if needed.
         """
         n = len(self.manifest)
         if min_ok is None:
@@ -240,6 +282,8 @@ class RunHandle(BaseModel):
         ok_entries = [m for m in self.manifest if m.status == Status.OK]
         if len(ok_entries) < min_ok:
             return False
+        if self.blinded:
+            return True
         # provider extracted from model_id prefix (litellm format) when available
         providers = {
             (m.model_id or "").split("/")[0] for m in ok_entries if m.model_id
@@ -274,6 +318,16 @@ class RunResult(BaseModel):
             raise ValueError("RunResult.partial=True requires partial_reason")
         if not self.partial and self.partial_reason:
             raise ValueError("RunResult.partial=False must not carry a partial_reason")
+        # Top-level cost_known must propagate from the manifest. A single
+        # unknown-priced panellist (or slow-tail dropout) means we can't
+        # validate against `max_run_usd`; flipping `cost_known=False` is
+        # how the rest of the stack signals that uncertainty to the caller.
+        # ManifestEntry already enforces cost_usd=None ⇒ cost_known=False;
+        # this validator stops the outer result from undoing that.
+        if self.cost_known and any(not m.cost_known for m in self.manifest):
+            raise ValueError(
+                "RunResult.cost_known=True but a manifest entry has cost_known=False"
+            )
         return self
 
 
@@ -336,4 +390,16 @@ class RefineResult(BaseModel):
             raise ValueError("RefineResult.partial=True requires partial_reason")
         if not self.partial and self.partial_reason:
             raise ValueError("RefineResult.partial=False must not carry a partial_reason")
+        if self.cost_known:
+            if any(not m.cost_known for m in self.final_manifest):
+                raise ValueError(
+                    "RefineResult.cost_known=True but a final_manifest entry has cost_known=False"
+                )
+            # The arbiter call is billed too — if any per-round verdict has
+            # cost_known=False (price-table miss or call failure), the run
+            # total cannot be validated against the cap either.
+            if any(not v.cost_known for v in self.verdicts):
+                raise ValueError(
+                    "RefineResult.cost_known=True but an arbiter verdict has cost_known=False"
+                )
         return self

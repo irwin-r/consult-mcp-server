@@ -216,6 +216,15 @@ Six panellists total — three runs each of two cheap models. Useful for measuri
 
 `total_known: false` means at least one panellist had pricing missing from the LiteLLM table — the displayed total is a lower bound. Pass any `YYYY-MM-DD` to ledger past days.
 
+### 9. View a run as a rich HTML page
+
+```bash
+.venv/bin/consult-view <run_id>          # writes ~/.consult/runs/<run_id>/feed.html, prints the path
+.venv/bin/consult-view <run_id> --open   # also opens it in the default browser
+```
+
+Renders the entire run as one self-contained HTML file — header with cost / wall-time / status pills, prompt, synthesis (markdown), per-round arbiter verdicts (for `refine`), per-panellist cards with capsule + full body, and a chronological timeline derived from `_progress.log`. No external assets, no JavaScript, light/dark via `prefers-color-scheme`. Regenerable: `feed.html` is a pure derivation of the on-disk artifacts.
+
 ## What's in scope for v1
 
 - 4 tools: `panel`, `synthesise`, `consult`, `refine`
@@ -233,6 +242,7 @@ Six panellists total — three runs each of two cheap models. Useful for measuri
 - `sequence` tool (chained multi-step consultations with shared context)
 - MCP `notifications/progress` + JSONL `_progress.log` fallback
 - Daily cost ledger (`consult-ledger` CLI + `consult/ledger.py`)
+- Static HTML run viewer (`consult-view <run_id>` → `feed.html`)
 - Continuation IDs for `refine` (chain a follow-up onto a prior run)
 - `model:N` multi-instance syntax
 - GitHub Actions CI on Python 3.11/3.12/3.13
@@ -260,6 +270,7 @@ consult/
   refine.py        # iterative arbiter-driven loop (max 3 rounds) + continuation
   sequence.py      # chained multi-step consultations
   ledger.py        # daily cost ledger (consult-ledger entry point)
+  viewer.py        # static HTML run renderer (consult-view entry point)
   registry.py      # models.json + stances.json loader
   artifacts.py     # ~/.consult/runs/<id>/ layout + resource URIs
   status.py        # LiteLLM response → Status

@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -37,6 +38,31 @@ def runs_root() -> Path:
 
 def new_run_id() -> str:
     return time.strftime("%Y%m%d-%H%M%S") + f"-{random.randint(1000, 99999)}"
+
+
+# Slugs and run IDs are interpolated directly into filesystem paths and
+# resource URIs. A value like "../manifest" or "/etc/passwd" would escape
+# the per-run artifact directory; refine's round suffix needs the dot, so
+# we allow `.` but reject path separators and any non-printable chars. The
+# leading alphanumeric anchor rejects pure-punctuation slugs like `..` that
+# match the body class but still traverse. Every legitimate identifier we
+# generate (`<base>-<idx>`, `<base>-<idx>.r<n>`, `YYYYMMDD-HHMMSS-<rand>`)
+# starts with an alphanumeric character.
+_SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def _validate_id(value: str, kind: str) -> str:
+    """Reject identifiers that could traverse out of the artifact root.
+
+    `kind` is "slug" or "run_id" — appears in the error message so a bad
+    request surfaces the offending field name. Empty strings are rejected
+    along with separator/special characters.
+    """
+    if not isinstance(value, str) or not value or not _SAFE_ID_RE.fullmatch(value):
+        raise ValueError(
+            f"invalid {kind} {value!r}: must match {_SAFE_ID_RE.pattern}"
+        )
+    return value
 
 
 @dataclass
@@ -73,19 +99,19 @@ class RunPaths:
         return self.root / "registry_snapshot.json"
 
     def response_text(self, slug: str) -> Path:
-        return self.responses / f"{slug}.txt"
+        return self.responses / f"{_validate_id(slug, 'slug')}.txt"
 
     def response_raw(self, slug: str) -> Path:
-        return self.responses / f"{slug}.json"
+        return self.responses / f"{_validate_id(slug, 'slug')}.json"
 
     def prompt_for(self, slug: str) -> Path:
-        return self.prompts / f"{slug}.txt"
+        return self.prompts / f"{_validate_id(slug, 'slug')}.txt"
 
     def capsule_for(self, slug: str) -> Path:
-        return self.capsules / f"{slug}.json"
+        return self.capsules / f"{_validate_id(slug, 'slug')}.json"
 
     def resource_uri(self, slug: str) -> str:
-        return f"consult://runs/{self.run_id}/responses/{slug}"
+        return f"consult://runs/{self.run_id}/responses/{_validate_id(slug, 'slug')}"
 
     def arbiter_for(self, round_num: int) -> Path:
         return self.arbiters / f"round-{round_num}.json"
@@ -104,7 +130,16 @@ def create_run() -> RunPaths:
 
 
 def load_run(run_id: str) -> RunPaths:
-    root = runs_root() / run_id
+    # `_validate_id` rejects path-traversal characters; a containment check
+    # via `.resolve()` is the belt-and-braces guard against case-insensitive
+    # FS resolution or pre-validation symlink swaps under `runs_root()`.
+    _validate_id(run_id, "run_id")
+    base = runs_root().resolve()
+    root = (base / run_id).resolve()
+    try:
+        root.relative_to(base)
+    except ValueError as e:
+        raise ValueError(f"run_id {run_id!r} escapes runs_root") from e
     if not root.exists():
         raise FileNotFoundError(f"Run not found: {run_id}")
     return RunPaths(run_id=run_id, root=root)
@@ -147,4 +182,8 @@ def parse_resource_uri(uri: str) -> tuple[str, str]:
     parts = rest.split("/")
     if len(parts) != 3 or parts[1] != "responses":
         raise ValueError(f"Malformed consult URI: {uri}")
+    # Validate before returning so a malicious URI can't reach disk via
+    # downstream callers that forget to call `_validate_id` themselves.
+    _validate_id(parts[0], "run_id")
+    _validate_id(parts[2], "slug")
     return parts[0], parts[2]

@@ -11,3 +11,5 @@ build/
 .coverage
 htmlcov/
 *.log
+.refine-loop/
+.claude/

@@ -60,3 +60,17 @@ class ErrorEnvelope(BaseModel):
 
     ok: bool = Field(False, description="Always False on this type")
     error: ConsultError
+
+
+def envelope(code: ErrorCode, message: str, run_id: str | None = None) -> dict:
+    """Build the standard failure envelope as a dict.
+
+    Returned by `handle_call_tool`'s try/except so every failure mode the
+    agent sees has the same shape. Returning a dict (rather than a JSON
+    string) lets the MCP SDK populate `structuredContent` alongside the
+    JSON text fallback — clients can branch on `error.code` directly
+    without parsing the text body.
+    """
+    return ErrorEnvelope(
+        error=ConsultError(code=code, message=message, run_id=run_id),
+    ).model_dump()

@@ -19,6 +19,7 @@ event has access to monotonic progress numbers regardless of kind.
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -157,6 +158,34 @@ ProgressEvent = Annotated[
     PanellistStarted | PanellistCompleted | PanellistPartial | CapsuleExtracted | ArbiterScored | SynthStarted | SynthCompleted | SequenceStepStarted | SequenceStepCompleted | PhaseStarted | Heartbeat,
     Field(discriminator="kind"),
 ]
+
+
+def shift_bucket(
+    parent: Callable[[ProgressEvent], Awaitable[None]] | None,
+    base: int,
+    total: int,
+) -> Callable[[ProgressEvent], Awaitable[None]] | None:
+    """Wrap `parent` so child events shift their `(done, total)` into an
+    outer monotonic bucket.
+
+    Multi-phase tools (`consult`, `refine`, `sequence`) compose fanout +
+    capsule + synth (and N rounds/steps of those) into one progress stream.
+    Each child phase counts from 0; the wrapper rebases by `base` and
+    overrides `total` so the parent client sees a single growing counter.
+    Event identity (`kind`, slug, etc.) is preserved via `model_copy`.
+
+    Returns `None` when `parent is None` — callers (which all check
+    `if on_progress is None`) get a clean way to short-circuit the
+    wrap without an extra branch at every call site.
+    """
+    if parent is None:
+        return None
+
+    async def cb(event: ProgressEvent) -> None:
+        shifted = event.model_copy(update={"done": base + event.done, "total": total})
+        await parent(shifted)
+
+    return cb
 
 
 def event_message(event: ProgressEvent) -> str:

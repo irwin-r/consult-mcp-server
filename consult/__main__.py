@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 
+from .runner import configure_litellm
 from .server import main
 
 
 def cli() -> None:
+    configure_litellm()
     asyncio.run(main())
 
 

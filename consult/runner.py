@@ -13,7 +13,7 @@ import random
 import re
 import time
 from collections.abc import Awaitable, Callable
-from contextlib import nullcontext
+from contextlib import nullcontext, suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -41,6 +41,16 @@ logger = logging.getLogger(__name__)
 ProgressCallback = Callable[[ProgressEvent], Awaitable[None]]
 
 
+async def _write_text_async(path: Path, content: str) -> None:
+    """Off-loop write helper. Wraps `Path.write_text` in `asyncio.to_thread`
+    so per-panellist artifact writes inside `_call_one` don't block the
+    event loop while N parallel panellists finish around the same time.
+    Sync-in-async writes on a 10-spec panel previously stacked ~30 blocking
+    syscalls that could push past per-call timeouts.
+    """
+    await asyncio.to_thread(path.write_text, content)
+
+
 def _append_progress_log(run_root: Path, event: ProgressEvent) -> None:
     """Append a JSONL line to `<run>/_progress.log` for client-less tailing.
 
@@ -56,21 +66,35 @@ def _append_progress_log(run_root: Path, event: ProgressEvent) -> None:
     except OSError as e:  # pragma: no cover — log-write failure is benign
         logger.debug("progress log write failed: %s", e)
 
-# Drop unsupported params per provider so e.g. `reasoning_effort` on a
-# non-reasoning model is silently ignored rather than failing the panel.
-litellm.drop_params = True
-# LiteLLM's default error path prints an ANSI-coloured "Give Feedback /
-# Get Help" footer + "debug this error" hint to stderr on every caught
-# exception. We already log a clean .warning() at the catch site; this
-# silences the noisy trailer so a single pricing-table miss doesn't
-# drown the rest of the log.
-litellm.suppress_debug_info = True
-# LiteLLM attaches its own coloured handler to the "LiteLLM" logger AND
-# lets it propagate to root. When a caller (test harness, dogfood
-# script, MCP host) configures the root logger at INFO or below, every
-# LiteLLM line prints twice — once via the coloured handler, once via
-# root. Stop the propagation so callers see exactly one copy.
-logging.getLogger("LiteLLM").propagate = False
+_LITELLM_CONFIGURED = False
+
+
+def configure_litellm() -> None:
+    """Apply consult's LiteLLM tweaks. Idempotent.
+
+    Called from `__main__.cli`, from `fanout()` on first use, and from test
+    fixtures. Three tweaks:
+    - `drop_params=True`: silently drop unsupported kwargs (e.g.
+      `reasoning_effort` on a non-reasoning model) instead of failing the
+      whole panel.
+    - `suppress_debug_info=True`: kill the ANSI "Give Feedback / Get Help"
+      footer LiteLLM prints to stderr on every caught exception.
+    - `LiteLLM` logger `propagate=False`: LiteLLM attaches its own coloured
+      handler AND lets messages propagate to root, so any caller that
+      configures the root logger at INFO sees every line twice.
+
+    Previously these ran as module-level side effects at import time, which
+    meant any importer (incl. test helpers and `consult-view`) silently
+    picked them up. Making it explicit keeps the side effect at the entry
+    points that actually need it.
+    """
+    global _LITELLM_CONFIGURED
+    if _LITELLM_CONFIGURED:
+        return
+    litellm.drop_params = True
+    litellm.suppress_debug_info = True
+    logging.getLogger("LiteLLM").propagate = False
+    _LITELLM_CONFIGURED = True
 
 # CONTRACT: capsule.py:_CONFIDENCE and the capsule extractor prompt depend on
 # these exact line prefixes (`CONFIDENCE:` and `KEY_REASON:`). Don't rename
@@ -119,8 +143,14 @@ def expand_specs(specs: list[ModelSpec]) -> list[ModelSpec]:
             raise ValueError(
                 f"model:count must be ≥1 (got {spec.model!r})"
             )
-        for _ in range(count):
-            out.append(ModelSpec(model=base, stance=spec.stance, slug=spec.slug))
+        # When an explicit slug is set and count > 1, suffix each copy with
+        # its index. Without this all N copies share the same slug, race to
+        # write to the same `responses/<slug>.txt`, and N-1 responses are
+        # silently overwritten. The bare-model branch is safe because
+        # `_make_slug` already disambiguates by index.
+        for i in range(count):
+            slug = f"{spec.slug}-{i}" if (spec.slug and count > 1) else spec.slug
+            out.append(ModelSpec(model=base, stance=spec.stance, slug=slug))
     return out
 
 
@@ -145,6 +175,31 @@ def _rate_limit_class() -> type[BaseException]:
 
 _RETRY_MAX_ATTEMPTS = 3
 _RETRY_BASE_DELAY_S = 2.0
+
+# Process-level provider concurrency gate. Keyed by the running event loop so
+# nothing breaks if a test harness or REPL drives the API from a fresh loop
+# (asyncio.Semaphore is bound to the loop that created it; a stale semaphore
+# from a torn-down loop would silently no-op). Lazily populated on first
+# `_get_provider_sems()` call in a given loop.
+_provider_sems_by_loop: dict[asyncio.AbstractEventLoop, dict[str, asyncio.Semaphore]] = {}
+
+
+def _get_provider_sems() -> dict[str, asyncio.Semaphore]:
+    """Return the process-level provider semaphore dict for the running loop.
+
+    Cross-call rate limiting: if a single MCP server process drives two
+    concurrent fanouts (panel + refine in flight, or two clients), they
+    share these semaphores — otherwise each fanout would hit the OpenAI
+    bucket independently (the FRICTION-logged failure mode that the
+    semaphores were originally meant to solve).
+    """
+    loop = asyncio.get_running_loop()
+    sems = _provider_sems_by_loop.get(loop)
+    if sems is None:
+        caps = registry.provider_concurrency()
+        sems = {p: asyncio.Semaphore(n) for p, n in caps.items()}
+        _provider_sems_by_loop[loop] = sems
+    return sems
 
 
 async def _acompletion_with_retry(*, timeout: float, **kwargs: Any) -> Any:
@@ -199,19 +254,57 @@ async def _acompletion_with_retry(*, timeout: float, **kwargs: Any) -> Any:
     raise TimeoutError(f"retry budget exhausted ({timeout}s)")
 
 
-def _build_messages(prompt: str, provider: str) -> list[dict[str, Any]]:
-    # Anthropic-only: mark the user prompt as a cache breakpoint. Repeat
-    # panellists in the same fanout share the bulk of their prefix (base
-    # prompt + footer; stance varies). Without cache_control LiteLLM
-    # serialises a plain string and no caching is requested.
+def _concat_turn_text(turns: list[dict[str, Any]]) -> str:
+    """Flatten a list of `{role, content}` turns into a single text blob
+    for token counting. `content` may be a string or a list of content
+    parts (Anthropic-style blocks); we only count text. Other block kinds
+    (images, tool_use) are skipped — none flow through `prior_turns` today.
+    """
+    parts: list[str] = []
+    for turn in turns:
+        content = turn.get("content")
+        if isinstance(content, str):
+            parts.append(content)
+        elif isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    parts.append(str(block.get("text", "")))
+    return "\n".join(parts)
+
+
+def _build_messages(
+    prompt: str,
+    provider: str,
+    prior_turns: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Assemble the messages array for one panellist call.
+
+    `prior_turns`, when set, is a sequence of `{role, content}` turns
+    prepended verbatim before the final user prompt — used by `refine`
+    when continuing a prior run so the model sees the previous
+    consultation as a proper user/assistant exchange rather than a single
+    block of stitched-together text. Role boundaries help the model
+    distinguish "what was previously asked & answered" from "what we're
+    asking now"; prepending also gives Anthropic + OpenAI prompt caches
+    a stable prefix to key on across follow-ups from the same parent run.
+
+    Anthropic-only: the final user prompt is wrapped with a
+    `cache_control: ephemeral` breakpoint. Within a single fanout,
+    repeat panellists share the bulk of this prefix (base prompt +
+    footer; only stance varies); the breakpoint lets the second-onwards
+    calls reuse the cached input.
+    """
+    turns: list[dict[str, Any]] = list(prior_turns) if prior_turns else []
     if provider == "anthropic":
-        return [{
+        turns.append({
             "role": "user",
             "content": [
                 {"type": "text", "text": prompt, "cache_control": {"type": "ephemeral"}}
             ],
-        }]
-    return [{"role": "user", "content": prompt}]
+        })
+    else:
+        turns.append({"role": "user", "content": prompt})
+    return turns
 
 
 def _make_slug(spec: ModelSpec, idx: int, blinded: bool) -> str:
@@ -325,6 +418,7 @@ async def _call_one(
     *,
     stream: bool = False,
     on_partial: Callable[[int, int], Awaitable[None]] | None = None,
+    prior_turns: list[dict[str, Any]] | None = None,
 ) -> ManifestEntry:
     # An unknown alias must fail this single panellist, not the whole panel.
     # `asyncio.gather` without return_exceptions=True would otherwise cancel
@@ -332,7 +426,11 @@ async def _call_one(
     try:
         entry = registry.resolve_model(spec.model)
     except KeyError as e:
-        paths.response_text(slug).write_text("")
+        await _write_text_async(paths.response_text(slug), "")
+        # Unknown alias — no provider call was made, so the cost is genuinely
+        # zero (NOT unknown). cost_usd=0.0 + cost_known=True is the correct
+        # encoding; using cost_usd=None would now fail the cost-invariant
+        # validator on ManifestEntry.
         return ManifestEntry(
             slug=slug,
             model_id=None,
@@ -344,7 +442,7 @@ async def _call_one(
             latency_ms=0,
             tokens_in=None,
             tokens_out=None,
-            cost_usd=None,
+            cost_usd=0.0,
             cost_known=True,
             error=str(e),
             confidence=None,
@@ -359,7 +457,7 @@ async def _call_one(
     if "reasoning_effort" in entry:
         extra["reasoning_effort"] = entry["reasoning_effort"]
 
-    paths.prompt_for(slug).write_text(per_slug_prompt)
+    await _write_text_async(paths.prompt_for(slug), per_slug_prompt)
     start = time.time()
     status: Status
     finish: str | None = None
@@ -383,13 +481,14 @@ async def _call_one(
 
     try:
         async with sem if sem is not None else nullcontext():
+            messages = _build_messages(per_slug_prompt, provider, prior_turns)
             if stream:
                 resp = await _stream_acompletion(
                     timeout=timeout,
                     on_partial=on_partial,
                     start=start,
                     model=litellm_id,
-                    messages=_build_messages(per_slug_prompt, provider),
+                    messages=messages,
                     max_tokens=budget,
                     **extra,
                 )
@@ -397,7 +496,7 @@ async def _call_one(
                 resp = await _acompletion_with_retry(
                     timeout=timeout,
                     model=litellm_id,
-                    messages=_build_messages(per_slug_prompt, provider),
+                    messages=messages,
                     max_tokens=budget,
                     **extra,
                 )
@@ -406,7 +505,9 @@ async def _call_one(
             raw = resp.model_dump()  # type: ignore[attr-defined]
         except AttributeError:
             raw = dict(resp) if hasattr(resp, "__iter__") else {"_repr": repr(resp)}
-        paths.response_raw(slug).write_text(json.dumps(raw, indent=2, default=str))
+        await _write_text_async(
+            paths.response_raw(slug), json.dumps(raw, indent=2, default=str)
+        )
 
         status, finish, body = classify(resp)
         usage = getattr(resp, "usage", None)
@@ -424,13 +525,23 @@ async def _call_one(
     except TimeoutError:
         status, finish, body = Status.TIMEOUT, None, ""
         error = f"timeout after {timeout}s"
-        cost_known = True  # no call was billable
+        # Conservative: a TimeoutError from `asyncio.wait_for` means we
+        # gave up waiting, NOT that the HTTP request never landed. The
+        # provider may have processed and billed us; cost_known=False
+        # surfaces that uncertainty in the ledger as a lower bound rather
+        # than silently understating spend. Mirrors slow-tail dropout.
+        cost = None
+        cost_known = False
     except Exception as e:  # noqa: BLE001 — LiteLLM raises many concrete types
         status, finish, body = classify(None, exception=e)
         error = str(e)[:4096] or f"{type(e).__name__}"
-        cost_known = True  # no call was billable
+        # Same logic: most provider exceptions imply no billable call, but
+        # we can't be sure for every case (e.g. 502 mid-stream may have
+        # billed). cost_known=False is the conservative encoding.
+        cost = None
+        cost_known = False
 
-    paths.response_text(slug).write_text(body)
+    await _write_text_async(paths.response_text(slug), body)
     latency_ms = int((time.time() - start) * 1000)
 
     # Per-panellist completion line. Visible in MCP server logs
@@ -532,10 +643,17 @@ async def fanout(
     on_progress: ProgressCallback | None = None,
     stream: bool = False,
     capsule_kind: str = "decision",
+    prior_turns: list[dict[str, Any]] | None = None,
 ) -> RunHandle:
     """Parallel fan-out. Creates a fresh run by default. Pass `existing_paths`
     to write into an existing run dir (used by `refine` to keep all rounds
     under one run_id with round-suffixed slugs).
+
+    `prior_turns`, when set, is a sequence of `{role, content}` dicts
+    prepended to the messages array for every panellist call. Used by
+    `refine` with a `continuation_id` to expose the prior consultation as
+    a proper user/assistant exchange. The text is included in cost
+    estimation so the cap check stays accurate.
 
     If `on_progress` is set, it's called once per panellist as it completes
     with `(done, total, message)`. Failures inside the callback are logged
@@ -549,6 +667,10 @@ async def fanout(
     # without changing the tool-call surface.
     if not stream and os.environ.get("CONSULT_STREAM", "0") == "1":
         stream = True
+    # Apply LiteLLM tweaks lazily — covers callers that bypass __main__.cli
+    # (tests, library use, the `consult-view`/`consult-ledger` CLIs that
+    # import this module).
+    configure_litellm()
     if existing_paths is None:
         paths = artifacts.create_run()
         paths.prompt_txt.write_text(prompt)
@@ -567,8 +689,13 @@ async def fanout(
     else:
         paths = existing_paths
 
-    # Estimate cost up front; if dry_run, return immediately with empty manifest
-    estimate, all_known = estimate_cost(specs, prompt)
+    # Estimate cost up front; if dry_run, return immediately with empty
+    # manifest. When `prior_turns` is set (continuation), include their
+    # text in the token count so the cap check sees the real input size.
+    cost_input = prompt
+    if prior_turns:
+        cost_input = _concat_turn_text(prior_turns) + "\n" + prompt
+    estimate, all_known = estimate_cost(specs, cost_input)
     cap = max_run_usd if max_run_usd is not None else registry.default_max_run_usd()
     if estimate > cap:
         # When some prices are unknown, `estimate` is only the known-priced
@@ -608,15 +735,9 @@ async def fanout(
         _build_per_slug_prompt(prompt, registry.resolve_stance(s.stance)) for s in specs
     ]
 
-    # Per-provider semaphores. Built per-fanout (each call gets fresh
-    # semaphores bound to the running loop). Cross-call rate-limiting would
-    # need a per-loop registry — out of scope here; an MCP client typically
-    # issues serial tool calls, so within-panel throttling fully covers the
-    # FRICTION-logged failure mode.
-    caps = registry.provider_concurrency()
-    provider_sems: dict[str, asyncio.Semaphore] = {
-        p: asyncio.Semaphore(n) for p, n in caps.items()
-    }
+    # Process-level provider semaphores (shared across concurrent fanouts
+    # in the same event loop). See `_get_provider_sems` for the rationale.
+    provider_sems = _get_provider_sems()
 
     start = time.time()
     total = len(specs)
@@ -698,6 +819,7 @@ async def fanout(
         entry = await _call_one(
             spec, slug, per_prompt, paths, provider_sems,
             stream=stream, on_partial=on_partial,
+            prior_turns=prior_turns,
         )
         done += 1
         completed_entries.append(entry)
@@ -773,6 +895,13 @@ async def fanout(
                 latency_ms = int((time.time() - start) * 1000)
                 if not paths.response_text(slug).exists():
                     paths.response_text(slug).write_text("")
+                # Cancelled tasks set cost_known=False: asyncio.cancel()
+                # may race with an already-in-flight HTTP request, in which
+                # case the provider WILL bill us even though we never see
+                # the response. Treating the cost as "known to be zero"
+                # would silently understate the run total. The handle's
+                # `cost_known` will go False as soon as any dropped entry
+                # is present, mirroring the partial-pricing path.
                 entry = ManifestEntry(
                     slug=slug,
                     model_id=None,
@@ -782,7 +911,8 @@ async def fanout(
                     resource_uri=paths.resource_uri(slug),
                     body_path=str(paths.response_text(slug)),
                     latency_ms=latency_ms,
-                    cost_known=True,  # no billable call landed
+                    cost_usd=None,
+                    cost_known=False,
                     error=f"slow-tail dropout after {tail_dropout_s}s",
                     confidence=None,
                     capsule=None,
@@ -809,10 +939,8 @@ async def fanout(
     finally:
         if heartbeat_task is not None:
             heartbeat_task.cancel()
-            try:
+            with suppress(asyncio.CancelledError):
                 await heartbeat_task
-            except asyncio.CancelledError:
-                pass
 
     wall_ms = int((time.time() - start) * 1000)
 
@@ -823,6 +951,23 @@ async def fanout(
 
     cost_total = sum((m.cost_usd or 0.0) for m in manifest)
     all_known = all(m.cost_known for m in manifest)
+    # Zero-usable-panel guard. When every panellist times out, errors, or is
+    # rate-limited, callers (refine arbiter, sequence) must not proceed —
+    # there is no signal to evaluate and the downstream spend (arbiter,
+    # synthesis) would burn for nothing. partial=True here lets the caller
+    # short-circuit; a non-empty manifest of failure entries is still
+    # returned for diagnosis.
+    usable_count = sum(1 for m in manifest if m.status in (Status.OK, Status.TRUNCATED))
+    if manifest and usable_count == 0:
+        statuses = sorted({m.status.value for m in manifest})
+        partial = True
+        partial_reason: str | None = (
+            f"zero usable panellists ({len(manifest)} returned: {', '.join(statuses)})"
+        )
+    else:
+        partial = False
+        partial_reason = None
+
     handle = RunHandle(
         run_id=paths.run_id,
         artifacts_dir=str(paths.root),
@@ -830,7 +975,8 @@ async def fanout(
         cost_usd=cost_total,
         cost_known=all_known,
         wall_ms=wall_ms,
-        partial=False,
+        partial=partial,
+        partial_reason=partial_reason,
         blinded=blinded,
     )
     artifacts.write_manifest(paths, handle.model_dump())

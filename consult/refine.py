@@ -17,10 +17,11 @@ import json
 import logging
 import re
 import time
+from typing import Any
 
 import litellm
 
-from . import artifacts, capsule, context, registry, runner, synth
+from . import artifacts, capsule, context, provider_caps, registry, runner, synth
 from . import progress as progress_mod
 from .jsonparse import extract_json
 from .types import (
@@ -272,15 +273,19 @@ async def _ask_arbiter(
         health_breakdown=health_breakdown,
     )
 
-    # 1) Call — exception here means we never got text back
+    # 1) Call — exception here means we never got text back.
+    # `temperature` is only set on providers that accept it. claude-opus-4-7
+    # and Gemini both reject the kwarg; falling back to the provider default
+    # is fine for an arbiter call that's just producing a JSON verdict.
+    call_kwargs: dict[str, Any] = {
+        "model": litellm_id,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 2000,
+    }
+    provider_caps.apply_temperature(call_kwargs, litellm_id, 0.0)
     try:
         resp = await asyncio.wait_for(
-            litellm.acompletion(
-                model=litellm_id,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=2000,
-                temperature=0.0,
-            ),
+            litellm.acompletion(**call_kwargs),
             timeout=timeout,
         )
     except Exception as e:
@@ -368,24 +373,31 @@ def _suffix_specs(specs: list[ModelSpec], round_num: int) -> list[ModelSpec]:
     return out
 
 
-def _apply_continuation(prompt: str, continuation_id: str | None) -> str:
-    """Prepend the prior run's original question + synthesis to `prompt`.
+def _apply_continuation(
+    prompt: str, continuation_id: str | None
+) -> tuple[str, list[dict[str, Any]] | None]:
+    """Resolve the continuation and split it from the follow-up prompt.
 
-    Order: stable prefix (prior question + prior synthesis) first, then the
-    new (volatile) question last. Anthropic + OpenAI prompt caches key on
-    leading bytes, so this ordering means every panellist in this turn
-    reuses the cache from the first panellist. Including the prior question
-    (not just the synthesis) restores fidelity — without it, the new panel
-    would only see a summary of what was asked previously, not the source
-    material.
+    Returns `(prompt_for_storage, prior_turns)`:
+    - `prompt_for_storage` is what gets persisted to `prompt.txt` and the
+      context bundle. It includes the prior question + synthesis as
+      markdown-headed sections so disk artifacts remain self-describing
+      and `consult-view` can render the full conversation in one place.
+    - `prior_turns`, when not `None`, is a `[user(prior_question),
+      assistant(prior_synthesis)]` pair fed to `runner.fanout` as message
+      history. The model sees the prior consultation as a proper exchange,
+      not a single user blob — better role boundaries, and the prefix
+      becomes a stable cache target across follow-ups from the same run.
+
+    Returns `(prompt, None)` when continuation isn't set, so non-continued
+    refine calls are unchanged.
 
     Raises `ValueError` on a missing run dir or missing `synthesis.md` — a
-    typo in `continuation_id` must not silently drop the prior context
-    (caller would think the new round had it, but it wouldn't). Empty
-    string is treated the same as None.
+    typo must not silently drop the prior context. Empty string is treated
+    the same as None.
     """
     if not continuation_id:
-        return prompt
+        return prompt, None
     try:
         prior_paths = artifacts.load_run(continuation_id)
     except FileNotFoundError as e:
@@ -396,6 +408,24 @@ def _apply_continuation(prompt: str, continuation_id: str | None) -> str:
             f"continuation_id {continuation_id} has no synthesis.md "
             "(was the prior run partial, dry-run, or pre-synth?)"
         )
+    # Reject the synth sentinels written by `synth.synthesise` when the
+    # prior run had no usable panel, a failed flagship call, or returned
+    # empty content. Feeding "# Synthesis unavailable" to a new panel as
+    # "prior consultation" produces hallucinated follow-ups that pretend
+    # the sentinel was a real conclusion.
+    prior_synth_text = synth_path.read_text()
+    _SYNTH_SENTINELS = (
+        "# Synthesis skipped",
+        "# Synthesis unavailable",
+        "# Synthesis empty",
+    )
+    for sentinel in _SYNTH_SENTINELS:
+        if prior_synth_text.startswith(sentinel):
+            raise ValueError(
+                f"continuation_id {continuation_id} has a sentinel synthesis "
+                f"({sentinel!r}) — the prior run did not produce real synthesis. "
+                "Re-run the prior consultation before continuing."
+            )
 
     # Load the prior question — prefer the bundle (canonical post-Phase 1)
     # and fall back to prompt.txt for legacy runs created before contexts
@@ -408,15 +438,19 @@ def _apply_continuation(prompt: str, continuation_id: str | None) -> str:
     else:
         prior_question = "(prior question unavailable)"
 
-    prior_synth = synth_path.read_text()
-    return (
+    combined_for_storage = (
         "## Prior consultation — original question\n\n"
         f"{prior_question}\n\n"
         "## Prior consultation — synthesis\n\n"
-        f"{prior_synth}\n\n---\n\n"
+        f"{prior_synth_text}\n\n---\n\n"
         "## Follow-up question\n\n"
         f"{prompt}"
     )
+    prior_turns: list[dict[str, Any]] = [
+        {"role": "user", "content": prior_question},
+        {"role": "assistant", "content": prior_synth_text},
+    ]
+    return combined_for_storage, prior_turns
 
 
 async def refine(
@@ -458,7 +492,14 @@ async def refine(
     if resolved_kind is None:
         resolved_kind = "decision"
 
-    prompt = _apply_continuation(prompt, continuation_id)
+    # `prompt_for_storage` includes the prior conversation as markdown (used
+    # for `prompt.txt`, the context bundle, and the arbiter's "original
+    # question"); `prior_turns` is the proper user/assistant exchange fed
+    # to the panellists so they see role boundaries, not stitched text.
+    # `followup_only` is what the panellist's *user* turn carries — just
+    # the new question, since the prior is already in prior_turns.
+    followup_only = prompt
+    prompt, prior_turns = _apply_continuation(prompt, continuation_id)
     # Resolve `model:N` sugar here too so `estimate_cost` (called before
     # `fanout` in each round) sees the real expanded panel.
     specs = runner.expand_specs(specs)
@@ -501,37 +542,65 @@ async def refine(
                 logger.debug("refine on_progress failed: %s", e)
 
     def make_phase_cb(base: int) -> runner.ProgressCallback | None:
-        """Wrap a child event by shifting its `done`/`total` into the outer
-        refine-wide bucket. Event identity (kind + payload) is preserved.
+        """Shift child events into the refine-wide monotonic bucket.
+
+        Tracks `progress_done` so subsequent direct `emit()` calls (e.g.
+        ArbiterScored at the end of a round) start from the right offset.
+        The actual shift is delegated to `progress_mod.shift_bucket`.
         """
         if on_progress is None:
             return None
+        inner = progress_mod.shift_bucket(emit, base, progress_total)
 
         async def cb(event: progress_mod.ProgressEvent) -> None:
             nonlocal progress_done
             progress_done = base + event.done
-            shifted = event.model_copy(update={"done": progress_done, "total": progress_total})
-            await emit(shifted)
+            assert inner is not None  # shift_bucket only returns None when parent is None
+            await inner(event)
 
         return cb
 
-    round_prompt = prompt
+    # Pre-resolve the arbiter spec so its cost estimate can roll into the
+    # per-round budget check below. The arbiter call is sequential after
+    # fanout — flagship arbiters on 3-5 rounds were the source of the
+    # silent cap overshoot.
+    arbiter_spec = ModelSpec(model=arbiter_alias)
+
+    # Panellist's user turn = just the follow-up question when continuation
+    # is active (the prior is already in `prior_turns`). With no
+    # continuation, `followup_only` equals `prompt` so this is a no-op.
+    round_prompt = followup_only if prior_turns else prompt
     prior_manifest: list[ManifestEntry] | None = None
     for round_num in range(1, max_rounds + 1):
-        # Estimate next-round cost; refuse if it'd blow the cap.
-        # If pricing is unknown for any spec, refuse conservatively past the
-        # first round to avoid an unbounded bill.
-        estimate, est_known = runner.estimate_cost(specs, round_prompt)
+        # Estimate next-round cost (fanout + arbiter); refuse if it'd blow
+        # the cap. The arbiter's prompt isn't known until after fanout, but
+        # token_counter on the round prompt is a reasonable proxy — the
+        # arbiter's input is roughly "round prompt + capsule summaries"
+        # which scales with the prompt size for code-review / long-context
+        # work where the cap actually matters.
+        fanout_est, fanout_known = runner.estimate_cost(specs, round_prompt)
+        arbiter_est, arbiter_known = runner.estimate_cost([arbiter_spec], round_prompt)
+        estimate = fanout_est + arbiter_est
+        est_known = fanout_known and arbiter_known
         if cumulative_cost + estimate > cap:
             partial_reason = (
                 f"would exceed cap: spent ${cumulative_cost:.2f}, next round estimate "
-                f"${estimate:.2f}, cap ${cap:.2f}"
+                f"${estimate:.2f} (fanout ${fanout_est:.2f} + arbiter ${arbiter_est:.2f}), "
+                f"cap ${cap:.2f}"
             )
             break
-        if not est_known and round_num > 1:
+        # Refuse further rounds only when partial pricing AND spend is
+        # already most of the way to the cap. Earlier behaviour was an
+        # asymmetric "round 1 with unknown pricing proceeds, round 2
+        # refuses" which surprised callers with mixed-provider panels
+        # (FRICTION pass #14 saw this on sequence). Conservative threshold
+        # of 80% leaves headroom for one more bounded round.
+        cap_warning_floor = cap * 0.8
+        if not est_known and cumulative_cost > cap_warning_floor:
             partial_reason = (
-                "refusing further rounds: per-model pricing unknown for at least one "
-                f"panellist, can't validate cap (${cumulative_cost:.2f} spent / ${cap:.2f} cap)"
+                f"refusing further rounds: per-model pricing unknown for at least one "
+                f"panellist and spend is past 80% of cap "
+                f"(${cumulative_cost:.2f} spent / ${cap:.2f} cap)"
             )
             break
 
@@ -543,19 +612,47 @@ async def refine(
             blinded=blinded,
             existing_paths=paths,
             on_progress=make_phase_cb(round_base),
+            prior_turns=prior_turns,
         )
+        final_manifest = handle.manifest
+        # Short-circuit when fanout itself is partial. Running the arbiter
+        # on a zero-usable-panel manifest just burns the arbiter's price for
+        # a verdict that can only say "no signal" — and on a cap-exceeded
+        # fanout, it would push the spend further over. Surface the
+        # fanout reason verbatim so the caller knows it wasn't refine that
+        # aborted. Done BEFORE the cost rollup since on cap-exceeded fanout
+        # handle.cost_usd is 0 by construction; rolling up zeros is fine
+        # but the early break avoids the capsule call below.
+        if handle.partial:
+            cumulative_cost += handle.cost_usd
+            if not handle.cost_known:
+                cost_all_known = False
+            partial_reason = (
+                f"round {round_num} fanout partial: {handle.partial_reason}"
+            )
+            break
         handle = await capsule.annotate(
             handle,
             on_progress=make_phase_cb(round_base + panel_n),
             kind=resolved_kind,
         )
-        final_manifest = handle.manifest
+        # Accumulate AFTER capsule.annotate — it mutates handle.cost_usd in
+        # place to add extractor spend. Pre-capsule accumulation silently
+        # dropped the extractor cost (one bug-fix landed in iter1 of the
+        # refine loop). cost_known likewise needs the post-capsule view: an
+        # extractor pricing miss flips handle.cost_known False.
         cumulative_cost += handle.cost_usd
         if not handle.cost_known:
             cost_all_known = False
 
+        # Arbiter sees the follow-up question alone when a continuation is
+        # active. Passing the full `prompt` (which `_apply_continuation`
+        # rewrote to include the entire prior synthesis blob) confuses the
+        # sufficiency-scoring — the arbiter ends up grading the panel against
+        # a multi-page conversation history rather than the actual question.
+        arbiter_question = followup_only if prior_turns else prompt
         verdict = await _ask_arbiter(
-            prompt, round_num, handle.manifest, arbiter_alias, prior_manifest
+            arbiter_question, round_num, handle.manifest, arbiter_alias, prior_manifest
         )
         progress_done = round_base + panel_n * 2 + 1
         await emit(progress_mod.ArbiterScored(
@@ -565,6 +662,13 @@ async def refine(
         verdicts.append(verdict)
         if verdict.cost_usd:
             cumulative_cost += verdict.cost_usd
+        # An arbiter pricing miss must propagate to the top-level cost_known.
+        # Previously only the truthy-cost branch fed into the totals — an
+        # unmapped-price arbiter (verdict.cost_usd=None, cost_known=False)
+        # left cost_all_known wrongly True, breaching the same invariant
+        # that bit the consult success path.
+        if not verdict.cost_known:
+            cost_all_known = False
         paths.arbiter_for(round_num).write_text(verdict.model_dump_json(indent=2))
 
         if not verdict.parsed_ok:
@@ -582,7 +686,14 @@ async def refine(
             break
 
         if round_num < max_rounds:
-            round_prompt = _build_refinement_prompt(prompt, round_num + 1, handle.manifest, verdict)
+            # Refinement prompt's "Original question" = follow-up only when
+            # continuation is active. The prior consultation context lives
+            # in `prior_turns`, not in this user turn — duplicating it
+            # would dilute the model's attention on the actual question.
+            base_q = followup_only if prior_turns else prompt
+            round_prompt = _build_refinement_prompt(
+                base_q, round_num + 1, handle.manifest, verdict
+            )
         # Snapshot for the next round's arbiter position-diff. Updated
         # after the verdict so an aborted round (parse failure above)
         # leaves prior_manifest pointing at the last fully-scored round.
@@ -592,9 +703,13 @@ async def refine(
     if final_manifest:
         progress_done = progress_total - 1
         await emit(progress_mod.SynthStarted(done=progress_done, total=progress_total))
-        text = await synth.synthesise(
+        synth_result = await synth.synthesise(
             paths.run_id, by_model=synth_alias, rubric=rubric
         )
+        text = synth_result.text
+        cumulative_cost += synth_result.cost_usd
+        if not synth_result.cost_known:
+            cost_all_known = False
         progress_done = progress_total
         await emit(progress_mod.SynthCompleted(done=progress_done, total=progress_total))
         # Persist the synthesiser so consult-view can badge it in the

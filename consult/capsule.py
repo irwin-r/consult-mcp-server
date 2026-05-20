@@ -17,7 +17,7 @@ from typing import Any
 
 import litellm
 
-from . import artifacts, context, registry
+from . import artifacts, context, provider_caps, registry
 from .jsonparse import extract_json
 from .progress import CapsuleExtracted, PhaseStarted
 from .runner import ProgressCallback, _append_progress_log
@@ -203,17 +203,11 @@ async def _extract_one(
     # litellm.drop_params silently drops the param and we fall back to the
     # prompt + regex JSON recovery below.
     #
-    # Temperature: most providers want temperature=0.0 for deterministic JSON
-    # extraction. Gemini-3 specifically warns that temperature < 1.0 "can
-    # cause infinite loops, degraded reasoning, and failure on complex tasks"
-    # and recommends omitting the parameter — so for Gemini we leave it
-    # unset and trust the provider default. Detect by substring so the
-    # openrouter-routed Gemini path (`openrouter/google/gemini-...`) is
-    # caught alongside the direct `gemini/...` path.
+    # Temperature: most providers want 0.0 for deterministic JSON extraction.
+    # A handful reject the parameter (Gemini-3 warns it causes infinite
+    # loops; claude-opus-4-7 errors outright). `provider_caps` centralises
+    # the deny list so capsule/synth/arbiter share the same source of truth.
     # Trim overlong bodies to keep the cheap extractor's input bounded.
-    # The extractor only needs structure, not every word — head+tail
-    # truncation preserves the panellist's opening claims and closing
-    # recommendation while dropping bulk from the middle.
     body = context.trim_capsule_body(body)
     prompt = _build_capsule_prompt(body, original_question, kind=kind)
     kwargs: dict[str, Any] = {
@@ -222,8 +216,7 @@ async def _extract_one(
         "max_tokens": _MAX_TOKENS_BY_KIND.get(kind, 800),
         "response_format": capsule_cls,
     }
-    if "gemini" not in extractor_id.lower():
-        kwargs["temperature"] = 0.0
+    provider_caps.apply_temperature(kwargs, extractor_id, 0.0)
     try:
         resp = await asyncio.wait_for(
             litellm.acompletion(**kwargs),

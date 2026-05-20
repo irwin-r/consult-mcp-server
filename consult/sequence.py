@@ -58,6 +58,14 @@ class SequenceResult(BaseModel):
             raise ValueError("SequenceResult.partial=True requires partial_reason")
         if not self.partial and self.partial_reason:
             raise ValueError("SequenceResult.partial=False must not carry a partial_reason")
+        # cost_known must propagate from the per-step view: if any single
+        # step couldn't be priced, the chain's total can't be either. Mirrors
+        # the ManifestEntry/RunResult invariant so the cap-enforcement story
+        # is uniform across tools.
+        if self.cost_known and any(not s.cost_known for s in self.steps):
+            raise ValueError(
+                "SequenceResult.cost_known=True but a step has cost_known=False"
+            )
         return self
 
 
@@ -118,17 +126,20 @@ async def sequence(
                 logger.debug("sequence on_progress failed: %s", e)
 
     def phase_cb(base: int) -> runner.ProgressCallback | None:
-        """Shift a child event's `done`/`total` into the sequence-wide bucket
-        while preserving its identity (PanellistCompleted, CapsuleExtracted).
+        """Shift child events into the sequence-wide monotonic bucket.
+
+        Tracks `progress_done` for subsequent direct `emit()` calls; the
+        shift itself is delegated to `progress_mod.shift_bucket`.
         """
         if on_progress is None:
             return None
+        inner = progress_mod.shift_bucket(emit, base, progress_total)
 
         async def cb(event: progress_mod.ProgressEvent) -> None:
             nonlocal progress_done
             progress_done = base + event.done
-            shifted = event.model_copy(update={"done": progress_done, "total": progress_total})
-            await emit(shifted)
+            assert inner is not None
+            await inner(event)
 
         return cb
 
@@ -181,9 +192,17 @@ async def sequence(
 
         progress_done = step_base + panel_n * 2
         await emit(progress_mod.SynthStarted(done=progress_done, total=progress_total))
-        step_synth = await synth.synthesise(
+        synth_result = await synth.synthesise(
             handle.run_id, by_model=synth_alias, anonymised=blinded, rubric=rubric
         )
+        # Synth spend rolls into the per-step total (and so into the
+        # cumulative cap check on the next step), mirroring the consult and
+        # refine handlers. Previously this was silently dropped.
+        step_cost = handle.cost_usd + synth_result.cost_usd
+        step_cost_known = handle.cost_known and synth_result.cost_known
+        cumulative_cost += synth_result.cost_usd
+        if not synth_result.cost_known:
+            cost_all_known = False
         progress_done = step_base + panel_n * 2 + 1
         await emit(progress_mod.SequenceStepCompleted(
             done=progress_done, total=progress_total, step=i,
@@ -193,13 +212,13 @@ async def sequence(
             SequenceStep(
                 step=i,
                 run_id=handle.run_id,
-                synthesis=step_synth,
-                cost_usd=handle.cost_usd,
-                cost_known=handle.cost_known,
+                synthesis=synth_result.text,
+                cost_usd=step_cost,
+                cost_known=step_cost_known,
                 panel_size=len(handle.manifest),
             )
         )
-        prior_synth = step_synth
+        prior_synth = synth_result.text
 
     wall_ms = int((time.time() - start) * 1000)
     final = steps[-1].synthesis if steps else "(no steps completed — see partial_reason)"
