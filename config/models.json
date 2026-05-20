@@ -1,0 +1,100 @@
+{
+  "$schema": "consult/models",
+  "models": {
+    "claude-opus": {
+      "litellm_id": "anthropic/claude-opus-4-7",
+      "default_budget_tokens": 8000,
+      "default_timeout_s": 240,
+      "provider": "anthropic",
+      "family": "claude"
+    },
+    "claude-sonnet": {
+      "litellm_id": "anthropic/claude-sonnet-4-6",
+      "default_budget_tokens": 8000,
+      "default_timeout_s": 180,
+      "provider": "anthropic",
+      "family": "claude"
+    },
+    "claude-haiku": {
+      "litellm_id": "anthropic/claude-haiku-4-5-20251001",
+      "default_budget_tokens": 4000,
+      "default_timeout_s": 120,
+      "provider": "anthropic",
+      "family": "claude"
+    },
+    "gpt-5-pro": {
+      "litellm_id": "openai/gpt-5.5-pro",
+      "default_budget_tokens": 16000,
+      "default_timeout_s": 300,
+      "provider": "openai",
+      "family": "gpt",
+      "reasoning_effort": "medium"
+    },
+    "gemini-pro": {
+      "litellm_id": "gemini/gemini-3.1-pro-preview",
+      "default_budget_tokens": 16000,
+      "default_timeout_s": 240,
+      "provider": "google",
+      "family": "gemini"
+    },
+    "grok": {
+      "litellm_id": "openrouter/x-ai/grok-4.3",
+      "default_budget_tokens": 12000,
+      "default_timeout_s": 240,
+      "provider": "openrouter",
+      "family": "grok"
+    },
+    "qwen-max": {
+      "litellm_id": "openrouter/qwen/qwen3.6-max-preview",
+      "default_budget_tokens": 12000,
+      "default_timeout_s": 240,
+      "provider": "openrouter",
+      "family": "qwen"
+    },
+    "deepseek": {
+      "litellm_id": "openrouter/deepseek/deepseek-v4-pro",
+      "default_budget_tokens": 12000,
+      "default_timeout_s": 240,
+      "provider": "openrouter",
+      "family": "deepseek"
+    },
+    "kimi": {
+      "litellm_id": "openrouter/moonshotai/kimi-k2.6",
+      "default_budget_tokens": 12000,
+      "default_timeout_s": 240,
+      "provider": "openrouter",
+      "family": "moonshot"
+    },
+    "glm": {
+      "litellm_id": "openrouter/z-ai/glm-5.1",
+      "default_budget_tokens": 12000,
+      "default_timeout_s": 240,
+      "provider": "openrouter",
+      "family": "zhipu"
+    },
+    "mistral": {
+      "litellm_id": "openrouter/mistralai/mistral-medium-3-5",
+      "default_budget_tokens": 8000,
+      "default_timeout_s": 180,
+      "provider": "openrouter",
+      "family": "mistral"
+    },
+    "mimo": {
+      "litellm_id": "openrouter/xiaomi/mimo-v2.5-pro",
+      "default_budget_tokens": 12000,
+      "default_timeout_s": 240,
+      "provider": "openrouter",
+      "family": "xiaomi"
+    }
+  },
+  "tiers": {
+    "quick": ["claude-haiku", "gemini-pro", "grok", "qwen-max", "kimi"],
+    "standard": ["claude-opus", "gpt-5-pro", "gemini-pro", "grok", "qwen-max", "kimi", "glm", "mistral"],
+    "deep": ["claude-opus", "gpt-5-pro", "gemini-pro", "grok", "qwen-max", "kimi", "glm", "mistral", "deepseek", "mimo"]
+  },
+  "defaults": {
+    "synthesiser": "gemini-pro",
+    "capsule_extractor": "claude-haiku",
+    "max_run_usd": 5.0
+  }
+}

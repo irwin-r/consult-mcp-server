@@ -1,0 +1,111 @@
+"""On-disk run layout + MCP resource URI conventions.
+
+Directory tree under ~/.consult/runs/<run_id>/:
+  prompt.txt              # the base prompt sent to every panellist
+  manifest.json           # the full RunHandle serialised
+  registry_snapshot.json  # frozen registry at run time
+  prompts/<slug>.txt      # per-slug prompt (with stance prefix)
+  responses/<slug>.json   # raw provider response (LiteLLM ModelResponse dump)
+  responses/<slug>.txt    # extracted body text (for resource serving)
+  capsules/<slug>.json    # extracted capsule
+
+Resource URI scheme: consult://runs/<id>/responses/<slug>
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import random
+import time
+from dataclasses import dataclass
+from pathlib import Path
+
+
+def runs_root() -> Path:
+    env = os.environ.get("CONSULT_RUNS_DIR")
+    base = Path(os.path.expanduser(env)) if env else Path.home() / ".consult" / "runs"
+    base.mkdir(parents=True, exist_ok=True)
+    return base
+
+
+def new_run_id() -> str:
+    return time.strftime("%Y%m%d-%H%M%S") + f"-{random.randint(1000, 99999)}"
+
+
+@dataclass
+class RunPaths:
+    run_id: str
+    root: Path
+
+    @property
+    def prompts(self) -> Path:
+        return self.root / "prompts"
+
+    @property
+    def responses(self) -> Path:
+        return self.root / "responses"
+
+    @property
+    def capsules(self) -> Path:
+        return self.root / "capsules"
+
+    @property
+    def manifest_json(self) -> Path:
+        return self.root / "manifest.json"
+
+    @property
+    def prompt_txt(self) -> Path:
+        return self.root / "prompt.txt"
+
+    @property
+    def registry_snapshot(self) -> Path:
+        return self.root / "registry_snapshot.json"
+
+    def response_text(self, slug: str) -> Path:
+        return self.responses / f"{slug}.txt"
+
+    def response_raw(self, slug: str) -> Path:
+        return self.responses / f"{slug}.json"
+
+    def prompt_for(self, slug: str) -> Path:
+        return self.prompts / f"{slug}.txt"
+
+    def capsule_for(self, slug: str) -> Path:
+        return self.capsules / f"{slug}.json"
+
+    def resource_uri(self, slug: str) -> str:
+        return f"consult://runs/{self.run_id}/responses/{slug}"
+
+
+def create_run() -> RunPaths:
+    rid = new_run_id()
+    root = runs_root() / rid
+    root.mkdir(parents=True, exist_ok=False)
+    paths = RunPaths(run_id=rid, root=root)
+    paths.prompts.mkdir()
+    paths.responses.mkdir()
+    paths.capsules.mkdir()
+    return paths
+
+
+def load_run(run_id: str) -> RunPaths:
+    root = runs_root() / run_id
+    if not root.exists():
+        raise FileNotFoundError(f"Run not found: {run_id}")
+    return RunPaths(run_id=run_id, root=root)
+
+
+def write_manifest(paths: RunPaths, payload: dict) -> None:
+    paths.manifest_json.write_text(json.dumps(payload, indent=2, default=str))
+
+
+def parse_resource_uri(uri: str) -> tuple[str, str]:
+    """Parse `consult://runs/<id>/responses/<slug>` → (run_id, slug)."""
+    if not uri.startswith("consult://runs/"):
+        raise ValueError(f"Not a consult resource URI: {uri}")
+    rest = uri[len("consult://runs/") :]
+    parts = rest.split("/")
+    if len(parts) != 3 or parts[1] != "responses":
+        raise ValueError(f"Malformed consult URI: {uri}")
+    return parts[0], parts[2]

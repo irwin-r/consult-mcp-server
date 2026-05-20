@@ -1,0 +1,46 @@
+[project]
+name = "consult-mcp-server"
+version = "0.1.0"
+description = "MCP server for multi-model panel orchestration with rich manifest capsules and on-disk artifacts as MCP resources."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "mcp>=1.2.0",
+    "litellm>=1.55.0",
+    "pydantic>=2.6.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.4",
+]
+
+[project.scripts]
+consult-mcp = "consult.__main__:cli"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["consult"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"config/models.json" = "consult/config/models.json"
+"config/stances.json" = "consult/config/stances.json"
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

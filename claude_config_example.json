@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "consult": {
+      "command": "/Users/you/Projects/personal/consult-mcp-server/.venv/bin/consult-mcp",
+      "env": {
+        "ANTHROPIC_API_KEY": "sk-ant-...",
+        "OPENROUTER_API_KEY": "sk-or-...",
+        "GEMINI_API_KEY": "...",
+        "OPENAI_API_KEY": "sk-..."
+      }
+    }
+  }
+}

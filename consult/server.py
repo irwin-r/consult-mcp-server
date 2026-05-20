@@ -1,0 +1,326 @@
+"""MCP server entry point.
+
+Registers three tools — `panel`, `synthesise`, `consult` — and a resource
+handler for `consult://runs/<id>/responses/<slug>` URIs.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+from pathlib import Path
+from typing import Any
+
+import dotenv
+from mcp.server import Server
+from mcp.server.models import InitializationOptions
+from mcp.server.stdio import stdio_server
+from mcp.types import (
+    AnyUrl,
+    Resource,
+    ServerCapabilities,
+    TextContent,
+    Tool,
+)
+
+from . import artifacts, capsule, registry, runner, synth
+from .types import ModelSpec, RunResult
+
+logger = logging.getLogger("consult")
+
+# Load .env from the working directory, the package directory, and the user's home
+for p in (Path.cwd() / ".env", Path(__file__).parent.parent / ".env", Path.home() / ".consult" / ".env"):
+    if p.exists():
+        dotenv.load_dotenv(p, override=False)
+
+server: Server = Server("consult")
+
+
+# ---- Tool schemas -----------------------------------------------------------
+
+_PANEL_SCHEMA = {
+    "type": "object",
+    "required": ["prompt", "models"],
+    "properties": {
+        "prompt": {"type": "string", "description": "The question / task for the panel."},
+        "models": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+                "type": "object",
+                "required": ["model"],
+                "properties": {
+                    "model": {"type": "string", "description": "Registry alias or LiteLLM ID"},
+                    "stance": {
+                        "type": "string",
+                        "description": "Stance key (e.g. 'security') or a literal stance prompt.",
+                    },
+                    "slug": {"type": "string", "description": "Optional explicit slug override."},
+                },
+            },
+            "description": "Panellists. Each entry: {model, stance?, slug?}.",
+        },
+        "blinded": {
+            "type": "boolean",
+            "default": False,
+            "description": "Anonymise slugs to panelist-alpha/beta/... and strip model_id from manifest.",
+        },
+        "attachments": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Absolute file paths to inline into the prompt.",
+        },
+        "dry_run": {
+            "type": "boolean",
+            "default": False,
+            "description": "Estimate cost without calling any model.",
+        },
+        "max_run_usd": {
+            "type": "number",
+            "description": "Per-run cost cap. Defaults to CONSULT_MAX_RUN_USD.",
+        },
+        "extract_capsules": {
+            "type": "boolean",
+            "default": True,
+            "description": "Run the capsule extractor after fanout. Disable for raw output.",
+        },
+    },
+}
+
+_SYNTH_SCHEMA = {
+    "type": "object",
+    "required": ["run_id"],
+    "properties": {
+        "run_id": {"type": "string", "description": "A run_id returned by `panel` or `consult`."},
+        "by_model": {
+            "type": "string",
+            "description": "Synthesiser model (alias or LiteLLM ID). Defaults to gemini-pro.",
+        },
+        "rubric": {"type": "string", "description": "Custom rubric. Defaults to the consensus rubric."},
+        "anonymised": {
+            "type": "boolean",
+            "default": False,
+            "description": "Hide real model IDs from the synthesiser input.",
+        },
+    },
+}
+
+_CONSULT_SCHEMA = {
+    "type": "object",
+    "required": ["prompt"],
+    "properties": {
+        "prompt": {"type": "string"},
+        "tier": {
+            "type": "string",
+            "enum": ["quick", "standard", "deep"],
+            "default": "standard",
+        },
+        "roles": {
+            "type": "object",
+            "additionalProperties": {"type": "string"},
+            "description": "Map model alias → stance key. Defaults to neutral.",
+        },
+        "attachments": {"type": "array", "items": {"type": "string"}},
+        "synthesiser": {"type": "string", "description": "Override synth model."},
+        "blinded": {"type": "boolean", "default": False},
+        "max_run_usd": {"type": "number"},
+    },
+}
+
+
+# ---- Tool listing -----------------------------------------------------------
+
+
+@server.list_tools()
+async def handle_list_tools() -> list[Tool]:
+    return [
+        Tool(
+            name="panel",
+            description=(
+                "Fan a prompt out to multiple models in parallel. Returns a manifest "
+                "with structured capsules (~200 tokens each) and resource URIs for full "
+                "bodies. Use when the parent agent wants to synthesise itself."
+            ),
+            inputSchema=_PANEL_SCHEMA,
+        ),
+        Tool(
+            name="synthesise",
+            description=(
+                "Synthesise an existing run via a flagship model. Reads the run's "
+                "manifest + bodies and returns markdown under a consensus rubric."
+            ),
+            inputSchema=_SYNTH_SCHEMA,
+        ),
+        Tool(
+            name="consult",
+            description=(
+                "Hero tool: parallel panel + server-side synthesis. Returns synthesis "
+                "+ manifest. Use for 'just give me the answer' workflows."
+            ),
+            inputSchema=_CONSULT_SCHEMA,
+        ),
+    ]
+
+
+# ---- Helpers ----------------------------------------------------------------
+
+
+def _inline_attachments(prompt: str, attachments: list[str] | None) -> str:
+    if not attachments:
+        return prompt
+    parts = [prompt, "\n\n--- ATTACHMENTS ---\n"]
+    for path in attachments:
+        try:
+            content = Path(path).read_text()
+            parts.append(f"\n# {path}\n```\n{content}\n```\n")
+        except OSError as e:
+            parts.append(f"\n# {path}\n[ERROR: {e}]\n")
+    return "".join(parts)
+
+
+def _specs_from_args(models_arg: list[dict[str, Any]]) -> list[ModelSpec]:
+    return [ModelSpec(**m) for m in models_arg]
+
+
+def _text_result(payload: dict | str) -> list[TextContent]:
+    if isinstance(payload, str):
+        return [TextContent(type="text", text=payload)]
+    return [TextContent(type="text", text=json.dumps(payload, indent=2, default=str))]
+
+
+# ---- Tool dispatch ----------------------------------------------------------
+
+
+@server.call_tool()
+async def handle_call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
+    if name == "panel":
+        return await _handle_panel(arguments)
+    if name == "synthesise":
+        return await _handle_synth(arguments)
+    if name == "consult":
+        return await _handle_consult(arguments)
+    raise ValueError(f"Unknown tool: {name}")
+
+
+async def _handle_panel(args: dict[str, Any]) -> list[TextContent]:
+    prompt = _inline_attachments(args["prompt"], args.get("attachments"))
+    specs = _specs_from_args(args["models"])
+    handle = await runner.fanout(
+        prompt,
+        specs,
+        blinded=args.get("blinded", False),
+        dry_run=args.get("dry_run", False),
+        max_run_usd=args.get("max_run_usd"),
+    )
+    if args.get("extract_capsules", True) and not handle.partial and handle.manifest:
+        handle = await capsule.annotate(handle)
+    return _text_result(handle.model_dump())
+
+
+async def _handle_synth(args: dict[str, Any]) -> list[TextContent]:
+    text = await synth.synthesise(
+        args["run_id"],
+        by_model=args.get("by_model"),
+        rubric=args.get("rubric"),
+        anonymised=args.get("anonymised", False),
+    )
+    return _text_result(text)
+
+
+async def _handle_consult(args: dict[str, Any]) -> list[TextContent]:
+    prompt = _inline_attachments(args["prompt"], args.get("attachments"))
+    tier = args.get("tier", "standard")
+    tier_models = registry.resolve_tier(tier)
+    roles = args.get("roles") or {}
+    synth_alias = args.get("synthesiser") or registry.default_synthesiser()
+
+    # Exclude the synthesiser from the panel to avoid self-inclusion bias
+    panel_aliases = [m for m in tier_models if m != synth_alias]
+    specs = [ModelSpec(model=m, stance=roles.get(m)) for m in panel_aliases]
+
+    handle = await runner.fanout(
+        prompt,
+        specs,
+        blinded=args.get("blinded", False),
+        max_run_usd=args.get("max_run_usd"),
+    )
+    if handle.partial or not handle.manifest:
+        return _text_result(
+            {"partial": True, "reason": handle.partial_reason, "manifest": []}
+        )
+    handle = await capsule.annotate(handle)
+    synthesis = await synth.synthesise(
+        handle.run_id, by_model=synth_alias, anonymised=args.get("blinded", False)
+    )
+    result = RunResult(
+        run_id=handle.run_id,
+        synthesis=synthesis,
+        manifest=handle.manifest,
+        cost_usd=handle.cost_usd,
+        wall_ms=handle.wall_ms,
+        partial=False,
+    )
+    return _text_result(result.model_dump())
+
+
+# ---- Resources --------------------------------------------------------------
+
+
+@server.list_resources()
+async def handle_list_resources() -> list[Resource]:
+    """List the most recent N runs as resource roots. The parent typically
+    addresses specific responses by URI, but listing helps for discovery.
+    """
+    runs_dir = artifacts.runs_root()
+    out: list[Resource] = []
+    runs = sorted(
+        (p for p in runs_dir.iterdir() if p.is_dir()),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )[:20]
+    for run in runs:
+        responses = run / "responses"
+        if not responses.exists():
+            continue
+        for resp in responses.glob("*.txt"):
+            slug = resp.stem
+            out.append(
+                Resource(
+                    uri=AnyUrl(f"consult://runs/{run.name}/responses/{slug}"),
+                    name=f"{run.name}/{slug}",
+                    mimeType="text/plain",
+                    description=f"Panellist body from run {run.name}",
+                )
+            )
+    return out
+
+
+@server.read_resource()
+async def handle_read_resource(uri: AnyUrl) -> str:
+    run_id, slug = artifacts.parse_resource_uri(str(uri))
+    paths = artifacts.load_run(run_id)
+    body_file = paths.response_text(slug)
+    if not body_file.exists():
+        raise FileNotFoundError(f"Body not found: {uri}")
+    return body_file.read_text()
+
+
+# ---- Main loop --------------------------------------------------------------
+
+
+async def main() -> None:
+    logging.basicConfig(
+        level=os.environ.get("CONSULT_LOG_LEVEL", "INFO"),
+        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+    )
+    async with stdio_server() as (read, write):
+        await server.run(
+            read,
+            write,
+            InitializationOptions(
+                server_name="consult",
+                server_version="0.1.0",
+                capabilities=ServerCapabilities(),
+            ),
+        )
