@@ -6,7 +6,6 @@ resource handler for `consult://runs/<id>/responses/<slug>` URIs.
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 from pathlib import Path
@@ -307,27 +306,25 @@ def _specs_from_args(models_arg: list[dict[str, Any]]) -> list[ModelSpec]:
     return [ModelSpec(**m) for m in models_arg]
 
 
-def _text_result(payload: dict | str) -> list[TextContent]:
-    if isinstance(payload, str):
-        return [TextContent(type="text", text=payload)]
-    return [TextContent(type="text", text=json.dumps(payload, indent=2, default=str))]
-
-
 def _error_result(
     code: errors.ErrorCode,
     message: str,
     run_id: str | None = None,
-) -> list[TextContent]:
+) -> dict[str, Any]:
     """Wrap a failure in the standard `{"ok": false, "error": {...}}` envelope.
 
     Returned by the top-level `handle_call_tool` try/except so every failure
     mode an agent sees has the same shape — they can branch on `error.code`
     instead of regex-matching free-text.
+
+    Returns a `dict` so the MCP SDK populates `structuredContent` alongside
+    the JSON text fallback — clients can branch on `error.code` directly
+    without parsing the text body.
     """
     envelope = errors.ErrorEnvelope(
         error=errors.ConsultError(code=code, message=message, run_id=run_id),
     )
-    return [TextContent(type="text", text=envelope.model_dump_json(indent=2))]
+    return envelope.model_dump()
 
 
 def _progress_callback():
@@ -367,7 +364,9 @@ def _progress_callback():
 
 
 @server.call_tool()
-async def handle_call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
+async def handle_call_tool(
+    name: str, arguments: dict[str, Any]
+) -> dict[str, Any] | list[TextContent]:
     # All failures are funnelled into the structured `ErrorEnvelope` shape so
     # the agent never has to parse free-text. Map known exception types to
     # stable error codes; anything unhandled becomes INTERNAL_ERROR (and we
@@ -407,7 +406,7 @@ async def handle_call_tool(name: str, arguments: dict[str, Any]) -> list[TextCon
         )
 
 
-async def _handle_panel(args: dict[str, Any]) -> list[TextContent]:
+async def _handle_panel(args: dict[str, Any]) -> dict[str, Any]:
     prompt = _inline_attachments(args["prompt"], args.get("attachments"))
     specs = _specs_from_args(args["models"])
     progress_cb = _progress_callback()
@@ -421,20 +420,24 @@ async def _handle_panel(args: dict[str, Any]) -> list[TextContent]:
     )
     if args.get("extract_capsules", True) and not handle.partial and handle.manifest:
         handle = await capsule.annotate(handle, on_progress=progress_cb)
-    return _text_result(handle.model_dump())
+    return handle.model_dump()
 
 
 async def _handle_synth(args: dict[str, Any]) -> list[TextContent]:
+    # Synth's output is a markdown blob — `TextContent` is the natural shape
+    # since a structured-content dict would force clients to unwrap the text
+    # before rendering. (Every other tool returns a dict so MCP also surfaces
+    # `structuredContent` for programmatic callers.)
     text = await synth.synthesise(
         args["run_id"],
         by_model=args.get("by_model"),
         rubric=args.get("rubric"),
         anonymised=args.get("anonymised", False),
     )
-    return _text_result(text)
+    return [TextContent(type="text", text=text)]
 
 
-async def _handle_consult(args: dict[str, Any]) -> list[TextContent]:
+async def _handle_consult(args: dict[str, Any]) -> dict[str, Any]:
     prompt = _inline_attachments(args["prompt"], args.get("attachments"))
     tier = args.get("tier", "standard")
     tier_models = registry.resolve_tier(tier)
@@ -474,9 +477,23 @@ async def _handle_consult(args: dict[str, Any]) -> list[TextContent]:
         on_progress=phase(),
     )
     if handle.partial or not handle.manifest:
-        return _text_result(
-            {"partial": True, "reason": handle.partial_reason, "manifest": []}
+        # Return a real `RunResult` so the partial response has the same shape
+        # as the success path — clients can rely on a single dict schema and
+        # branch on `partial` / `partial_reason` rather than two layouts.
+        partial = RunResult(
+            run_id=handle.run_id,
+            synthesis="",
+            manifest=handle.manifest,
+            cost_usd=handle.cost_usd,
+            cost_known=handle.cost_known,
+            wall_ms=handle.wall_ms,
+            partial=True,
+            partial_reason=(
+                handle.partial_reason or "no panellists returned usable responses"
+            ),
+            synthesiser=synth_alias,
         )
+        return partial.model_dump()
     offset = len(specs)
     handle = await capsule.annotate(handle, on_progress=phase())
     offset = len(specs) * 2
@@ -496,10 +513,10 @@ async def _handle_consult(args: dict[str, Any]) -> list[TextContent]:
         partial=False,
         synthesiser=synth_alias,
     )
-    return _text_result(result.model_dump())
+    return result.model_dump()
 
 
-async def _handle_sequence(args: dict[str, Any]) -> list[TextContent]:
+async def _handle_sequence(args: dict[str, Any]) -> dict[str, Any]:
     # Attachments — if supplied — are inlined into every step's prompt, since
     # a sequence is one logical consultation with shared context. Per-step
     # attachment overrides are a v2 feature.
@@ -515,10 +532,10 @@ async def _handle_sequence(args: dict[str, Any]) -> list[TextContent]:
         max_run_usd=args.get("max_run_usd"),
         on_progress=_progress_callback(),
     )
-    return _text_result(result.model_dump())
+    return result.model_dump()
 
 
-async def _handle_refine(args: dict[str, Any]) -> list[TextContent]:
+async def _handle_refine(args: dict[str, Any]) -> dict[str, Any]:
     prompt = _inline_attachments(args["prompt"], args.get("attachments"))
     specs = _specs_from_args(args["models"])
     result = await refine_mod.refine(
@@ -533,7 +550,7 @@ async def _handle_refine(args: dict[str, Any]) -> list[TextContent]:
         continuation_id=args.get("continuation_id"),
         on_progress=_progress_callback(),
     )
-    return _text_result(result.model_dump())
+    return result.model_dump()
 
 
 # ---- Resources --------------------------------------------------------------

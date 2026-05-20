@@ -17,15 +17,19 @@ import sys
 from datetime import date, datetime
 from pathlib import Path
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from . import artifacts
 
 logger = logging.getLogger(__name__)
 
+_STRICT = ConfigDict(extra="forbid")
+
 
 class LedgerRunEntry(BaseModel):
     """One row in the daily ledger — a single run's summary."""
+
+    model_config = _STRICT
 
     run_id: str
     cost_usd: float = Field(..., ge=0.0)
@@ -40,6 +44,8 @@ class DailyLedger(BaseModel):
     `total_known=False` when at least one run had unknown pricing for some
     panellist — the displayed total is then a lower bound, not the truth.
     """
+
+    model_config = _STRICT
 
     date: date
     total_usd: float = Field(..., ge=0.0)

@@ -15,14 +15,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import re
 import time
-from typing import Any
 
 import litellm
 
 from . import artifacts, capsule, registry, runner, synth
 from . import progress as progress_mod
+from .jsonparse import extract_json
 from .types import (
     ArbiterVerdict,
     ManifestEntry,
@@ -84,26 +83,6 @@ Specifically focus on: {focus}
 
 Now give your refined answer to the original question, addressing the gaps. \
 Be concrete; don't simply restate the prior position."""
-
-_JSON_BLOCK = re.compile(r"\{.*\}", re.S)
-
-
-def _extract_json(text: str) -> dict[str, Any] | None:
-    text = text.strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\n", "", text)
-        text = re.sub(r"\n```$", "", text)
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        m = _JSON_BLOCK.search(text)
-        if m:
-            try:
-                return json.loads(m.group(0))
-            except json.JSONDecodeError:
-                return None
-    return None
-
 
 def _format_capsules(manifest: list[ManifestEntry]) -> str:
     lines = []
@@ -203,7 +182,7 @@ async def _ask_arbiter(
 
     # 3) JSON parse — failure here is real signal (don't pollute gaps with an
     # exception string; the next round's prompt would silently include it)
-    data = _extract_json(text)
+    data = extract_json(text)
     if data is None:
         logger.warning(
             "arbiter returned non-JSON; sample=%r", text[:120].replace("\n", " ")

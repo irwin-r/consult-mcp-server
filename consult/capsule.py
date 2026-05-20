@@ -11,7 +11,6 @@ a failure in one stage doesn't poison the others.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import re
 from typing import Any
@@ -19,6 +18,7 @@ from typing import Any
 import litellm
 
 from . import artifacts, registry
+from .jsonparse import extract_json
 from .progress import CapsuleExtracted
 from .runner import ProgressCallback, _append_progress_log
 from .types import Capsule, ManifestEntry, RunHandle, Status
@@ -50,25 +50,7 @@ Rules:
 PANELLIST RESPONSE:
 """
 
-_JSON_BLOCK = re.compile(r"\{.*\}", re.S)
 _CONFIDENCE = re.compile(r"^\s*CONFIDENCE\s*:\s*([0-9.]+)", re.M | re.I)
-
-
-def _extract_json(text: str) -> dict[str, Any] | None:
-    text = text.strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\n", "", text)
-        text = re.sub(r"\n```$", "", text)
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        m = _JSON_BLOCK.search(text)
-        if m:
-            try:
-                return json.loads(m.group(0))
-            except json.JSONDecodeError:
-                return None
-        return None
 
 
 async def _extract_one(
@@ -123,7 +105,7 @@ async def _extract_one(
     # 2) Capsule build — failures here are JSON shape or Pydantic validation
     try:
         text = resp.choices[0].message.content or ""
-        data = _extract_json(text) or {}
+        data = extract_json(text) or {}
         if data.get("confidence") in (None, "null"):
             m = _CONFIDENCE.search(body)
             if m:

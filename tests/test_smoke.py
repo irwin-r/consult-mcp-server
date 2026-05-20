@@ -395,6 +395,10 @@ def test_error_envelope_shape_round_trips():
 async def test_handle_call_tool_wraps_value_error_in_envelope(monkeypatch):
     """A handler raising ValueError must surface as `invalid_input` envelope,
     not as a raw exception bubbling out of the MCP dispatch.
+
+    The envelope is returned as a `dict` so the MCP SDK populates
+    `structuredContent` on the wire — agents can branch on `error.code`
+    without re-parsing the text body.
     """
     from consult import server as server_mod
 
@@ -403,9 +407,8 @@ async def test_handle_call_tool_wraps_value_error_in_envelope(monkeypatch):
 
     monkeypatch.setattr(server_mod, "_handle_refine", bad_handler)
 
-    result = await server_mod.handle_call_tool("refine", {"prompt": "x", "models": []})
-    assert len(result) == 1
-    payload = json.loads(result[0].text)
+    payload = await server_mod.handle_call_tool("refine", {"prompt": "x", "models": []})
+    assert isinstance(payload, dict)
     assert payload["ok"] is False
     assert payload["error"]["code"] == "invalid_input"
     assert "max_rounds" in payload["error"]["message"]
@@ -423,8 +426,7 @@ async def test_handle_call_tool_wraps_key_error_as_unknown_model(monkeypatch):
         raise KeyError("Unknown model: bogus-alias")
 
     monkeypatch.setattr(server_mod, "_handle_synth", bad_handler)
-    result = await server_mod.handle_call_tool("synthesise", {"run_id": "x"})
-    payload = json.loads(result[0].text)
+    payload = await server_mod.handle_call_tool("synthesise", {"run_id": "x"})
     assert payload["ok"] is False
     assert payload["error"]["code"] == "unknown_model"
 
@@ -438,8 +440,7 @@ async def test_handle_call_tool_wraps_file_not_found_as_run_not_found(monkeypatc
         raise FileNotFoundError("Run not found: 20260520-foo")
 
     monkeypatch.setattr(server_mod, "_handle_synth", bad_handler)
-    result = await server_mod.handle_call_tool("synthesise", {"run_id": "20260520-foo"})
-    payload = json.loads(result[0].text)
+    payload = await server_mod.handle_call_tool("synthesise", {"run_id": "20260520-foo"})
     assert payload["error"]["code"] == "run_not_found"
 
 
@@ -450,8 +451,7 @@ async def test_handle_call_tool_unknown_tool_returns_envelope():
     """
     from consult import server as server_mod
 
-    result = await server_mod.handle_call_tool("not-a-tool", {})
-    payload = json.loads(result[0].text)
+    payload = await server_mod.handle_call_tool("not-a-tool", {})
     assert payload["ok"] is False
     assert payload["error"]["code"] == "invalid_input"
     assert "not-a-tool" in payload["error"]["message"]
@@ -468,10 +468,28 @@ async def test_handle_call_tool_unhandled_exception_becomes_internal_error(monke
         raise RuntimeError("kaboom")
 
     monkeypatch.setattr(server_mod, "_handle_panel", bad_handler)
-    result = await server_mod.handle_call_tool("panel", {"prompt": "x", "models": []})
-    payload = json.loads(result[0].text)
+    payload = await server_mod.handle_call_tool("panel", {"prompt": "x", "models": []})
     assert payload["error"]["code"] == "internal_error"
     assert "kaboom" in payload["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_handle_call_tool_success_path_returns_dict(monkeypatch):
+    """The success path must return a `dict` so the MCP SDK populates
+    `structuredContent` on the response. Returning `list[TextContent]` would
+    leave clients with only the JSON-text-blob fallback.
+    """
+    from consult import server as server_mod
+
+    sentinel = {"run_id": "20260520-stub", "synthesis": "ok", "manifest": []}
+
+    async def fake_handler(args):
+        return sentinel
+
+    monkeypatch.setattr(server_mod, "_handle_consult", fake_handler)
+    result = await server_mod.handle_call_tool("consult", {"prompt": "x"})
+    assert result is sentinel
+    assert isinstance(result, dict)
 
 
 def test_progress_event_round_trips_through_json():

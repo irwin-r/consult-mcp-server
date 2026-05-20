@@ -5,7 +5,16 @@ from __future__ import annotations
 from enum import StrEnum
 from math import ceil
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+# Forbid unknown fields by default. Pydantic v2's default `extra="ignore"`
+# silently drops kwargs that don't match a field — the same mechanism that
+# caused the original `RefineResult` silent-drop incident where `partial`,
+# `partial_reason`, and `wall_ms` were quietly discarded. Forbidding extras
+# turns any future field-mismatch into a loud ValidationError at the call
+# site. Set per-class (not via a shared base) to keep types.py self-contained
+# and avoid surprising inheritance interactions with downstream validators.
+_STRICT = ConfigDict(extra="forbid")
 
 
 class Status(StrEnum):
@@ -24,6 +33,8 @@ class Status(StrEnum):
 class ModelSpec(BaseModel):
     """One panellist slot. Either `model` alone, or with a stance."""
 
+    model_config = _STRICT
+
     model: str = Field(..., description="Registry alias (e.g. 'gpt-pro') or LiteLLM ID")
     stance: str | None = Field(None, description="Stance key from stances.json or a custom prompt")
     slug: str | None = Field(
@@ -37,6 +48,8 @@ class Capsule(BaseModel):
     Designed so the parent agent can synthesise from the manifest alone in
     most cases, only reading full bodies when it needs depth.
     """
+
+    model_config = _STRICT
 
     position: str = Field("", description="One-line summary of stance/conclusion")
     recommendation: str = Field("", description="What the panellist recommends")
@@ -59,6 +72,8 @@ class ManifestEntry(BaseModel):
     - `cost_known=False` distinguishes "we couldn't look up the price" from
       a true zero cost (matters for the `max_run_usd` cap math in refine).
     """
+
+    model_config = _STRICT
 
     slug: str
     model_id: str | None = Field(
@@ -89,6 +104,8 @@ class ManifestEntry(BaseModel):
 
 class RunHandle(BaseModel):
     """Returned by `panel`. Manifest-only — no raw bodies inlined."""
+
+    model_config = _STRICT
 
     run_id: str
     artifacts_dir: str
@@ -138,6 +155,8 @@ class RunHandle(BaseModel):
 class RunResult(BaseModel):
     """Returned by `consult` (the hero tool). Includes the synthesis."""
 
+    model_config = _STRICT
+
     run_id: str
     synthesis: str
     manifest: list[ManifestEntry]
@@ -145,11 +164,20 @@ class RunResult(BaseModel):
     cost_known: bool = True
     wall_ms: int = Field(..., ge=0)
     partial: bool = False
+    partial_reason: str | None = None
     # Surfaced so the caller can tell why the panel size is `tier_size - 1`
     # when the chosen synthesiser is itself a member of the requested tier
     # (the synthesiser is excluded from the panel to avoid self-inclusion
     # bias). Without this, panel-shrinkage is invisible in the response.
     synthesiser: str | None = None
+
+    @model_validator(mode="after")
+    def _validate_partial(self) -> RunResult:
+        if self.partial and not self.partial_reason:
+            raise ValueError("RunResult.partial=True requires partial_reason")
+        if not self.partial and self.partial_reason:
+            raise ValueError("RunResult.partial=False must not carry a partial_reason")
+        return self
 
 
 class ArbiterVerdict(BaseModel):
@@ -163,6 +191,8 @@ class ArbiterVerdict(BaseModel):
     callers must not feed `gaps` into a follow-up prompt in that case (the
     "gaps" carry an exception message, not a real arbiter finding).
     """
+
+    model_config = _STRICT
 
     round: int
     score: float = Field(..., ge=0.0, le=1.0)
@@ -182,6 +212,8 @@ class RefineResult(BaseModel):
     Per-round transcripts live as MCP resources at
     consult://runs/<id>/responses/<slug>.r<n>
     """
+
+    model_config = _STRICT
 
     run_id: str
     rounds_completed: int = Field(..., ge=0)
@@ -207,6 +239,3 @@ class RefineResult(BaseModel):
         if not self.partial and self.partial_reason:
             raise ValueError("RefineResult.partial=False must not carry a partial_reason")
         return self
-    wall_ms: int = Field(..., ge=0)
-    partial: bool = False
-    partial_reason: str | None = None

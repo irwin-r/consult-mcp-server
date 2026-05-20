@@ -21,11 +21,16 @@ from __future__ import annotations
 
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class _BaseProgressEvent(BaseModel):
     """Common shape: every event carries the monotonic `(done, total)` pair."""
+
+    # Forbid extras so a typo in an event-emitter kwarg fails loudly rather
+    # than silently dropping the value (see types._STRICT for the same
+    # rationale; this base class propagates the policy to every event kind).
+    model_config = ConfigDict(extra="forbid")
 
     done: int = Field(..., ge=0)
     total: int = Field(..., ge=0)

@@ -15,17 +15,21 @@ from __future__ import annotations
 import logging
 import time
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from . import capsule, registry, runner, synth
 from . import progress as progress_mod
 from .types import ModelSpec
+
+_STRICT = ConfigDict(extra="forbid")
 
 logger = logging.getLogger(__name__)
 
 
 class SequenceStep(BaseModel):
     """One step in a sequence — its run_id, prompt-as-sent, and synth."""
+
+    model_config = _STRICT
 
     step: int = Field(..., ge=1)
     run_id: str
@@ -37,6 +41,8 @@ class SequenceStep(BaseModel):
 
 class SequenceResult(BaseModel):
     """Aggregate result of a sequence run."""
+
+    model_config = _STRICT
 
     steps: list[SequenceStep] = Field(default_factory=list)
     final_synthesis: str
@@ -79,6 +85,10 @@ async def sequence(
         raise ValueError("sequence requires at least one prompt")
     if not specs:
         raise ValueError("sequence requires at least one model spec")
+
+    # Resolve `model:N` sugar up front so per-step `estimate_cost` and
+    # `panel_n` (used for progress bucketing) see the real expanded panel.
+    specs = runner.expand_specs(specs)
 
     synth_alias = synthesiser or registry.default_synthesiser()
     cap = max_run_usd if max_run_usd is not None else registry.default_max_run_usd()
