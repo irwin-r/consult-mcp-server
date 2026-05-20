@@ -374,6 +374,68 @@ def test_run_handle_validates_partial_coupling():
         RunHandle(**base, partial=False, partial_reason="oops")  # reason without partial
 
 
+def test_daily_ledger_aggregates_costs_status_and_panel_size(tmp_path, monkeypatch):
+    """Daily ledger reads every run dir whose ID starts with YYYYMMDD,
+    aggregates cost + cost_known, and records per-status counts. Malformed
+    or missing manifests are skipped without aborting the scan.
+    """
+    from datetime import date as date_cls
+
+    from consult import ledger
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+
+    # Two real runs on the target date, one on a different date, plus a
+    # malformed-manifest run that should be skipped without crashing.
+    def make_run(rid: str, cost: float, cost_known: bool, statuses: list[str]):
+        d = tmp_path / rid
+        d.mkdir()
+        manifest = {
+            "run_id": rid,
+            "cost_usd": cost,
+            "cost_known": cost_known,
+            "manifest": [{"status": s} for s in statuses],
+        }
+        (d / "manifest.json").write_text(json.dumps(manifest))
+
+    make_run("20260101-100000-1", 0.40, True, ["OK", "OK", "RATE_LIMITED"])
+    make_run("20260101-110000-2", 0.15, False, ["OK"])
+    make_run("20260102-100000-3", 99.0, True, ["OK"])  # different day, ignored
+
+    # Malformed manifest — bytes that aren't JSON
+    bad = tmp_path / "20260101-120000-9"
+    bad.mkdir()
+    (bad / "manifest.json").write_text("{this is not json")
+
+    # Bare directory with no manifest at all — also skipped
+    (tmp_path / "20260101-130000-9").mkdir()
+
+    led = ledger.daily_ledger(date_cls(2026, 1, 1))
+    assert led.date == date_cls(2026, 1, 1)
+    assert len(led.runs) == 2  # malformed + manifest-less skipped, other day excluded
+    assert led.total_usd == pytest.approx(0.55)
+    assert led.total_known is False  # one of the two had cost_known=False
+
+    by_id = {r.run_id: r for r in led.runs}
+    assert by_id["20260101-100000-1"].status_counts == {"OK": 2, "RATE_LIMITED": 1}
+    assert by_id["20260101-100000-1"].panel_size == 3
+    assert by_id["20260101-110000-2"].panel_size == 1
+
+
+def test_daily_ledger_empty_day_returns_zero(tmp_path, monkeypatch):
+    """A day with no runs must return a well-formed empty ledger (not raise),
+    and total_known=True since there's nothing unknown about $0."""
+    from datetime import date as date_cls
+
+    from consult import ledger
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    led = ledger.daily_ledger(date_cls(2030, 6, 15))
+    assert led.runs == []
+    assert led.total_usd == 0.0
+    assert led.total_known is True
+
+
 def test_refine_result_validates_partial_coupling_and_surfaces_reason():
     """RefineResult must (a) enforce partial⇔partial_reason coupling and
     (b) actually accept partial_reason at all — previously the field didn't
