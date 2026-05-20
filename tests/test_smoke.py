@@ -4077,6 +4077,90 @@ async def test_sequence_partial_fanout_rolls_cost_into_total(tmp_path, monkeypat
     assert result.cost_known is False
 
 
+async def test_capsule_extractor_out_of_range_confidence_doesnt_crash(tmp_path, monkeypatch):
+    """A panellist body with `CONFIDENCE: 75.0` (model wrote percent instead
+    of fraction) must NOT propagate a Pydantic validation error out of
+    `_extract_one`. Pre-fix this crashed an entire refine run because
+    `capsule.annotate`'s `asyncio.gather` had no `return_exceptions=True`.
+    """
+    import litellm
+
+    from consult import capsule as capsule_mod
+
+    async def fake_acompletion(**kwargs):
+        # Return malformed JSON (out-of-range confidence) so the JSON-build
+        # path takes the except branch, then the body-fallback would also
+        # hit the same out-of-range value.
+        class Resp:
+            class _Choice:
+                class _Msg:
+                    content = '{"kind":"decision","confidence":75.0}'
+                message = _Msg()
+                finish_reason = "stop"
+            choices = [_Choice()]
+            usage = None
+        return Resp()
+
+    monkeypatch.setattr(litellm, "acompletion", fake_acompletion)
+    monkeypatch.setattr(litellm, "completion_cost", lambda **kwargs: 0.0)
+    body = "stuff stuff\n\nCONFIDENCE: 75.0\nKEY_REASON: whatever"
+    # Decision kind — confidence is ge=0 le=1 in Capsule.
+    cap, cost, cost_known = await capsule_mod._extract_one(
+        body, extractor_id="anthropic/claude-haiku-test", timeout=30,
+        kind="decision",
+    )
+    # Did not crash. Out-of-range body confidence was discarded.
+    assert cap.confidence is None
+
+
+async def test_capsule_annotate_isolates_per_slug_failure(tmp_path, monkeypatch):
+    """A single panellist's capsule extraction crash must not abort the
+    whole panel — annotate's per-slug wrapper now swallows unexpected
+    failures and returns an empty capsule for that slug.
+    """
+    from consult import capsule as capsule_mod
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    paths = artifacts.create_run()
+    paths.prompt_txt.write_text("q")
+
+    manifest = []
+    for slug, body in [("good", "Real answer.\nCONFIDENCE: 0.7"), ("bad", "boom")]:
+        paths.response_text(slug).write_text(body)
+        manifest.append(
+            ManifestEntry(
+                slug=slug, model_id="m/x", status=Status.OK,
+                resource_uri=paths.resource_uri(slug),
+                body_path=str(paths.response_text(slug)),
+                latency_ms=0, cost_usd=0.0, cost_known=True,
+                confidence=None, capsule=None,
+            )
+        )
+    handle = RunHandle(
+        run_id=paths.run_id, artifacts_dir=str(paths.root),
+        manifest=manifest, cost_usd=0.0, cost_known=True, wall_ms=0,
+    )
+    artifacts.write_manifest(paths, handle.model_dump())
+
+    call_count = {"i": 0}
+
+    async def fake_extract_one(body, extractor_id, timeout, original_question=None, *, kind="decision"):
+        call_count["i"] += 1
+        if call_count["i"] == 2:
+            # Simulate an extractor crash on the second slug.
+            raise RuntimeError("explosion")
+        return Capsule(position="ok"), 0.0, True
+
+    monkeypatch.setattr(capsule_mod, "_extract_one", fake_extract_one)
+
+    annotated = await capsule_mod.annotate(handle, kind="decision")
+    # No exception propagated. Both slugs annotated; "bad" got an empty capsule.
+    assert annotated.manifest[0].capsule is not None
+    assert annotated.manifest[1].capsule is not None
+    # Second entry's capsule is the empty fallback (no position set).
+    assert annotated.manifest[1].capsule.position == ""
+
+
 def test_missing_default_rubric_raises_runtime_not_filenotfound(tmp_path, monkeypatch):
     """A missing `consensus.md` (broken install) must NOT raise
     FileNotFoundError — that exception class is reserved for run-not-found

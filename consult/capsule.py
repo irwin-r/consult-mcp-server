@@ -171,6 +171,28 @@ def _build_capsule_prompt(
 _CONFIDENCE = re.compile(r"^\s*CONFIDENCE\s*:\s*([0-9.]+)", re.M | re.I)
 
 
+def _body_confidence(body: str) -> float | None:
+    """Extract a CONFIDENCE: value from the body, clamped to [0.0, 1.0].
+
+    The body-level CONFIDENCE footer is documented as 0.0-1.0, but models
+    sometimes emit "75" or "0.85.5" (instructions ignored / typo / decimal
+    drift). Out-of-range or unparseable values must NOT propagate as
+    Pydantic validation errors out of `_extract_one`'s fallback paths —
+    that was what crashed an entire refine run (asyncio.gather without
+    return_exceptions). Return None for anything unusable.
+    """
+    m = _CONFIDENCE.search(body)
+    if not m:
+        return None
+    try:
+        v = float(m.group(1))
+    except ValueError:
+        return None
+    if not (0.0 <= v <= 1.0):
+        return None
+    return v
+
+
 async def _extract_one(
     body: str,
     extractor_id: str,
@@ -226,18 +248,17 @@ async def _extract_one(
         logger.warning(
             "capsule extractor call failed for extractor=%s: %s", extractor_id, e
         )
-        m = _CONFIDENCE.search(body)
-        conf = float(m.group(1)) if m else None
-        return capsule_cls(confidence=conf), None, False
+        return capsule_cls(confidence=_body_confidence(body)), None, False
 
     # 2) Capsule build — failures here are JSON shape or Pydantic validation
     try:
         text = resp.choices[0].message.content or ""
         data = extract_json(text) or {}
+        # Trust the body fallback over an absent/null confidence in JSON.
         if data.get("confidence") in (None, "null"):
-            m = _CONFIDENCE.search(body)
-            if m:
-                data["confidence"] = float(m.group(1))
+            body_conf = _body_confidence(body)
+            if body_conf is not None:
+                data["confidence"] = body_conf
         # Filter to known fields so an extractor adding an extra key doesn't
         # break the strict (`extra="forbid"`) Pydantic model.
         capsule = capsule_cls(
@@ -245,9 +266,18 @@ async def _extract_one(
         )
     except Exception as e:
         logger.warning("capsule JSON build failed for extractor=%s: %s", extractor_id, e)
-        m = _CONFIDENCE.search(body)
-        conf = float(m.group(1)) if m else None
-        capsule = capsule_cls(confidence=conf)
+        # Pydantic validation on the body-fallback path must NOT propagate:
+        # `annotate`'s `asyncio.gather` doesn't pass `return_exceptions=True`,
+        # so a confidence-out-of-range or any other build failure here would
+        # tear down the whole panel's capsule pass and any tool that wraps it.
+        try:
+            capsule = capsule_cls(confidence=_body_confidence(body))
+        except Exception as ce:
+            logger.warning(
+                "capsule fallback construction failed for extractor=%s: %s "
+                "(returning empty capsule)", extractor_id, ce,
+            )
+            capsule = capsule_cls()
 
     # 3) Cost lookup — never let a pricing miss discard a successful capsule
     try:
@@ -321,7 +351,20 @@ async def annotate(
 
     async def _run(body: str, slug: str) -> tuple[AnyCapsule, float | None, bool]:
         nonlocal done
-        result = await _extract_one(body, ext_id, timeout, original_question, kind=kind)
+        try:
+            result = await _extract_one(body, ext_id, timeout, original_question, kind=kind)
+        except Exception as e:  # noqa: BLE001
+            # `_extract_one` already swallows the documented failure modes
+            # (extractor call, JSON build, Pydantic validation), but a path
+            # we haven't anticipated must not poison the whole panel — the
+            # capsule pass is a best-effort enrichment on top of bodies
+            # the panellists already produced.
+            logger.warning(
+                "capsule extraction crashed for slug=%s: %s "
+                "(returning empty capsule)", slug, e,
+            )
+            cls = _RESPONSE_FORMAT_BY_KIND.get(kind, Capsule)
+            result = (cls(), None, False)
         done += 1
         event = CapsuleExtracted(done=done, total=total, slug=slug)
         _append_progress_log(paths.root, event)
