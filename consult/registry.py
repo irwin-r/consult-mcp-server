@@ -46,16 +46,38 @@ def resolve_model(alias_or_id: str) -> dict[str, Any]:
         entry = dict(models[alias_or_id])
         entry["alias"] = alias_or_id
         return entry
-    # Allow raw LiteLLM IDs like "openrouter/x-ai/grok-4.3" — synthesise a row
+    # Allow raw LiteLLM IDs like "openrouter/x-ai/grok-4.3" — synthesise a row.
     if "/" in alias_or_id or alias_or_id.startswith(("gpt-", "claude-", "gemini-")):
         return {
             "alias": alias_or_id,
             "litellm_id": alias_or_id,
             "default_budget_tokens": 8000,
             "default_timeout_s": 180,
-            "provider": alias_or_id.split("/")[0] if "/" in alias_or_id else "openai",
+            "provider": _infer_provider(alias_or_id),
         }
     raise KeyError(f"Unknown model: {alias_or_id}")
+
+
+def _infer_provider(litellm_id: str) -> str:
+    """Best-effort provider inference for raw IDs without an explicit prefix.
+
+    `litellm_id` with a `/` uses the leading segment as the provider —
+    matches LiteLLM's own routing. For bare names like
+    `claude-3-5-sonnet-latest` (allowed because LiteLLM accepts them as
+    Anthropic shortcuts), defaulting to "openai" wrongly puts the call
+    into the OpenAI rate-limit bucket and disables Anthropic cache_control
+    handling. Map a few known prefixes; fall back to openai only when
+    nothing matches (preserves the prior behaviour for the OpenAI shortcuts).
+    """
+    if "/" in litellm_id:
+        return litellm_id.split("/")[0]
+    if litellm_id.startswith("claude-"):
+        return "anthropic"
+    if litellm_id.startswith("gemini-"):
+        return "google"
+    if litellm_id.startswith(("gpt-", "o1-", "o3-")):
+        return "openai"
+    return "openai"
 
 
 def resolve_tier(tier: str) -> list[str]:

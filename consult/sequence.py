@@ -37,6 +37,10 @@ class SequenceStep(BaseModel):
     cost_usd: float = Field(..., ge=0.0)
     cost_known: bool = True
     panel_size: int = Field(..., ge=0)
+    # No per-step invariant validator: `cost_usd` is a non-None `float`, so
+    # the `cost_usd=None ⇒ cost_known=False` rule from ManifestEntry doesn't
+    # apply. The cross-step "if any step is unknown, the chain is unknown"
+    # check lives on SequenceResult.
 
 
 class SequenceResult(BaseModel):
@@ -151,7 +155,7 @@ async def sequence(
         step_base = (i - 1) * (panel_n * 2 + 1)
         full_prompt = _step_prompt(i, total, prior_synth, body)
 
-        estimate, est_known = runner.estimate_cost(specs, full_prompt)
+        estimate, est_known = await runner.aestimate_cost(specs, full_prompt)
         if cumulative_cost + estimate > cap:
             partial_reason = (
                 f"would exceed cap: spent ${cumulative_cost:.2f}, step {i} estimate "
@@ -214,10 +218,31 @@ async def sequence(
         cumulative_cost += synth_result.cost_usd
         if not synth_result.cost_known:
             cost_all_known = False
+        # A non-OK synth means the body is a "# Synthesis unavailable" /
+        # "# Synthesis empty" sentinel. Feeding that into the next step as
+        # `prior_synth` would make the panel hallucinate continuity from a
+        # failure marker — short-circuit here so the partial reason is the
+        # real cause, not a downstream mystery.
+        if synth_result.status is not synth.SynthStatus.OK:
+            partial_reason = (
+                f"step {i} synth status={synth_result.status.value}; "
+                "stopping chain rather than feeding a sentinel into the next step"
+            )
+            break
         progress_done = step_base + panel_n * 2 + 1
         await emit(progress_mod.SequenceStepCompleted(
             done=progress_done, total=progress_total, step=i,
         ))
+        # Persist the per-step total (synthesiser badge + true cost) on disk.
+        # Each step is its own run_id; without this `consult-ledger` reads
+        # the fanout-only cost and silently understates by capsule + synth.
+        from . import artifacts
+        artifacts.augment_manifest(
+            artifacts.load_run(handle.run_id),
+            synthesiser=synth_alias,
+            cost_usd=step_cost,
+            cost_known=step_cost_known,
+        )
 
         steps.append(
             SequenceStep(

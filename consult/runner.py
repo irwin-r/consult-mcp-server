@@ -202,7 +202,17 @@ _RETRY_BASE_DELAY_S = 2.0
 # (asyncio.Semaphore is bound to the loop that created it; a stale semaphore
 # from a torn-down loop would silently no-op). Lazily populated on first
 # `_get_provider_sems()` call in a given loop.
-_provider_sems_by_loop: dict[asyncio.AbstractEventLoop, dict[str, asyncio.Semaphore]] = {}
+#
+# WeakKeyDictionary: test harnesses and notebook kernels routinely create and
+# tear down event loops. With a regular dict, each new loop would add a
+# permanent entry (loop ref + semaphores) that's never collected — a slow
+# memory leak proportional to test/run count. WeakKeyDictionary drops the
+# entry as soon as the loop is garbage-collected.
+import weakref  # noqa: E402
+
+_provider_sems_by_loop: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop, dict[str, asyncio.Semaphore]
+] = weakref.WeakKeyDictionary()
 
 
 def _get_provider_sems() -> dict[str, asyncio.Semaphore]:
@@ -329,6 +339,10 @@ def _build_messages(
 
 
 def _make_slug(spec: ModelSpec, idx: int, blinded: bool) -> str:
+    """Single-spec slug derivation. Prefer `_make_slugs` for whole panels;
+    this exists for backwards-compat and is used by tests that construct
+    one entry at a time.
+    """
     if blinded:
         # alpha, beta, gamma, delta, epsilon, zeta, eta, theta, iota, kappa, lambda, mu
         greek = [
@@ -362,6 +376,31 @@ def _make_slug(spec: ModelSpec, idx: int, blinded: bool) -> str:
     # OpenRouter); sanitise so a valid model never crashes the path build.
     base = _sanitise_derived_slug(spec.model.split("/")[-1].lower())
     return f"{base}-{idx}" if idx > 0 else base
+
+
+def _make_slugs(specs: list[ModelSpec], blinded: bool) -> list[str]:
+    """Compute slugs for a whole panel with per-base disambiguation.
+
+    Single-instance models get the bare base name. Only repeats of the
+    same base get a `-N` index suffix, so `[claude-opus, gpt-pro]` yields
+    `["claude-opus", "gpt-pro"]` instead of the previous global-index
+    `["claude-opus", "gpt-pro-1"]` (unearned suffix on the only gpt-pro).
+
+    The refine `.r<n>` round suffix and the blinded greek-letter slug
+    flow still go through `_make_slug` per spec — only the non-blinded
+    bare-model path needs panel-level awareness.
+    """
+    out: list[str] = []
+    seen: dict[str, int] = {}
+    for i, spec in enumerate(specs):
+        if blinded or spec.slug:
+            out.append(_make_slug(spec, i, blinded))
+            continue
+        base = _sanitise_derived_slug(spec.model.split("/")[-1].lower())
+        count = seen.get(base, 0)
+        out.append(f"{base}-{count}" if count else base)
+        seen[base] = count + 1
+    return out
 
 
 _STREAM_PARTIAL_INTERVAL_S_DEFAULT = 1.0
@@ -626,6 +665,19 @@ async def _call_one(
     )
 
 
+async def aestimate_cost(specs: list[ModelSpec], prompt: str) -> tuple[float, bool]:
+    """Async wrapper around `estimate_cost`.
+
+    `litellm.token_counter` is blocking and on a cache miss takes 50-200ms
+    while it loads the tokenizer; large panels with new aliases can stall
+    heartbeat ticks for noticeable real-time. Offloading to a thread keeps
+    the event loop responsive. Test monkeypatches still bind to the sync
+    `estimate_cost` symbol — this wrapper picks up whatever's currently
+    bound there, so test setup is unchanged.
+    """
+    return await asyncio.to_thread(estimate_cost, specs, prompt)
+
+
 def estimate_cost(specs: list[ModelSpec], prompt: str) -> tuple[float, bool]:
     """Returns (total_estimate, all_known).
 
@@ -637,6 +689,10 @@ def estimate_cost(specs: list[ModelSpec], prompt: str) -> tuple[float, bool]:
     Unknown-alias specs are treated as cost-unknown (rather than raising) so
     a single typo can't abort the panel here; `_call_one` surfaces the alias
     as a per-spec Status.ERROR.
+
+    Sync by design so tests can monkeypatch it with a plain lambda; the
+    async fan-out paths call `aestimate_cost()` to keep the event loop
+    free during the blocking `token_counter` lookup.
     """
     total = 0.0
     all_known = True
@@ -734,7 +790,7 @@ async def fanout(
     cost_input = prompt
     if prior_turns:
         cost_input = _concat_turn_text(prior_turns) + "\n" + prompt
-    estimate, all_known = estimate_cost(specs, cost_input)
+    estimate, all_known = await aestimate_cost(specs, cost_input)
     cap = max_run_usd if max_run_usd is not None else registry.default_max_run_usd()
     # Don't clobber an existing manifest with the empty-manifest early-return
     # payload. Refine drives multiple rounds through the same `paths`; an
@@ -784,7 +840,7 @@ async def fanout(
         return handle
 
     # Build slugs + prompts
-    slugs = [_make_slug(s, i, blinded) for i, s in enumerate(specs)]
+    slugs = _make_slugs(specs, blinded)
     # Duplicate slugs ⇒ multiple panellists racing to write to the same
     # `responses/<slug>.txt`; the second writer silently overwrites the
     # first. `expand_specs` fixes the model:N case but a caller passing

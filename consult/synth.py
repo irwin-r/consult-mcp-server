@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Any
 
 import litellm
@@ -22,20 +23,46 @@ from .types import Status
 logger = logging.getLogger(__name__)
 
 
+class SynthStatus(StrEnum):
+    """Outcome category for a `synth.synthesise` call.
+
+    Callers (`sequence`, refine continuation) need to distinguish a real
+    synthesised answer from one of the three sentinel paths — feeding
+    "# Synthesis unavailable" verbatim into the next step's prompt as
+    "prior synthesis" makes the panel hallucinate continuity that doesn't
+    exist. With a status enum the caller can short-circuit cleanly.
+    """
+
+    OK = "OK"
+    """The synthesiser returned real content."""
+
+    SKIPPED_EMPTY = "SKIPPED_EMPTY"
+    """Zero usable bodies — no synth call was made (no cost)."""
+
+    FAILED = "FAILED"
+    """The synthesiser call raised — sentinel text was written instead."""
+
+    EMPTY = "EMPTY"
+    """The synthesiser returned no content — sentinel text was written."""
+
+
 @dataclass(frozen=True)
 class SynthResult:
-    """Synthesis output plus its own pricing.
+    """Synthesis output, pricing, and outcome status.
 
-    `synthesise` was returning only `str`; callers (`consult`, `refine`,
-    `sequence`) silently dropped the synthesiser's spend from `cost_usd`,
-    breaching the `max_run_usd` accounting. Returning the cost alongside
-    the text keeps the sentinel-write path (skipped/unavailable/empty)
-    cost-neutral while letting successful calls roll into the run total.
+    `synthesise` was returning only `str`; callers silently dropped the
+    synthesiser's spend from `cost_usd`, breaching the `max_run_usd`
+    accounting. Returning the cost alongside the text keeps the
+    sentinel-write path (skipped/unavailable/empty) cost-neutral while
+    letting successful calls roll into the run total. `status` lets
+    callers distinguish real output from a sentinel rather than
+    string-matching the body.
     """
 
     text: str
     cost_usd: float = 0.0
     cost_known: bool = True
+    status: SynthStatus = SynthStatus.OK
 
 
 def _resolve_rubric(rubric: str | None) -> str:
@@ -130,7 +157,7 @@ async def synthesise(
             "Inspect per-panellist artifacts to see why the panel failed."
         )
         (paths.root / "synthesis.md").write_text(text)
-        return SynthResult(text=text)
+        return SynthResult(text=text, status=SynthStatus.SKIPPED_EMPTY)
     rub = _resolve_rubric(rubric)
     # Load the per-run context bundle so the synthesiser can fact-check
     # panellist claims against the source. Legacy runs (pre-Phase 1)
@@ -187,7 +214,9 @@ async def synthesise(
         (paths.root / "synthesis.md").write_text(text)
         # No completion was returned, so there's nothing reliable to price.
         # cost_known=False mirrors the partial-cost convention elsewhere.
-        return SynthResult(text=text, cost_usd=0.0, cost_known=False)
+        return SynthResult(
+            text=text, cost_usd=0.0, cost_known=False, status=SynthStatus.FAILED,
+        )
 
     # Look up cost even on the empty-content path: provider billed for the
     # call regardless of whether output was usable. Independent try block so
@@ -217,7 +246,10 @@ async def synthesise(
             f"Retry `synthesise(run_id, by_model=...)` with a different model."
         )
         (paths.root / "synthesis.md").write_text(text)
-        return SynthResult(text=text, cost_usd=cost_value, cost_known=cost_known)
+        return SynthResult(
+            text=text, cost_usd=cost_value, cost_known=cost_known,
+            status=SynthStatus.FAILED,
+        )
     if not content or not content.strip():
         logger.warning(
             "synth produced empty content (finish_reason=%s) for %s",
@@ -231,8 +263,14 @@ async def synthesise(
             f"Retry with a larger budget or a different model."
         )
         (paths.root / "synthesis.md").write_text(text)
-        return SynthResult(text=text, cost_usd=cost_value, cost_known=cost_known)
+        return SynthResult(
+            text=text, cost_usd=cost_value, cost_known=cost_known,
+            status=SynthStatus.EMPTY,
+        )
 
     text = content.strip()
     (paths.root / "synthesis.md").write_text(text)
-    return SynthResult(text=text, cost_usd=cost_value, cost_known=cost_known)
+    return SynthResult(
+        text=text, cost_usd=cost_value, cost_known=cost_known,
+        status=SynthStatus.OK,
+    )

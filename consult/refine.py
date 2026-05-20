@@ -402,10 +402,11 @@ def _apply_continuation(
     """
     if not continuation_id:
         return prompt, None
-    try:
-        prior_paths = artifacts.load_run(continuation_id)
-    except FileNotFoundError as e:
-        raise ValueError(f"continuation_id not found: {continuation_id}") from e
+    # Let `FileNotFoundError` from `artifacts.load_run` propagate so the MCP
+    # dispatcher in server.py maps it to the dedicated RUN_NOT_FOUND envelope
+    # — the previous wrap-as-ValueError funnelled the same failure through
+    # INVALID_INPUT, which agents can't distinguish from a malformed prompt.
+    prior_paths = artifacts.load_run(continuation_id)
     synth_path = prior_paths.root / "synthesis.md"
     if not synth_path.exists():
         raise ValueError(
@@ -600,8 +601,8 @@ async def refine(
             fanout_cost_input = (
                 runner._concat_turn_text(prior_turns) + "\n" + round_prompt
             )
-        fanout_est, fanout_known = runner.estimate_cost(specs, fanout_cost_input)
-        arbiter_est, arbiter_known = runner.estimate_cost([arbiter_spec], round_prompt)
+        fanout_est, fanout_known = await runner.aestimate_cost(specs, fanout_cost_input)
+        arbiter_est, arbiter_known = await runner.aestimate_cost([arbiter_spec], round_prompt)
         estimate = fanout_est + arbiter_est
         est_known = fanout_known and arbiter_known
         if cumulative_cost + estimate > cap:
@@ -750,11 +751,18 @@ async def refine(
             cost_all_known = False
         progress_done = progress_total
         await emit(progress_mod.SynthCompleted(done=progress_done, total=progress_total))
-        # Persist the synthesiser so consult-view can badge it in the
-        # header; matches the consult handler. Refine writes the manifest
-        # once per round from `runner.fanout`, so this lands on the final
-        # version after the loop has stopped.
-        artifacts.augment_manifest(paths, synthesiser=synth_alias)
+        # Persist synthesiser + cumulative cost. Refine writes the manifest
+        # once per round from `runner.fanout`, which only knows that round's
+        # fanout spend; capsule + arbiter + synth costs were rolled into
+        # `cumulative_cost` in memory but never reached disk. Without this
+        # `consult-ledger` reads the last fanout's cost and silently
+        # under-reports the run total.
+        artifacts.augment_manifest(
+            paths,
+            synthesiser=synth_alias,
+            cost_usd=cumulative_cost,
+            cost_known=cost_all_known,
+        )
     else:
         text = "(no rounds completed — see partial_reason)"
 

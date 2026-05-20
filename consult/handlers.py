@@ -208,15 +208,21 @@ async def consult(args: dict[str, Any]) -> dict[str, Any]:
     await _safe_emit(
         base, progress.SynthCompleted(done=overall_total, total=overall_total)
     )
-    # Persist the synthesiser choice on disk so `consult-view` can badge it
-    # in the header. `RunResult` carries it on the wire, but the manifest
-    # written by `runner.fanout` was assembled before synth ran.
-    artifacts.augment_manifest(artifacts.load_run(handle.run_id), synthesiser=synth_alias)
     # Roll synth spend into the run total. The synthesiser is often the most
     # expensive call (flagship + big context), so omitting it silently
     # under-reports the run against `max_run_usd`.
     total_cost = handle.cost_usd + synth_result.cost_usd
     total_cost_known = handle.cost_known and synth_result.cost_known
+    # Persist synthesiser + total cost on disk. `RunResult` carries them on
+    # the wire, but the manifest written by `runner.fanout` was assembled
+    # before synth ran — `consult-ledger` reads from disk and would otherwise
+    # under-report by the synth call's spend.
+    artifacts.augment_manifest(
+        artifacts.load_run(handle.run_id),
+        synthesiser=synth_alias,
+        cost_usd=total_cost,
+        cost_known=total_cost_known,
+    )
     result = RunResult(
         run_id=handle.run_id,
         synthesis=synth_result.text,

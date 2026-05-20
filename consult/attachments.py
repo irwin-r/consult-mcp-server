@@ -13,10 +13,56 @@ so server.py stays focused on MCP wiring + tool orchestration.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
 from . import sources
+
+# Hard cap on a single attachment's size. A panel call against a multi-GB
+# log file would burn token budget and may also OOM the server before
+# LiteLLM even rejects the payload. The cap is generous enough for whole
+# small codebases (~5MB ≈ 1M tokens at 5 bytes/token) but small enough to
+# fail fast on operator typos like attaching `/var/log/system.log`.
+_DEFAULT_MAX_BYTES = 5 * 1024 * 1024
+
+
+def _max_bytes() -> int:
+    """Read the size cap at call time so test monkeypatching works."""
+    return int(os.environ.get("CONSULT_ATTACHMENT_MAX_BYTES", _DEFAULT_MAX_BYTES))
+
+
+def _read_text_safely(path: Path) -> str:
+    """Read a file as text, surfacing every failure mode inline.
+
+    Catches:
+    - `OSError`: missing / permission denied / non-regular file
+    - `UnicodeDecodeError`: binary blob attached by mistake — without this,
+      it bubbles up as INTERNAL_ERROR and the whole tool call fails. The
+      whole point of the inline `[ERROR: ...]` shape is that a broken
+      attachment shouldn't take down the panel.
+    - size cap: stat() first so we don't slurp gigabytes into RAM.
+
+    Returns the file content or raises `ValueError` with a one-line reason
+    the caller turns into an `[ERROR: ...]` block.
+    """
+    try:
+        size = path.stat().st_size
+    except OSError as e:
+        raise ValueError(f"{type(e).__name__}: {e}") from e
+    cap = _max_bytes()
+    if size > cap:
+        raise ValueError(
+            f"attachment {size} bytes exceeds CONSULT_ATTACHMENT_MAX_BYTES={cap}"
+        )
+    try:
+        return path.read_text()
+    except UnicodeDecodeError as e:
+        raise ValueError(
+            f"not a text file (UnicodeDecodeError at byte {e.start})"
+        ) from e
+    except OSError as e:
+        raise ValueError(f"{type(e).__name__}: {e}") from e
 
 # JSON Schema fragment for one attachment entry. Used by every tool that
 # accepts attachments (panel, refine, consult, sequence) — keeping the
@@ -83,8 +129,8 @@ def render_attachment(item: Any) -> str:
         label = None
         kind = None
         try:
-            content = Path(path).read_text()
-        except OSError as e:
+            content = _read_text_safely(Path(path))
+        except ValueError as e:
             return f"\n# {path}\n[ERROR: {e}]\n"
     elif isinstance(item, dict) and item.get("source") == "git_diff":
         base = item.get("base")
@@ -102,8 +148,8 @@ def render_attachment(item: Any) -> str:
         label = item.get("label")
         kind = item.get("kind")
         try:
-            content = Path(path).read_text()
-        except OSError as e:
+            content = _read_text_safely(Path(path))
+        except ValueError as e:
             return f"\n# {path}\n[ERROR: {e}]\n"
     else:
         return f"\n[ERROR: malformed attachment spec: {item!r}]\n"

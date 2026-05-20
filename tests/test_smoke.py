@@ -243,12 +243,15 @@ def test_refine_continuation_none_or_empty_is_passthrough(tmp_path, monkeypatch)
 
 def test_refine_continuation_unknown_id_raises(tmp_path, monkeypatch):
     """An unknown continuation_id must raise — silently dropping the prior
-    context would leave the caller thinking the new round had it.
+    context would leave the caller thinking the new round had it. The
+    exception type is FileNotFoundError (propagated from artifacts.load_run)
+    so the MCP dispatcher in server.py maps it to RUN_NOT_FOUND rather than
+    INVALID_INPUT.
     """
     from consult.refine import _apply_continuation
 
     monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
-    with pytest.raises(ValueError, match="continuation_id not found"):
+    with pytest.raises(FileNotFoundError, match="Run not found"):
         _apply_continuation("hello", "20990101-000000-99999")
 
 

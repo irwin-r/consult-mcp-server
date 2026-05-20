@@ -255,6 +255,14 @@ class RunHandle(BaseModel):
             raise ValueError("RunHandle.partial=True requires partial_reason")
         if not self.partial and self.partial_reason:
             raise ValueError("RunHandle.partial=False must not carry a partial_reason")
+        # Aggregate cost invariant: a handle that claims `cost_known=True`
+        # while any child entry has `cost_known=False` would silently mask
+        # the unknown in ledger totals. Mirrors `ManifestEntry`'s own cost
+        # invariant so the cap-enforcement story is uniform top-down.
+        if self.cost_known and any(not m.cost_known for m in self.manifest):
+            raise ValueError(
+                "RunHandle.cost_known=True but a manifest entry has cost_known=False"
+            )
         return self
 
     def status_counts(self) -> dict[str, int]:
@@ -350,10 +358,33 @@ class ArbiterVerdict(BaseModel):
     gaps: list[str] = Field(default_factory=list)
     next_round_focus: str = ""
     reasoning: str = ""
-    cost_usd: float | None = None
+    # Default to known-zero (matches the ManifestEntry cost-default convention):
+    # constructors that don't carry a real cost yet should look like a free call,
+    # not "we don't know". The failure paths in refine.py set cost=None +
+    # cost_known=False explicitly.
+    cost_usd: float | None = 0.0
     cost_known: bool = True
     parsed_ok: bool = True
     error: str | None = None
+
+    @model_validator(mode="after")
+    def _validate_invariants(self) -> ArbiterVerdict:
+        # `cost_usd=None` ⇒ `cost_known=False`: matches ManifestEntry's
+        # invariant so cost roll-ups in refine don't silently treat
+        # arbiter-cost-unknown as zero.
+        if self.cost_usd is None and self.cost_known:
+            raise ValueError(
+                "ArbiterVerdict with cost_usd=None must have cost_known=False"
+            )
+        # `parsed_ok=False` ⇒ `error is not None`: refine.py drops gaps and
+        # aborts the loop on parse failure, but only if an error string
+        # carries the reason. Silent parsed_ok=False with no error makes
+        # the caller's debugging path much harder.
+        if not self.parsed_ok and not self.error:
+            raise ValueError(
+                "ArbiterVerdict.parsed_ok=False requires an error message"
+            )
+        return self
 
 
 class RefineResult(BaseModel):
