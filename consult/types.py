@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from enum import Enum
+from enum import StrEnum
 from math import ceil
 
 from pydantic import BaseModel, Field, model_validator
 
 
-class Status(str, Enum):
+class Status(StrEnum):
     OK = "OK"
     TRUNCATED = "TRUNCATED"
     MALFORMED = "MALFORMED"

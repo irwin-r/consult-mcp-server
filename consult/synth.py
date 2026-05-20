@@ -14,11 +14,11 @@ from typing import Any
 
 import litellm
 
-logger = logging.getLogger(__name__)
-
 from . import artifacts, registry
 from .runner import _build_messages
 from .types import Status
+
+logger = logging.getLogger(__name__)
 
 _DEFAULT_RUBRIC = """\
 You have {n} expert responses below. Synthesise them under this rubric:

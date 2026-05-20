@@ -10,7 +10,7 @@ import logging
 import re
 import time
 from collections.abc import Awaitable, Callable
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -35,7 +35,7 @@ def _append_progress_log(run_root: Path, entry: dict[str, Any]) -> None:
     client didn't ask for `notifications/progress`. A write error here is
     logged at debug and swallowed; the progress log is best-effort.
     """
-    entry = {"ts": datetime.now(timezone.utc).isoformat(), **entry}
+    entry = {"ts": datetime.now(UTC).isoformat(), **entry}
     try:
         with (run_root / "_progress.log").open("a") as fh:
             fh.write(json.dumps(entry) + "\n")
@@ -230,7 +230,7 @@ async def _call_one(
             cost = None
             cost_known = False
 
-    except (TimeoutError, asyncio.TimeoutError):
+    except TimeoutError:
         status, finish, body = Status.TIMEOUT, None, ""
         error = f"timeout after {timeout}s"
         cost_known = True  # no call was billable

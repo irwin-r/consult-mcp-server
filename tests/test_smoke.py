@@ -6,18 +6,17 @@ Run: `pytest -v`
 
 from __future__ import annotations
 
-import asyncio
 import json
 import os
-from pathlib import Path
+from typing import Any
 
 import pytest
 
-from consult import artifacts, refine as refine_mod, registry
+from consult import artifacts, registry
+from consult import refine as refine_mod
 from consult.runner import _build_per_slug_prompt, _make_slug, estimate_cost
 from consult.status import classify
 from consult.types import ArbiterVerdict, Capsule, ManifestEntry, ModelSpec, RunHandle, Status
-
 
 # ---- Pure-Python tests (no network) ----------------------------------------
 
@@ -440,9 +439,9 @@ async def test_sequence_chains_synthesis_across_steps(tmp_path, monkeypatch):
     synthesis, and the final_synthesis matches the last step's output.
     Heavy machinery (fanout, capsule, synth) is monkeypatched.
     """
-    from consult import sequence as sequence_mod
-    from consult import runner as runner_mod
     from consult import capsule as capsule_mod
+    from consult import runner as runner_mod
+    from consult import sequence as sequence_mod
     from consult import synth as synth_mod
 
     monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
