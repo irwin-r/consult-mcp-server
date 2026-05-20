@@ -4175,3 +4175,196 @@ def test_missing_default_rubric_raises_runtime_not_filenotfound(tmp_path, monkey
     with pytest.raises(RuntimeError) as exc:
         synth_mod._resolve_rubric(None)
     assert "broken" in str(exc.value).lower()
+
+
+# ---- Iter 3 refine-loop regression locks -----------------------------------
+
+
+def test_extract_json_rejects_non_dict_root():
+    """LLMs occasionally return a JSON array instead of an object. Upstream
+    callers do `data.get(...)`, which raises AttributeError on a list.
+    `extract_json` must return None for any non-dict root.
+    """
+    from consult.jsonparse import extract_json
+
+    assert extract_json("[1, 2, 3]") is None
+    assert extract_json('[{"score": 1.0}]') is None
+    assert extract_json("42") is None
+    assert extract_json('"hello"') is None
+    # Real dict still parses.
+    assert extract_json('{"score": 0.5}') == {"score": 0.5}
+
+
+async def test_fanout_rejects_duplicate_explicit_slugs(tmp_path, monkeypatch):
+    """Two specs with identical explicit slugs race on `responses/<slug>.txt`.
+    `runner.fanout` must fail fast with a clear ValueError before any
+    artifact write happens.
+    """
+    from consult import runner as runner_mod
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    monkeypatch.setattr(runner_mod, "estimate_cost", lambda specs, prompt: (0.0, True))
+
+    specs = [
+        ModelSpec(model="claude-haiku", slug="test"),
+        ModelSpec(model="gpt-pro", slug="test"),
+    ]
+    with pytest.raises(ValueError) as exc:
+        await runner_mod.fanout("hi", specs)
+    assert "duplicate" in str(exc.value).lower()
+    assert "test" in str(exc.value)
+
+
+async def test_consult_handler_swallows_progress_callback_failure(tmp_path, monkeypatch):
+    """A progress-callback failure during the synth phase must NOT tear
+    down the tool. Pre-fix the consult handler called `await base(event)`
+    directly; a disconnected MCP session surfaced as INTERNAL_ERROR.
+    """
+    from consult import capsule as capsule_mod
+    from consult import handlers
+    from consult import runner as runner_mod
+    from consult import synth as synth_mod
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+
+    async def fake_fanout(prompt, specs, **kwargs):
+        paths = artifacts.create_run()
+        return RunHandle(
+            run_id=paths.run_id,
+            artifacts_dir=str(paths.root),
+            manifest=[
+                ManifestEntry(
+                    slug="x", model_id="m/x", status=Status.OK,
+                    resource_uri=paths.resource_uri("x"),
+                    body_path=str(paths.response_text("x")),
+                    latency_ms=0, cost_usd=0.0, cost_known=True,
+                    confidence=None, capsule=None,
+                ),
+            ],
+            cost_usd=0.0, cost_known=True, wall_ms=0,
+        )
+
+    async def fake_annotate(handle, **kwargs):
+        return handle
+
+    async def fake_synth(*args, **kwargs):
+        return synth_mod.SynthResult(text="ok")
+
+    async def crashy_cb():
+        async def inner(event):
+            raise RuntimeError("client disconnected")
+        return inner
+
+    cb = await crashy_cb()
+
+    monkeypatch.setattr(runner_mod, "fanout", fake_fanout)
+    monkeypatch.setattr(handlers.runner, "fanout", fake_fanout)
+    monkeypatch.setattr(capsule_mod, "annotate", fake_annotate)
+    monkeypatch.setattr(handlers.capsule, "annotate", fake_annotate)
+    monkeypatch.setattr(synth_mod, "synthesise", fake_synth)
+    monkeypatch.setattr(handlers.synth, "synthesise", fake_synth)
+    monkeypatch.setattr(handlers, "_progress_callback", lambda: cb)
+
+    # No exception should propagate; tool returns its normal payload.
+    result = await handlers.consult({"prompt": "p", "tier": "quick"})
+    assert result["partial"] is False
+    assert result["synthesis"] == "ok"
+
+
+async def test_refine_synth_call_passes_anonymised_when_blinded(tmp_path, monkeypatch):
+    """A blinded refine must pass `anonymised=True` to `synth.synthesise` so
+    the bundle's brand-scrubbed prompt is what reaches the synthesiser.
+    """
+    from consult import capsule as capsule_mod
+    from consult import runner as runner_mod
+    from consult import synth as synth_mod
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    monkeypatch.setattr(runner_mod, "estimate_cost", lambda specs, prompt: (0.0, True))
+
+    async def fake_fanout(prompt, specs, **kwargs):
+        paths = kwargs.get("existing_paths") or artifacts.create_run()
+        return RunHandle(
+            run_id=paths.run_id,
+            artifacts_dir=str(paths.root),
+            manifest=[
+                ManifestEntry(
+                    slug="x.r1", model_id="m/x", status=Status.OK,
+                    resource_uri=paths.resource_uri("x.r1"),
+                    body_path=str(paths.response_text("x.r1")),
+                    latency_ms=0, cost_usd=0.0, cost_known=True,
+                    confidence=None, capsule=None,
+                ),
+            ],
+            cost_usd=0.0, cost_known=True, wall_ms=0,
+        )
+
+    async def fake_annotate(handle, **kwargs):
+        return handle
+
+    async def fake_arbiter(*args, **kwargs):
+        return ArbiterVerdict(
+            round=1, score=1.0, gaps=[], reasoning="ok",
+            cost_usd=0.0, cost_known=True, parsed_ok=True,
+        )
+
+    captured: dict[str, Any] = {}
+
+    async def fake_synth(run_id, **kwargs):
+        captured.update(kwargs)
+        return synth_mod.SynthResult(text="final")
+
+    monkeypatch.setattr(runner_mod, "fanout", fake_fanout)
+    monkeypatch.setattr(refine_mod.runner, "fanout", fake_fanout)
+    monkeypatch.setattr(capsule_mod, "annotate", fake_annotate)
+    monkeypatch.setattr(refine_mod.capsule, "annotate", fake_annotate)
+    monkeypatch.setattr(refine_mod, "_ask_arbiter", fake_arbiter)
+    monkeypatch.setattr(refine_mod.synth, "synthesise", fake_synth)
+
+    await refine_mod.refine(
+        "Q", [ModelSpec(model="claude-haiku")],
+        threshold=0.5, max_rounds=1, blinded=True,
+    )
+    assert captured.get("anonymised") is True
+
+
+async def test_synth_defensive_extraction_on_unexpected_shape(tmp_path, monkeypatch):
+    """A non-conformant provider response must surface the unavailable
+    sentinel, not AttributeError/IndexError straight out of `synthesise`.
+    """
+    import litellm
+
+    from consult import synth as synth_mod
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    paths = artifacts.create_run()
+    paths.prompt_txt.write_text("q")
+    paths.response_text("alpha").write_text("body")
+    manifest = [
+        ManifestEntry(
+            slug="alpha", model_id="m/x", status=Status.OK,
+            resource_uri=paths.resource_uri("alpha"),
+            body_path=str(paths.response_text("alpha")),
+            latency_ms=0, cost_usd=0.0, cost_known=True,
+            confidence=None, capsule=None,
+        ),
+    ]
+    handle = RunHandle(
+        run_id=paths.run_id, artifacts_dir=str(paths.root),
+        manifest=manifest, cost_usd=0.0, cost_known=True, wall_ms=0,
+    )
+    artifacts.write_manifest(paths, handle.model_dump())
+
+    class Garbage:
+        choices: list = []  # IndexError on resp.choices[0]
+
+    async def garbage_acompletion(**kwargs):
+        return Garbage()
+
+    monkeypatch.setattr(litellm, "acompletion", garbage_acompletion)
+    monkeypatch.setattr(litellm, "completion_cost", lambda **kwargs: 0.0)
+
+    result = await synth_mod.synthesise(paths.run_id)
+    # Did not crash. Sentinel text written.
+    assert "# Synthesis unavailable" in result.text
+    assert "unexpected response shape" in result.text

@@ -201,9 +201,24 @@ async def synthesise(
         cost_value = 0.0
         cost_known = False
 
-    content = resp.choices[0].message.content
-    if not content or not content.strip():
+    # Defensive extraction: most providers follow OpenAI's `choices[0].message`
+    # shape, but a non-conformant response (or a future SDK regression) would
+    # otherwise raise AttributeError/IndexError straight out of synthesise,
+    # bypassing the unavailable-sentinel path that callers expect.
+    try:
+        content = resp.choices[0].message.content
         finish = getattr(resp.choices[0], "finish_reason", None)
+    except (AttributeError, IndexError, KeyError, TypeError) as e:
+        logger.warning("synth response shape unexpected for %s: %s", litellm_id, e)
+        text = (
+            f"# Synthesis unavailable\n\n"
+            f"The synthesiser (`{litellm_id}`) returned an unexpected response "
+            f"shape: `{type(e).__name__}: {e!s:.200}`. "
+            f"Retry `synthesise(run_id, by_model=...)` with a different model."
+        )
+        (paths.root / "synthesis.md").write_text(text)
+        return SynthResult(text=text, cost_usd=cost_value, cost_known=cost_known)
+    if not content or not content.strip():
         logger.warning(
             "synth produced empty content (finish_reason=%s) for %s",
             finish,

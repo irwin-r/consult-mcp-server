@@ -763,6 +763,20 @@ async def fanout(
 
     # Build slugs + prompts
     slugs = [_make_slug(s, i, blinded) for i, s in enumerate(specs)]
+    # Duplicate slugs ⇒ multiple panellists racing to write to the same
+    # `responses/<slug>.txt`; the second writer silently overwrites the
+    # first. `expand_specs` fixes the model:N case but a caller passing
+    # two literal `{slug: "foo"}` specs falls through. Fail fast here
+    # before the artifact dance starts.
+    if len(set(slugs)) != len(slugs):
+        seen: dict[str, int] = {}
+        for s in slugs:
+            seen[s] = seen.get(s, 0) + 1
+        dupes = sorted(slug for slug, n in seen.items() if n > 1)
+        raise ValueError(
+            f"duplicate panel slugs would race the artifact dir: {dupes}. "
+            "Disambiguate by giving each spec a distinct `slug` (or omitting it)."
+        )
     per_prompts = [
         _build_per_slug_prompt(prompt, registry.resolve_stance(s.stance)) for s in specs
     ]

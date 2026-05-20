@@ -12,6 +12,8 @@ imports this module to build its dispatch table).
 
 from __future__ import annotations
 
+import logging
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from mcp.types import TextContent
@@ -32,6 +34,28 @@ from . import (
     sequence as sequence_mod,
 )
 from .types import ModelSpec, RunResult
+
+logger = logging.getLogger(__name__)
+
+
+async def _safe_emit(
+    cb: Callable[[progress.ProgressEvent], Awaitable[None]] | None,
+    event: progress.ProgressEvent,
+) -> None:
+    """Emit a progress event, swallowing any callback exception.
+
+    Progress is best-effort: a notification failure (closed MCP session,
+    raising user callback) must never abort the tool call. Runner and
+    refine wrap their per-call emissions; the consult handler used to
+    call `await base(event)` directly, which let a disconnect surface as
+    INTERNAL_ERROR — this helper closes that gap.
+    """
+    if cb is None:
+        return
+    try:
+        await cb(event)
+    except Exception as e:  # noqa: BLE001
+        logger.debug("progress callback failed: %s", e)
 
 
 def _specs_from_args(models_arg: list[dict[str, Any]]) -> list[ModelSpec]:
@@ -168,16 +192,18 @@ async def consult(args: dict[str, Any]) -> dict[str, Any]:
         )
     # The outer total was sized for fanout + capsules + synth, so synth's
     # `done` starts at the synth offset regardless of whether capsules ran.
-    if base is not None:
-        await base(progress.SynthStarted(done=synth_offset, total=overall_total))
+    await _safe_emit(
+        base, progress.SynthStarted(done=synth_offset, total=overall_total)
+    )
     synth_result = await synth.synthesise(
         handle.run_id,
         by_model=synth_alias,
         anonymised=args.get("blinded", False),
         rubric=args.get("rubric"),
     )
-    if base is not None:
-        await base(progress.SynthCompleted(done=overall_total, total=overall_total))
+    await _safe_emit(
+        base, progress.SynthCompleted(done=overall_total, total=overall_total)
+    )
     # Persist the synthesiser choice on disk so `consult-view` can badge it
     # in the header. `RunResult` carries it on the wire, but the manifest
     # written by `runner.fanout` was assembled before synth ran.

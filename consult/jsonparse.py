@@ -23,19 +23,22 @@ def extract_json(text: str) -> dict[str, Any] | None:
 
     Strips a leading/trailing ```/```json fence first. On failure, searches
     for the first `{...}` block in the text and tries again. Returns None if
-    no parse succeeds.
+    no parse succeeds OR if the parsed value isn't a dict — callers do
+    `data.get(...)`, so an unintended list/number/string would raise
+    AttributeError and bypass the cleaner None-handling path.
     """
     text = text.strip()
     if text.startswith("```"):
         text = _FENCE_OPEN.sub("", text)
         text = _FENCE_CLOSE.sub("", text)
     try:
-        return json.loads(text)
+        parsed = json.loads(text)
     except json.JSONDecodeError:
         m = _JSON_BLOCK.search(text)
         if not m:
             return None
         try:
-            return json.loads(m.group(0))
+            parsed = json.loads(m.group(0))
         except json.JSONDecodeError:
             return None
+    return parsed if isinstance(parsed, dict) else None

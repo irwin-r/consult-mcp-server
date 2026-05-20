@@ -711,8 +711,15 @@ async def refine(
     if final_manifest:
         progress_done = progress_total - 1
         await emit(progress_mod.SynthStarted(done=progress_done, total=progress_total))
+        # `anonymised=blinded` so a refine-with-blinded-True doesn't leak the
+        # raw original prompt into synth_input.txt — without it the synth
+        # call defaults to `anonymised=False`, which makes the context bundle
+        # return the un-scrubbed prompt regardless of the blinded flag.
         synth_result = await synth.synthesise(
-            paths.run_id, by_model=synth_alias, rubric=rubric
+            paths.run_id,
+            by_model=synth_alias,
+            anonymised=blinded,
+            rubric=rubric,
         )
         text = synth_result.text
         cumulative_cost += synth_result.cost_usd
