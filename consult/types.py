@@ -145,6 +145,11 @@ class RunResult(BaseModel):
     cost_known: bool = True
     wall_ms: int = Field(..., ge=0)
     partial: bool = False
+    # Surfaced so the caller can tell why the panel size is `tier_size - 1`
+    # when the chosen synthesiser is itself a member of the requested tier
+    # (the synthesiser is excluded from the panel to avoid self-inclusion
+    # bias). Without this, panel-shrinkage is invisible in the response.
+    synthesiser: str | None = None
 
 
 class ArbiterVerdict(BaseModel):

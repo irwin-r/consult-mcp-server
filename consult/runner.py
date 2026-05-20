@@ -21,6 +21,12 @@ logger = logging.getLogger(__name__)
 # Drop unsupported params per provider so e.g. `reasoning_effort` on a
 # non-reasoning model is silently ignored rather than failing the panel.
 litellm.drop_params = True
+# LiteLLM's default error path prints an ANSI-coloured "Give Feedback /
+# Get Help" footer + "debug this error" hint to stderr on every caught
+# exception. We already log a clean .warning() at the catch site; this
+# silences the noisy trailer so a single pricing-table miss doesn't
+# drown the rest of the log.
+litellm.suppress_debug_info = True
 
 # CONTRACT: capsule.py:_CONFIDENCE and the capsule extractor prompt depend on
 # these exact line prefixes (`CONFIDENCE:` and `KEY_REASON:`). Don't rename
@@ -168,6 +174,12 @@ async def _call_one(
 
     paths.response_text(slug).write_text(body)
     latency_ms = int((time.time() - start) * 1000)
+
+    # Per-panellist completion line. Visible in MCP server logs
+    # (~/.claude/logs/mcp-logs-consult/) — gives mid-run observability so
+    # a slow panellist's status is knowable without waiting for the full
+    # manifest. Use info-level so production stays quiet by default.
+    logger.info("panellist %s: %s in %dms", slug, status.value, latency_ms)
 
     persona_label = spec.stance if spec.stance else None
 

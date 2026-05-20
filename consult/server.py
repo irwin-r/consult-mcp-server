@@ -317,6 +317,7 @@ async def _handle_consult(args: dict[str, Any]) -> list[TextContent]:
         cost_usd=handle.cost_usd,
         wall_ms=handle.wall_ms,
         partial=False,
+        synthesiser=synth_alias,
     )
     return _text_result(result.model_dump())
 

@@ -16,20 +16,20 @@ improvement before adding features" with the 8 core modules attached.
   spawn. Workaround so far: full session restart.
 - [env] **`/mcp reconnect consult` reconnects transport but doesn't re-enumerate
   tools** into Claude Code's registry. Same symptom as above persists post-reconnect.
-- [ux] **Noisy LiteLLM pricing-table miss for `openrouter/deepseek/deepseek-v4-pro`**.
-  Our cost lookup catches the exception and logs a clean `.warning()`, but LiteLLM
-  prints the underlying error block to stderr first (3 lines of error + HTML
-  feedback links per panellist on each lookup). Drowns the rest of the log. Could
-  filter stderr or suppress at the LiteLLM logger.
-- [ux] **`code` tier shrinks silently when its members overlap with the default
-  synthesiser**. `code` has 5 aliases; `gemini-pro` is the default synthesiser and
-  gets filtered out of the panel by `_handle_consult`, leaving 4. No warning. Either
-  surface the effective panel size in the result, or pick non-overlapping synthesiser
-  by default.
+- [ux] ~~**Noisy LiteLLM pricing-table miss**~~ — RESOLVED: set
+  `litellm.suppress_debug_info = True` next to `drop_params` (runner.py). Kills
+  the ANSI feedback-link footer LiteLLM prints on every caught exception.
+- [ux] ~~**`code` tier shrinks silently when its members overlap with the default
+  synthesiser**~~ — PARTIAL: `RunResult` now carries `synthesiser` (types.py:148,
+  populated in `_handle_consult`). Panel-size shrinkage is now inferable from the
+  response. Still no proactive warning when this happens — open question whether
+  that's worth the noise.
 - [ux] **Wide latency variance with no per-call timeout intelligence**. In this run
-  deepseek took 136s while claude-opus finished in 39s. No mid-run signal to user
-  that one panellist is dragging; only the final manifest reveals it. (Per-model
-  timeouts exist in config, but a 240s ceiling means a single laggard pegs wall time.)
+  deepseek took 136s while claude-opus finished in 39s. PARTIAL FIX: `_call_one`
+  now logs each panellist completion at INFO (`runner.py`) so MCP server logs
+  (`~/.claude/logs/mcp-logs-consult/`) carry a mid-run signal. The full
+  user-facing fix is MCP progress notifications, deferred from v1 by the refine
+  panel verdict.
 - [bug] **First real bug found via dogfooding (panel surfaced it)**: an unknown model
   alias (typo, stale config) raises `KeyError` from `registry.resolve_model` inside
   `estimate_cost`, propagates out of `fanout`, and crashes the whole call before any
