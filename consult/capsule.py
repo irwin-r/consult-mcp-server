@@ -82,7 +82,12 @@ async def _extract_one(
     if not body or not body.strip():
         return Capsule(), None, True  # zero cost is known: we made no call
 
-    # 1) Extraction call — exceptions here mean we couldn't build a capsule
+    # 1) Extraction call — exceptions here mean we couldn't build a capsule.
+    # `response_format=Capsule` asks LiteLLM to enforce the Pydantic schema on
+    # supporting providers (OpenAI strict mode, Anthropic tool-use emulation,
+    # Gemini responseSchema). On providers that don't support it,
+    # litellm.drop_params silently drops the param and we fall back to the
+    # prompt + regex JSON recovery below.
     prompt = _CAPSULE_PROMPT + body
     try:
         resp = await asyncio.wait_for(
@@ -91,6 +96,7 @@ async def _extract_one(
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=800,
                 temperature=0.0,
+                response_format=Capsule,
             ),
             timeout=timeout,
         )
