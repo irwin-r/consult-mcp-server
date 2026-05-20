@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -523,11 +524,102 @@ async def fanout(
                 logger.debug("on_progress callback failed: %s", e)
         return entry
 
-    tasks = [
-        _run_one(spec, slug, per_prompt)
-        for spec, slug, per_prompt in zip(specs, slugs, per_prompts, strict=True)
-    ]
-    manifest = await asyncio.gather(*tasks)
+    # Slow-tail dropout: once most of the panel has returned, cancel the
+    # slowest stragglers rather than waiting for the per-spec timeout. FRICTION
+    # observed a 5× spread between fastest and slowest in the same panel; the
+    # median wall-time win comes from releasing 1-2 laggards. Disabled for
+    # small panels (no useful "rest of the panel" signal) and when
+    # CONSULT_TAIL_DROPOUT_S=0. The full per-spec timeout still bounds the
+    # worst case if dropout is off.
+    tail_dropout_s = float(os.environ.get("CONSULT_TAIL_DROPOUT_S", 30.0))
+    tail_k_frac = float(os.environ.get("CONSULT_TAIL_K_FRAC", 0.2))
+    enable_dropout = total >= 4 and tail_dropout_s > 0 and 0 < tail_k_frac < 1.0
+
+    if not enable_dropout:
+        coros = [
+            _run_one(spec, slug, per_prompt)
+            for spec, slug, per_prompt in zip(specs, slugs, per_prompts, strict=True)
+        ]
+        manifest = list(await asyncio.gather(*coros))
+    else:
+        task_list: list[asyncio.Task[ManifestEntry]] = []
+        task_meta: dict[asyncio.Task[ManifestEntry], tuple[str, ModelSpec]] = {}
+        for spec, slug, per_prompt in zip(specs, slugs, per_prompts, strict=True):
+            t = asyncio.create_task(_run_one(spec, slug, per_prompt))
+            task_list.append(t)
+            task_meta[t] = (slug, spec)
+
+        completed_tasks: set[asyncio.Task[ManifestEntry]] = set()
+        pending: set[asyncio.Task[ManifestEntry]] = set(task_list)
+        k = max(1, math.ceil(total * tail_k_frac))
+        trigger = max(1, total - k)
+
+        while len(completed_tasks) < trigger and pending:
+            done_set, pending = await asyncio.wait(
+                pending, return_when=asyncio.FIRST_COMPLETED
+            )
+            completed_tasks.update(done_set)
+
+        if pending:
+            logger.info(
+                "slow-tail dropout: %d/%d complete, waiting up to %.1fs for %d stragglers",
+                len(completed_tasks), total, tail_dropout_s, len(pending),
+            )
+            done_set, pending = await asyncio.wait(pending, timeout=tail_dropout_s)
+            completed_tasks.update(done_set)
+
+        drop_entries: dict[asyncio.Task[ManifestEntry], ManifestEntry] = {}
+        for t in pending:
+            t.cancel()
+        for t in pending:
+            slug, spec = task_meta[t]
+            try:
+                # A task may complete in the race between asyncio.wait
+                # returning and t.cancel(); in that case _run_one already
+                # ran its progress emission and we keep its result.
+                await t
+                completed_tasks.add(t)
+                continue
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+            latency_ms = int((time.time() - start) * 1000)
+            if not paths.response_text(slug).exists():
+                paths.response_text(slug).write_text("")
+            entry = ManifestEntry(
+                slug=slug,
+                model_id=None,
+                persona=spec.stance if spec.stance else None,
+                status=Status.TIMEOUT,
+                finish_reason=None,
+                resource_uri=paths.resource_uri(slug),
+                body_path=str(paths.response_text(slug)),
+                latency_ms=latency_ms,
+                cost_known=True,  # no billable call landed
+                error=f"slow-tail dropout after {tail_dropout_s}s",
+                confidence=None,
+                capsule=None,
+            )
+            drop_entries[t] = entry
+            done += 1
+            if on_progress is not None:
+                try:
+                    await on_progress(PanellistCompleted(
+                        done=done, total=total, slug=slug,
+                        status=Status.TIMEOUT.value, latency_ms=latency_ms,
+                    ))
+                except Exception as e:  # noqa: BLE001
+                    logger.debug("on_progress callback failed in slow-tail: %s", e)
+            _append_progress_log(paths.root, PanellistCompleted(
+                done=0, total=0, slug=slug,
+                status=Status.TIMEOUT.value, latency_ms=latency_ms,
+            ))
+
+        manifest = []
+        for t in task_list:
+            if t in drop_entries:
+                manifest.append(drop_entries[t])
+            else:
+                manifest.append(t.result())
     wall_ms = int((time.time() - start) * 1000)
 
     # If blinded, scrub model_id from the manifest (kept in registry_snapshot for audit)

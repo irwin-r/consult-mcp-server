@@ -666,6 +666,90 @@ async def test_fanout_progress_callback_failure_does_not_abort_run(tmp_path, mon
 
 
 @pytest.mark.asyncio
+async def test_fanout_slow_tail_dropout_cancels_stragglers(tmp_path, monkeypatch):
+    """Once `N - k` panellists return, slow stragglers get cancelled and
+    surface as Status.TIMEOUT with a "slow-tail dropout" error. The full
+    panel is returned (no panellist silently missing) so cost math and the
+    progress total still see a complete N.
+    """
+    import asyncio as _asyncio
+
+    from consult import runner
+    from consult.runner import fanout
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    monkeypatch.setattr(runner, "estimate_cost", lambda specs, prompt: (0.0, True))
+    monkeypatch.setenv("CONSULT_TAIL_DROPOUT_S", "0.05")
+    monkeypatch.setenv("CONSULT_TAIL_K_FRAC", "0.25")  # k=1 for n=4 → trigger=3
+
+    async def fake_call(spec, slug, per_prompt, paths, provider_sems=None):
+        if "slow" in slug:
+            await _asyncio.sleep(5.0)
+        paths.response_text(slug).write_text("ok")
+        return ManifestEntry(
+            slug=slug, model_id="x/y", persona=None, status=Status.OK,
+            finish_reason="stop", resource_uri=paths.resource_uri(slug),
+            body_path=str(paths.response_text(slug)), latency_ms=1,
+            cost_usd=0.0, cost_known=True,
+        )
+
+    monkeypatch.setattr(runner, "_call_one", fake_call)
+
+    specs = [
+        ModelSpec(model="claude-haiku", slug="fast-0"),
+        ModelSpec(model="claude-haiku", slug="fast-1"),
+        ModelSpec(model="claude-haiku", slug="fast-2"),
+        ModelSpec(model="claude-haiku", slug="slow-3"),
+    ]
+    handle = await fanout("anything", specs)
+    assert len(handle.manifest) == 4
+    by_status = [m.status for m in handle.manifest]
+    assert by_status.count(Status.OK) == 3
+    assert by_status.count(Status.TIMEOUT) == 1
+    dropped = next(m for m in handle.manifest if m.status is Status.TIMEOUT)
+    assert "slow-tail dropout" in (dropped.error or "")
+
+
+@pytest.mark.asyncio
+async def test_fanout_no_dropout_below_threshold_panel_size(tmp_path, monkeypatch):
+    """Panels smaller than 4 panellists never trigger slow-tail dropout —
+    there's no statistically useful "rest of the panel" signal at N<4.
+    A 3-spec panel with a slow panellist still completes all three.
+    """
+    import asyncio as _asyncio
+
+    from consult import runner
+    from consult.runner import fanout
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    monkeypatch.setattr(runner, "estimate_cost", lambda specs, prompt: (0.0, True))
+    monkeypatch.setenv("CONSULT_TAIL_DROPOUT_S", "0.05")
+    monkeypatch.setenv("CONSULT_TAIL_K_FRAC", "0.5")
+
+    async def fake_call(spec, slug, per_prompt, paths, provider_sems=None):
+        if "slow" in slug:
+            await _asyncio.sleep(0.3)
+        paths.response_text(slug).write_text("ok")
+        return ManifestEntry(
+            slug=slug, model_id="x/y", persona=None, status=Status.OK,
+            finish_reason="stop", resource_uri=paths.resource_uri(slug),
+            body_path=str(paths.response_text(slug)), latency_ms=1,
+            cost_usd=0.0, cost_known=True,
+        )
+
+    monkeypatch.setattr(runner, "_call_one", fake_call)
+
+    specs = [
+        ModelSpec(model="claude-haiku", slug="fast-0"),
+        ModelSpec(model="claude-haiku", slug="fast-1"),
+        ModelSpec(model="claude-haiku", slug="slow-2"),
+    ]
+    handle = await fanout("anything", specs)
+    assert len(handle.manifest) == 3
+    assert all(m.status is Status.OK for m in handle.manifest)
+
+
+@pytest.mark.asyncio
 async def test_acompletion_with_retry_recovers_after_rate_limit(monkeypatch):
     """One rate-limit followed by a success: the retry loop sleeps with
     jittered backoff and returns the second response. Without retry, a
