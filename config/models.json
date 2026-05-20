@@ -37,8 +37,15 @@
       "provider": "openai",
       "family": "gpt"
     },
-    "gpt-instant": {
-      "litellm_id": "openai/gpt-5.5-instant",
+    "gpt-mini": {
+      "litellm_id": "openai/gpt-5.4-mini",
+      "default_budget_tokens": 8000,
+      "default_timeout_s": 180,
+      "provider": "openai",
+      "family": "gpt"
+    },
+    "gpt-nano": {
+      "litellm_id": "openai/gpt-5.4-nano",
       "default_budget_tokens": 6000,
       "default_timeout_s": 120,
       "provider": "openai",
@@ -51,13 +58,6 @@
       "provider": "openai",
       "family": "gpt-codex"
     },
-    "gpt-coder-mini": {
-      "litellm_id": "openai/gpt-5.4-mini",
-      "default_budget_tokens": 8000,
-      "default_timeout_s": 180,
-      "provider": "openai",
-      "family": "gpt-codex"
-    },
     "gemini-pro": {
       "litellm_id": "gemini/gemini-3.1-pro-preview",
       "default_budget_tokens": 16000,
@@ -66,7 +66,7 @@
       "family": "gemini"
     },
     "gemini-flash": {
-      "litellm_id": "gemini/gemini-3.1-flash",
+      "litellm_id": "gemini/gemini-3.1-flash-lite",
       "default_budget_tokens": 8000,
       "default_timeout_s": 120,
       "provider": "google",
@@ -87,7 +87,7 @@
       "family": "llama"
     },
     "sonar-pro": {
-      "litellm_id": "openrouter/perplexity/sonar-pro-online",
+      "litellm_id": "openrouter/perplexity/sonar-pro",
       "default_budget_tokens": 8000,
       "default_timeout_s": 240,
       "provider": "openrouter",
@@ -137,11 +137,11 @@
     }
   },
   "tiers": {
-    "nano": ["claude-haiku", "gemini-flash", "gpt-instant"],
+    "nano": ["claude-haiku", "gemini-flash", "gpt-nano"],
     "quick": ["claude-haiku", "gemini-pro", "grok", "qwen-max", "kimi"],
     "standard": ["claude-opus", "claude-sonnet", "gpt-pro", "gpt", "gemini-pro", "grok", "qwen-max", "kimi", "glm", "llama"],
     "deep": ["claude-opus", "claude-sonnet", "gpt-pro", "gpt", "gemini-pro", "grok", "qwen-max", "kimi", "glm", "llama", "mistral", "deepseek", "mimo", "sonar-pro"],
-    "code": ["claude-opus", "gpt-codex", "gpt-coder-mini", "gemini-pro", "deepseek"]
+    "code": ["claude-opus", "gpt-codex", "gpt-mini", "gemini-pro", "deepseek"]
   },
   "defaults": {
     "synthesiser": "gemini-pro",

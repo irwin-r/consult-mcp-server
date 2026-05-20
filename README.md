@@ -33,13 +33,13 @@ Aliases are `<family>-<tier>` — version-neutral. The registry maps each alias 
 
 | Tier | Models | Use |
 |---|---|---|
-| `nano` (3) | `claude-haiku`, `gemini-flash`, `gpt-instant` | sub-$0.05 panels for smoke tests / trivia |
+| `nano` (3) | `claude-haiku`, `gemini-flash`, `gpt-nano` | sub-$0.05 panels for smoke tests / trivia |
 | `quick` (5) | `claude-haiku`, `gemini-pro`, `grok`, `qwen-max`, `kimi` | ~30s snap second opinions |
 | `standard` (10) | `claude-opus`, `claude-sonnet`, `gpt-pro`, `gpt`, `gemini-pro`, `grok`, `qwen-max`, `kimi`, `glm`, `llama` | normal decisions |
 | `deep` (14) | standard + `mistral`, `deepseek`, `mimo`, `sonar-pro` | high-stakes; includes Perplexity for web search |
-| `code` (5) | `claude-opus`, `gpt-codex`, `gpt-coder-mini`, `gemini-pro`, `deepseek` | code-heavy questions |
+| `code` (5) | `claude-opus`, `gpt-codex`, `gpt-mini`, `gemini-pro`, `deepseek` | code-heavy questions |
 
-Specialist single-model aliases also available: `gpt-codex` (latest OpenAI codex), `sonar-pro` (web search), `gpt-coder-mini` (fast coding).
+Specialist single-model aliases also available: `gpt-codex` (latest OpenAI codex), `sonar-pro` (web search), `gpt-mini`/`gpt-nano` (fast/ultra-cheap general-purpose).
 
 ## The manifest capsule
 
