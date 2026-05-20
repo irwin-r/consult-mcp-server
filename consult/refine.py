@@ -590,7 +590,17 @@ async def refine(
         # arbiter's input is roughly "round prompt + capsule summaries"
         # which scales with the prompt size for code-review / long-context
         # work where the cap actually matters.
-        fanout_est, fanout_known = runner.estimate_cost(specs, round_prompt)
+        # Mirror runner.fanout's view: when a continuation is active, the
+        # prior_turns text is part of every panellist call's input. Omitting
+        # it here lets refine wave a round through that fanout would then
+        # reject as cap-exceeded — and fanout's early-return path would
+        # clobber the prior round's manifest because we share `paths`.
+        fanout_cost_input = round_prompt
+        if prior_turns:
+            fanout_cost_input = (
+                runner._concat_turn_text(prior_turns) + "\n" + round_prompt
+            )
+        fanout_est, fanout_known = runner.estimate_cost(specs, fanout_cost_input)
         arbiter_est, arbiter_known = runner.estimate_cost([arbiter_spec], round_prompt)
         estimate = fanout_est + arbiter_est
         est_known = fanout_known and arbiter_known

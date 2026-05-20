@@ -736,6 +736,17 @@ async def fanout(
         cost_input = _concat_turn_text(prior_turns) + "\n" + prompt
     estimate, all_known = estimate_cost(specs, cost_input)
     cap = max_run_usd if max_run_usd is not None else registry.default_max_run_usd()
+    # Don't clobber an existing manifest with the empty-manifest early-return
+    # payload. Refine drives multiple rounds through the same `paths`; an
+    # over-cap or dry-run rejection on round N+1 would otherwise wipe out
+    # round N's successful manifest. New run dirs (existing_paths is None)
+    # still get the manifest so downstream tools — `consult-view`,
+    # `consult-ledger`, `synth.synthesise` — never face FileNotFoundError on
+    # a dry-run / cap-rejected dir.
+    def _persist_partial_handle(handle: RunHandle) -> None:
+        if existing_paths is None or not paths.manifest_json.exists():
+            artifacts.write_manifest(paths, handle.model_dump())
+
     if estimate > cap:
         # When some prices are unknown, `estimate` is only the known-priced
         # portion; the actual run could cost more. Surface that so the cap
@@ -754,10 +765,7 @@ async def fanout(
             ),
             blinded=blinded,
         )
-        # Write the manifest even on the early-return paths so
-        # `consult-view` / `consult-ledger` / `synth.synthesise` don't
-        # crash with FileNotFoundError on a cap-rejected or dry-run dir.
-        artifacts.write_manifest(paths, handle.model_dump())
+        _persist_partial_handle(handle)
         return handle
     if dry_run:
         suffix = "" if all_known else " (some prices unknown — actual cost may differ)"
@@ -772,7 +780,7 @@ async def fanout(
             partial_reason=f"dry_run: estimated cost ${estimate:.4f}{suffix}",
             blinded=blinded,
         )
-        artifacts.write_manifest(paths, handle.model_dump())
+        _persist_partial_handle(handle)
         return handle
 
     # Build slugs + prompts
