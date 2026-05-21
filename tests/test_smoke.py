@@ -5095,3 +5095,177 @@ async def test_orchestrate_consult_accepts_attachments_and_dry_run(
     assert result.partial is True
     assert result.partial_reason and "dry_run" in result.partial_reason
     assert "ATTACHMENT-CONTENT" in captured["prompt"]
+
+
+# ---- Iter10 regression tests -----------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_fit_prompt_to_context_no_op_when_under_budget(monkeypatch):
+    """No trim, no marker when the prompt already fits."""
+    from consult import runner
+
+    monkeypatch.setattr(
+        runner.litellm, "token_counter", lambda model, text: len(text) // 4,
+    )
+    out = await runner._fit_prompt_to_context(
+        "short prompt",
+        prior_turns=None,
+        litellm_id="x/y",
+        max_input_tokens=100_000,
+        max_output_tokens=4000,
+    )
+    assert out == "short prompt"
+    assert "[TRIMMED" not in out
+
+
+@pytest.mark.asyncio
+async def test_fit_prompt_to_context_trims_when_over_budget(monkeypatch):
+    """Over-budget prompt gets head+tail trimmed with a clear marker so
+    the call proceeds instead of being rejected by the provider."""
+    from consult import runner
+
+    monkeypatch.setattr(
+        runner.litellm, "token_counter", lambda model, text: len(text),
+    )
+    # Budget: 1000 input - 100 output = 900 available. Build a 2000-char
+    # prompt that fakes 1 token/char so we're 2× over.
+    long_prompt = "A" * 1000 + "B" * 1000
+    out = await runner._fit_prompt_to_context(
+        long_prompt,
+        prior_turns=None,
+        litellm_id="x/y",
+        max_input_tokens=1000,
+        max_output_tokens=100,
+    )
+    # Marker present + final size under the budget after the recount loop.
+    assert "[TRIMMED" in out
+    assert len(out) < len(long_prompt)
+
+
+@pytest.mark.asyncio
+async def test_fit_prompt_to_context_skips_when_prior_alone_exceeds_budget(
+    monkeypatch,
+):
+    """If `prior_turns` already exceed the budget, the prompt is returned
+    untouched (we don't corrupt role boundaries) and the provider's
+    rejection becomes the surfaced error."""
+    from consult import runner
+
+    monkeypatch.setattr(
+        runner.litellm, "token_counter", lambda model, text: len(text),
+    )
+    prior = [
+        {"role": "user", "content": "X" * 2000},
+        {"role": "assistant", "content": "Y" * 2000},
+    ]
+    out = await runner._fit_prompt_to_context(
+        "follow-up",
+        prior_turns=prior,
+        litellm_id="x/y",
+        max_input_tokens=1000,
+        max_output_tokens=100,
+    )
+    assert out == "follow-up"  # not trimmed
+
+
+@pytest.mark.asyncio
+async def test_call_one_auto_trims_oversized_prompt(tmp_path, monkeypatch):
+    """End-to-end: _call_one with an over-budget prompt trims, the LLM
+    call succeeds, and the ManifestEntry carries the trim note in
+    `error` even on Status.OK."""
+    from consult import runner
+    from consult.runner import _call_one
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    # max_input_tokens=10000 leaves ~6000 for the prompt after claude-haiku's
+    # default_budget_tokens (4000) is reserved for output.
+    monkeypatch.setattr(
+        runner, "_max_input_tokens", lambda lid, entry: 10_000,
+    )
+    monkeypatch.setattr(
+        runner.litellm, "token_counter", lambda model, text: len(text),
+    )
+
+    sent_messages: dict[str, Any] = {}
+
+    class FakeMsg:
+        content = "trimmed response body"
+
+    class FakeChoice:
+        message = FakeMsg()
+        finish_reason = "stop"
+
+    class FakeResp:
+        choices = [FakeChoice()]
+        usage = type("U", (), {"prompt_tokens": 100, "completion_tokens": 50})()
+
+        def model_dump(self):
+            return {"choices": [{"message": {"content": "trimmed response body"}}]}
+
+    async def fake_acompletion(**kwargs):
+        sent_messages["messages"] = kwargs.get("messages")
+        return FakeResp()
+
+    monkeypatch.setattr(runner.litellm, "acompletion", fake_acompletion)
+    monkeypatch.setattr(
+        runner.litellm, "completion_cost", lambda **kw: 0.01,
+    )
+
+    spec = ModelSpec(model="claude-haiku")
+    paths = artifacts.create_run()
+    # 50000-char prompt is well over the fake 6000-char available input budget.
+    long_prompt = "Z" * 50_000
+
+    entry = await _call_one(spec, "test-slug", long_prompt, paths)
+
+    assert entry.status == Status.OK
+    assert "auto-trimmed" in (entry.error or "")
+    sent_text = sent_messages["messages"][0]["content"]
+    # Anthropic wraps content in a list with cache_control; extract the text.
+    if isinstance(sent_text, list):
+        sent_text = sent_text[0]["text"]
+    assert "[TRIMMED" in sent_text
+    assert len(sent_text) < 50_000
+
+
+def test_max_input_tokens_registry_override():
+    """Explicit max_input_tokens in the registry entry wins over LiteLLM."""
+    from consult.runner import _max_input_tokens
+
+    entry = {"max_input_tokens": 50_000}
+    assert _max_input_tokens("openrouter/some/model", entry) == 50_000
+
+
+def test_max_input_tokens_falls_back_to_litellm(monkeypatch):
+    """No registry override → ask LiteLLM."""
+    from consult import runner
+
+    monkeypatch.setattr(
+        runner.litellm, "get_model_info",
+        lambda model: {"max_input_tokens": 128_000},
+    )
+    assert runner._max_input_tokens("openai/gpt-x", {}) == 128_000
+
+
+def test_max_input_tokens_unknown_returns_none(monkeypatch):
+    """Unknown model + no override → None, so pre-flight is skipped."""
+    from consult import runner
+
+    def boom(model):
+        raise Exception("unknown model")
+
+    monkeypatch.setattr(runner.litellm, "get_model_info", boom)
+    assert runner._max_input_tokens("vendor/totally-new-model", {}) is None
+
+
+def test_slow_tail_dropout_default_is_180s():
+    """Default bumped from 30s to 180s — long-context wide-panel runs were
+    losing real signal (kimi/qwen often take 60-180s on ~200K input)."""
+    # The default lives in runner.fanout's body; verify by reading the
+    # source rather than executing the path (which would need a full fanout).
+    import inspect
+
+    from consult import runner
+    src = inspect.getsource(runner.fanout)
+    assert 'os.environ.get("CONSULT_TAIL_DROPOUT_S", 180.0)' in src

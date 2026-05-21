@@ -415,6 +415,131 @@ def _stream_partial_interval_s() -> float:
     )
 
 
+def _max_input_tokens(litellm_id: str, entry: dict[str, Any]) -> int | None:
+    """Return the model's maximum input-token budget, or None if unknown.
+
+    Lookup order:
+    1. `entry["max_input_tokens"]` — explicit registry override. Use when
+       LiteLLM's table is wrong or stale for a model.
+    2. `litellm.get_model_info(litellm_id)["max_input_tokens"]` — LiteLLM
+       maintains this for most known models. Returns None when missing.
+    3. None — unknown context size; the pre-flight check below skips
+       gracefully (provider will reject the call if it's too large, same
+       as the prior behaviour).
+
+    Kept narrow on purpose: we don't want a broad provider-capability layer
+    here, just enough to surface "your prompt is too big" as a manifest
+    Status.ERROR rather than as a raw provider BadRequestError that the
+    user has to decode.
+    """
+    override = entry.get("max_input_tokens")
+    if override is not None:
+        try:
+            return int(override)
+        except (TypeError, ValueError):
+            logger.warning(
+                "registry max_input_tokens for %s is not an int: %r",
+                litellm_id, override,
+            )
+    try:
+        info = litellm.get_model_info(litellm_id)
+    except Exception:  # noqa: BLE001 — get_model_info raises on unknown IDs
+        return None
+    if isinstance(info, dict):
+        v = info.get("max_input_tokens")
+        if isinstance(v, int) and v > 0:
+            return v
+    return None
+
+
+async def _fit_prompt_to_context(
+    per_slug_prompt: str,
+    *,
+    prior_turns: list[dict[str, Any]] | None,
+    litellm_id: str,
+    max_input_tokens: int,
+    max_output_tokens: int,
+) -> str:
+    """Trim `per_slug_prompt` so input+output fits the model's context.
+
+    Returns the prompt unchanged when already within budget. Otherwise
+    head+tail truncates the prompt via `context.trim_text` (preserves the
+    stance preface at the head and the CONFIDENCE/KEY_REASON footer at
+    the tail) and re-counts; if still over budget after one pass (rare —
+    usually means `prior_turns` alone exceed the budget), shrinks further
+    via a smaller char target.
+
+    The `prior_turns` text is included in the token count but never
+    trimmed — those are the prior consultation's role-separated exchange
+    in a `refine` continuation, and trimming them would corrupt the
+    user/assistant boundary the model relies on. If they alone exceed the
+    budget the caller should re-prompt without continuation.
+    """
+    from . import context
+
+    prior_text = _concat_turn_text(prior_turns) if prior_turns else ""
+    target_input = max_input_tokens - max_output_tokens
+    if target_input <= 0:
+        # Defensive: the registry's `default_budget_tokens` shouldn't ever
+        # be larger than the model's whole context, but if it is, return
+        # the prompt as-is and let the provider reject — the caller's
+        # config is the real bug.
+        return per_slug_prompt
+
+    async def _count(text: str) -> int:
+        # token_counter is sync + CPU-bound; offload so we don't block the
+        # event loop during the pre-flight check.
+        try:
+            return int(await asyncio.to_thread(
+                litellm.token_counter, model=litellm_id, text=text,
+            ))
+        except Exception:  # noqa: BLE001
+            return -1  # unknown — caller treats as "skip the check"
+
+    prior_tokens = await _count(prior_text) if prior_text else 0
+    if prior_tokens < 0:
+        return per_slug_prompt  # token_counter is broken; let provider decide
+    available_for_prompt = target_input - prior_tokens
+    if available_for_prompt <= 0:
+        # prior_turns alone exceed the budget. We don't trim prior_turns
+        # (would corrupt role boundaries); log and pass through so the
+        # caller sees the provider's rejection with the real reason.
+        logger.warning(
+            "fit_prompt: prior_turns alone (%d tokens) exceed available input "
+            "budget (%d). Returning prompt untrimmed; provider will reject.",
+            prior_tokens, target_input,
+        )
+        return per_slug_prompt
+
+    prompt_tokens = await _count(per_slug_prompt)
+    if prompt_tokens < 0:
+        return per_slug_prompt
+    if prompt_tokens <= available_for_prompt:
+        return per_slug_prompt  # already fits, no-op
+
+    # Trim. token_counter <-> char-count is approximate; aim for 90% of the
+    # available budget so a recount comes in under cleanly. The 500-char
+    # floor prevents pathological "shrink to nothing" outcomes on
+    # tiny-context models — below that the panellist has no signal at all
+    # and the trim would just produce a marker stub. Cap iterations at 3
+    # — usually one pass suffices.
+    trimmed = per_slug_prompt
+    for _attempt in range(3):
+        ratio = (available_for_prompt * 0.9) / prompt_tokens
+        target_chars = max(500, int(len(trimmed) * ratio))
+        if target_chars >= len(trimmed):
+            # Can't shrink further without breaking the floor — return what
+            # we have and let the provider reject (or accept) the call.
+            break
+        trimmed = context.trim_text(
+            trimmed, target_chars, label="panellist prompt",
+        )
+        prompt_tokens = await _count(trimmed)
+        if prompt_tokens < 0 or prompt_tokens <= available_for_prompt:
+            break
+    return trimmed
+
+
 async def _stream_acompletion(
     *,
     timeout: float,
@@ -550,6 +675,40 @@ async def _call_one(
     if provider_sems:
         sem = provider_sems.get(provider) or provider_sems.get("default")
 
+    # Pre-flight context-budget check + auto-trim. Each provider rejects
+    # calls that exceed its context window with a hard 400; without this
+    # we'd burn latency (and a per-provider rate-limit slot) to get back
+    # a raw BadRequestError that surfaces in the manifest as a wall of
+    # provider JSON.
+    #
+    # When the prompt would overflow, trim per_slug_prompt head+tail
+    # (preserving the stance preface and the CONFIDENCE/KEY_REASON
+    # footer — both live in the head/tail respectively) so the call
+    # succeeds with a slightly-reduced view of the source material.
+    # Trimming is logged at warning level and noted in the manifest's
+    # `error` field even on success ("trimmed N chars..."), so the
+    # caller can see that this panellist saw less than the others.
+    #
+    # Skipped silently when the model's context size is unknown — falls
+    # back to the prior "let the provider reject it" behaviour for
+    # unfamiliar models.
+    trim_note: str | None = None
+    max_in = _max_input_tokens(litellm_id, entry)
+    if max_in is not None:
+        per_slug_prompt = await _fit_prompt_to_context(
+            per_slug_prompt,
+            prior_turns=prior_turns,
+            litellm_id=litellm_id,
+            max_input_tokens=max_in,
+            max_output_tokens=budget,
+        )
+        # `_fit_prompt_to_context` annotates the prompt with a `[TRIMMED ...]`
+        # marker when it cut anything; surface a one-line note in the manifest
+        # so the caller can see at a glance that this panellist's input was
+        # narrower than the others'.
+        if "[TRIMMED" in per_slug_prompt:
+            trim_note = "input auto-trimmed to fit model context window"
+
     try:
         async with sem if sem is not None else nullcontext():
             messages = _build_messages(per_slug_prompt, provider, prior_turns)
@@ -645,6 +804,13 @@ async def _call_one(
     # doesn't blow up — the underlying classifier already logged the shape.
     if status in (Status.ERROR, Status.TIMEOUT) and not error:
         error = f"{status.value}: no provider exception captured"
+
+    # Surface the pre-flight trim note on the OK path too. `error` is
+    # primarily for failure reasons but doubles as a soft annotation
+    # channel here so the caller can spot when this panellist saw less
+    # input than the others (their capsule may be thinner as a result).
+    if trim_note and not error:
+        error = trim_note
 
     return ManifestEntry(
         slug=slug,
@@ -964,7 +1130,12 @@ async def fanout(
     # small panels (no useful "rest of the panel" signal) and when
     # CONSULT_TAIL_DROPOUT_S=0. The full per-spec timeout still bounds the
     # worst case if dropout is off.
-    tail_dropout_s = float(os.environ.get("CONSULT_TAIL_DROPOUT_S", 30.0))
+    #
+    # Default 180s (was 30s): long-context code reviews on wide panels
+    # produce genuinely useful capsules from slower models (kimi, qwen,
+    # deepseek often take 60-180s on ~200K input). The previous 30s was
+    # firing on most wide-panel runs and dropping real signal.
+    tail_dropout_s = float(os.environ.get("CONSULT_TAIL_DROPOUT_S", 180.0))
     tail_k_frac = float(os.environ.get("CONSULT_TAIL_K_FRAC", 0.2))
     enable_dropout = total >= 4 and tail_dropout_s > 0 and 0 < tail_k_frac < 1.0
 
