@@ -765,7 +765,7 @@ async def refine(
         # `cumulative_cost` in memory but never reached disk. Without this
         # `consult-ledger` reads the last fanout's cost and silently
         # under-reports the run total.
-        artifacts.augment_manifest(
+        await artifacts.aaugment_manifest(
             paths,
             synthesiser=synth_alias,
             cost_usd=cumulative_cost,

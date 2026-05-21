@@ -16,6 +16,7 @@ import logging
 from collections.abc import Awaitable, Callable
 
 from . import artifacts, capsule, registry, runner, synth
+from . import attachments as attachments_mod
 from .progress import ProgressEvent, SynthCompleted, SynthStarted, shift_bucket
 from .types import ModelSpec, RunResult
 
@@ -53,6 +54,8 @@ async def consult(
     extract_capsules: bool = True,
     capsule_kind: str = "decision",
     rubric: str | None = None,
+    attachments: list | None = None,
+    dry_run: bool = False,
     on_progress: ProgressCallback | None = None,
 ) -> RunResult:
     """Run the 3-phase hero: fanout → capsule extract → synth.
@@ -61,6 +64,17 @@ async def consult(
     bias. Synth spend rolls into the returned `cost_usd` and is also
     persisted to the on-disk manifest so `consult-ledger` reports the
     true run total rather than the fanout-only figure.
+
+    `attachments`, when set, is the same shape the MCP `consult` tool
+    accepts — bare strings, `{path, label?, kind?}` dicts, or
+    `{source: "git_diff", base, head, repo_path?, label?}` — and gets
+    inlined into the prompt under an `--- ATTACHMENTS ---` separator.
+    Library consumers can pass file references without separately
+    importing `attachments.inline_attachments`.
+
+    `dry_run=True` estimates cost without invoking any model — useful
+    for pre-flight cap validation. Returns a partial RunResult with
+    `cost_usd=0` and a `dry_run:` partial_reason.
 
     `on_progress`, when set, receives a single monotonic stream of
     progress events across all three phases — child events from each
@@ -78,6 +92,12 @@ async def consult(
     # cost. `registry.resolve_model` raises KeyError on an unknown alias.
     registry.resolve_model(synth_alias)
 
+    # Inline attachments inside the engine so library consumers don't
+    # have to do it. MCP handlers pre-inline before calling us, which
+    # makes this a no-op for that path (attachments will be None).
+    if attachments is not None:
+        prompt = attachments_mod.inline_attachments(prompt, attachments)
+
     # Exclude the synthesiser from the panel to avoid self-inclusion bias.
     panel_aliases = [m for m in tier_models if m != synth_alias]
     specs = [ModelSpec(model=m, stance=roles.get(m)) for m in panel_aliases]
@@ -94,6 +114,7 @@ async def consult(
         prompt,
         specs,
         blinded=blinded,
+        dry_run=dry_run,
         max_run_usd=max_run_usd,
         on_progress=shift_bucket(on_progress, fanout_offset, overall_total),
         capsule_kind=capsule_kind,
@@ -147,7 +168,7 @@ async def consult(
     # the wire, but the manifest written by `runner.fanout` was assembled
     # before synth ran — `consult-ledger` reads from disk and would otherwise
     # under-report by the synth call's spend.
-    artifacts.augment_manifest(
+    await artifacts.aaugment_manifest(
         artifacts.load_run(handle.run_id),
         synthesiser=synth_alias,
         cost_usd=total_cost,

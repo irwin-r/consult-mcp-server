@@ -82,9 +82,13 @@ async def synthesise(
 async def consult(
     args: dict[str, Any], *, on_progress: ProgressCallback | None = None
 ) -> dict[str, Any]:
-    prompt = attachments.inline_attachments(args["prompt"], args.get("attachments"))
+    # Attachments are forwarded raw to `orchestrate.consult`, which inlines
+    # them itself. Two reasons not to pre-inline here: (1) library consumers
+    # get the same convenience without re-importing `attachments`, and (2)
+    # having one inlining site keeps the rendered shape consistent if it
+    # ever changes.
     result = await orchestrate.consult(
-        prompt,
+        args["prompt"],
         tier=args.get("tier", "standard"),
         roles=args.get("roles"),
         synthesiser=args.get("synthesiser"),
@@ -93,6 +97,7 @@ async def consult(
         extract_capsules=args.get("extract_capsules", True),
         capsule_kind=args.get("capsule_kind", "decision"),
         rubric=args.get("rubric"),
+        attachments=args.get("attachments"),
         on_progress=on_progress,
     )
     return result.model_dump()

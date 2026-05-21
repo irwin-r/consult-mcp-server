@@ -225,7 +225,7 @@ async def sequence(
         # under-report) and the result's `steps` array omitted the run
         # entirely. The break still fires below — but only after the step
         # has been fully recorded.
-        artifacts.augment_manifest(
+        await artifacts.aaugment_manifest(
             artifacts.load_run(handle.run_id),
             synthesiser=synth_alias,
             cost_usd=step_cost,

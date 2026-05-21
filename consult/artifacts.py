@@ -26,6 +26,7 @@ import random
 import re
 import time
 from collections.abc import Callable
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -35,9 +36,12 @@ from pathlib import Path
 # `set_resource_uri_formatter()`; the manifest then carries whatever URI
 # their downstream tooling knows how to fetch.
 #
-# Module-level (rather than per-RunPaths) so a process-wide override
-# applies to runs created by every code path (refine, sequence, the CLI
-# tools, etc.) without threading a formatter through every call site.
+# Stored in a `ContextVar` rather than a module-level binding so that two
+# concurrent fanouts in the same process (e.g. a multi-tenant HTTP server,
+# each request scoped to its own URI scheme) can each install their own
+# formatter without corrupting the other. Async tasks inherit the
+# formatter from their spawning context — call `set_resource_uri_formatter`
+# once at request entry and it scopes to the awaitable that follows.
 ResourceUriFormatter = Callable[[str, str], str]
 
 
@@ -45,24 +49,32 @@ def _default_resource_uri(run_id: str, slug: str) -> str:
     return f"consult://runs/{run_id}/responses/{slug}"
 
 
-_resource_uri_formatter: ResourceUriFormatter = _default_resource_uri
+_resource_uri_formatter: ContextVar[ResourceUriFormatter] = ContextVar(
+    "consult_resource_uri_formatter", default=_default_resource_uri
+)
 
 
 def set_resource_uri_formatter(fn: ResourceUriFormatter) -> None:
-    """Override the URI formatter used by every new manifest entry.
+    """Override the URI formatter used by every new manifest entry in the
+    current async context.
 
-    Call once at process start. Existing on-disk manifests are NOT rewritten —
-    `parse_resource_uri()` below only knows the default `consult://` scheme,
-    so a custom formatter implies the consumer owns its own parse path too.
+    Scoped to the calling `contextvars.Context`: tasks spawned after this
+    call inherit the override; sibling contexts (other concurrent HTTP
+    requests, other test cases) are unaffected. Existing on-disk manifests
+    are NOT rewritten; `parse_resource_uri()` below only knows the default
+    `consult://` scheme, so a custom formatter implies the consumer owns
+    its own parse path too.
     """
-    global _resource_uri_formatter
-    _resource_uri_formatter = fn
+    _resource_uri_formatter.set(fn)
 
 
 def reset_resource_uri_formatter() -> None:
-    """Restore the default `consult://` formatter. Useful for tests."""
-    global _resource_uri_formatter
-    _resource_uri_formatter = _default_resource_uri
+    """Restore the default `consult://` formatter in the current context.
+
+    Useful for tests; production code that wants per-request scope should
+    just install a new formatter at request entry and let context isolation
+    do the work."""
+    _resource_uri_formatter.set(_default_resource_uri)
 
 
 def runs_root() -> Path:
@@ -147,7 +159,7 @@ class RunPaths:
         return self.capsules / f"{_validate_id(slug, 'slug')}.json"
 
     def resource_uri(self, slug: str) -> str:
-        return _resource_uri_formatter(self.run_id, _validate_id(slug, "slug"))
+        return _resource_uri_formatter.get()(self.run_id, _validate_id(slug, "slug"))
 
     def arbiter_for(self, round_num: int) -> Path:
         return self.arbiters / f"round-{round_num}.json"
@@ -186,7 +198,7 @@ def write_manifest(paths: RunPaths, payload: dict) -> None:
 
 
 def augment_manifest(paths: RunPaths, **fields: object) -> None:
-    """Merge fields into the existing manifest.json.
+    """Merge fields into the existing manifest.json (synchronous).
 
     Used after synth/refine to persist metadata that wasn't available at
     fanout time — `synthesiser` is the canonical example: the consult
@@ -197,6 +209,11 @@ def augment_manifest(paths: RunPaths, **fields: object) -> None:
     effort: if the manifest is missing or malformed, no-op rather than
     raise — augmentation is a UX nicety for downstream viewers, not a
     correctness boundary.
+
+    Sync by design: easy to call from non-async contexts (CLI tools,
+    tests, the viewer). Async fan-out paths call `aaugment_manifest`
+    below so the disk write doesn't block the event loop during
+    multi-round refine or large sequence runs.
     """
     if not paths.manifest_json.exists():
         return
@@ -208,6 +225,19 @@ def augment_manifest(paths: RunPaths, **fields: object) -> None:
         return
     current.update(fields)
     paths.manifest_json.write_text(json.dumps(current, indent=2, default=str))
+
+
+async def aaugment_manifest(paths: RunPaths, **fields: object) -> None:
+    """Async wrapper around `augment_manifest`.
+
+    Offloads the JSON read + write to a thread so the event loop stays
+    responsive during heavy refine/sequence orchestration where
+    augment_manifest is called repeatedly. Test monkeypatches still bind
+    to the sync `augment_manifest` symbol — this picks up whatever's
+    currently bound there, so test setup is unchanged.
+    """
+    import asyncio
+    await asyncio.to_thread(augment_manifest, paths, **fields)
 
 
 def parse_resource_uri(uri: str) -> tuple[str, str]:

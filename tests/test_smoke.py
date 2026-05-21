@@ -4963,3 +4963,135 @@ def test_refine_continuation_sentinel_check_handles_leading_whitespace(
 # `asyncio` is imported lazily so the rest of the test module's existing
 # style stays intact.
 import asyncio  # noqa: E402
+
+# ---- Iter9 regression tests ------------------------------------------------
+
+
+def test_resource_uri_formatter_is_context_scoped(tmp_path, monkeypatch):
+    """The override is scoped to the current async/contextvars Context, so
+    two concurrent consumers don't corrupt each other's manifest URIs.
+    """
+    import contextvars
+
+    from consult.artifacts import (
+        reset_resource_uri_formatter,
+        set_resource_uri_formatter,
+    )
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    paths = artifacts.create_run()
+
+    # Default formatter — `consult://` scheme.
+    reset_resource_uri_formatter()
+    assert paths.resource_uri("alpha") == f"consult://runs/{paths.run_id}/responses/alpha"
+
+    # Override scoped to a child context: parent context stays on the default.
+    def install_http():
+        set_resource_uri_formatter(
+            lambda run_id, slug: f"https://example.com/runs/{run_id}/{slug}"
+        )
+        return paths.resource_uri("alpha")
+
+    child_ctx = contextvars.copy_context()
+    in_child = child_ctx.run(install_http)
+    assert in_child == f"https://example.com/runs/{paths.run_id}/alpha"
+    # Parent context unaffected because the child's `set` only mutated its
+    # own copy of the contextvars map.
+    assert paths.resource_uri("alpha") == f"consult://runs/{paths.run_id}/responses/alpha"
+
+
+@pytest.mark.asyncio
+async def test_synth_persists_cost_to_manifest(tmp_path, monkeypatch):
+    """Direct calls to synth.synthesise() must persist the synthesiser
+    cost + badge to the run's manifest so consult-ledger sees it.
+    Previously only orchestrate/refine/sequence did this; the standalone
+    synthesise tool was a ledger blindspot.
+    """
+    from consult import synth as synth_mod
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+
+    # Build a minimal run with one usable body + manifest on disk.
+    paths = artifacts.create_run()
+    entry = ManifestEntry(
+        slug="alpha", model_id="anthropic/x", status=Status.OK,
+        resource_uri=paths.resource_uri("alpha"),
+        body_path=str(paths.response_text("alpha")),
+        latency_ms=10, cost_usd=0.005, cost_known=True,
+    )
+    paths.response_text("alpha").write_text("Some response.")
+    handle = RunHandle(
+        run_id=paths.run_id,
+        artifacts_dir=str(paths.root),
+        manifest=[entry],
+        cost_usd=0.005,
+        cost_known=True,
+        wall_ms=10,
+    )
+    artifacts.write_manifest(paths, handle.model_dump())
+
+    # Stub the LiteLLM call so the synth path returns deterministic text + cost.
+    class FakeMsg:
+        content = "synth body"
+
+    class FakeChoice:
+        message = FakeMsg()
+        finish_reason = "stop"
+
+    class FakeResp:
+        choices = [FakeChoice()]
+
+    async def fake_acompletion(**kwargs):
+        return FakeResp()
+
+    monkeypatch.setattr(synth_mod.litellm, "acompletion", fake_acompletion)
+    monkeypatch.setattr(
+        synth_mod.litellm, "completion_cost", lambda **kw: 0.05,
+    )
+
+    result = await synth_mod.synthesise(paths.run_id)
+    assert result.status is synth_mod.SynthStatus.OK
+    assert abs(result.cost_usd - 0.05) < 1e-9
+
+    # Manifest on disk now reflects the synth spend + synthesiser badge.
+    on_disk = json.loads(paths.manifest_json.read_text())
+    assert abs(on_disk["cost_usd"] - 0.05) < 1e-9
+    assert "synthesiser" in on_disk
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_consult_accepts_attachments_and_dry_run(
+    tmp_path, monkeypatch
+):
+    """orchestrate.consult must accept attachments (inlining internally)
+    and dry_run (passed through to runner.fanout) so library consumers
+    have parity with the MCP `consult` tool.
+    """
+    from consult import orchestrate, runner
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    monkeypatch.setattr(runner, "estimate_cost", lambda specs, prompt: (0.5, True))
+
+    f = tmp_path / "atta.txt"
+    f.write_text("ATTACHMENT-CONTENT")
+
+    # dry_run=True returns a partial RunResult; the prompt that reaches
+    # estimate_cost includes the attachment content (proves inlining).
+    captured = {}
+
+    def fake_estimate(specs, prompt):
+        captured["prompt"] = prompt
+        return (0.5, True)
+
+    monkeypatch.setattr(runner, "estimate_cost", fake_estimate)
+
+    result = await orchestrate.consult(
+        "test question",
+        tier="nano",
+        attachments=[str(f)],
+        dry_run=True,
+        max_run_usd=10.0,
+    )
+    assert result.partial is True
+    assert result.partial_reason and "dry_run" in result.partial_reason
+    assert "ATTACHMENT-CONTENT" in captured["prompt"]

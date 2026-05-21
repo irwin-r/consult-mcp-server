@@ -270,6 +270,22 @@ async def synthesise(
 
     text = content.strip()
     (paths.root / "synthesis.md").write_text(text)
+    # Persist synthesiser badge + spend to the manifest so the standalone
+    # `synthesise` tool's cost reaches `consult-ledger`. `orchestrate.consult`,
+    # `refine`, and `sequence` already roll their cumulative cost into the
+    # manifest themselves (they need to combine fanout + capsule + synth);
+    # the direct-synth path was the missing one. Best-effort: a partial
+    # manifest or failed lookup silently no-ops (matches augment_manifest's
+    # contract) so a re-synth of a legacy run doesn't surface a new error.
+    try:
+        await artifacts.aaugment_manifest(
+            paths,
+            synthesiser=synth_alias,
+            cost_usd=cost_value,
+            cost_known=cost_known,
+        )
+    except Exception as e:  # noqa: BLE001 — augment is best-effort, never load-bearing
+        logger.debug("augment_manifest skipped on direct synth: %s", e)
     return SynthResult(
         text=text, cost_usd=cost_value, cost_known=cost_known,
         status=SynthStatus.OK,
