@@ -162,3 +162,203 @@ async def test_read_resource_round_trip(mcp_session_factory, tmp_path, monkeypat
     assert result.contents
     first = result.contents[0]
     assert getattr(first, "text", None) == "THIS IS THE BODY"
+
+
+# ---- SEP-1686 task mode -----------------------------------------------------
+#
+# Task-augmented tools/call: client sends `params.task: {ttl}`, server returns
+# a CreateTaskResult immediately with a taskId, the handler runs in the
+# background, and the client polls `tasks/get` until terminal. Stubbing one
+# of the `_HANDLERS` entries lets us drive the full roundtrip offline — the
+# adapter glue (task spawning, run_id correlation, terminal-state mapping)
+# is what we're testing, not engine behaviour.
+
+
+def _task_call_request(name: str, arguments: dict, *, ttl_ms: int):
+    """Build a ClientRequest wrapping a CallToolRequest with task metadata."""
+    from mcp.types import (
+        CallToolRequest,
+        CallToolRequestParams,
+        ClientRequest,
+        TaskMetadata,
+    )
+
+    return ClientRequest(
+        CallToolRequest(
+            params=CallToolRequestParams(
+                name=name,
+                arguments=arguments,
+                task=TaskMetadata(ttl=ttl_ms),
+            ),
+        )
+    )
+
+
+def _get_task_request(task_id: str):
+    from mcp.types import (
+        ClientRequest,
+        GetTaskRequest,
+        GetTaskRequestParams,
+    )
+
+    return ClientRequest(
+        GetTaskRequest(params=GetTaskRequestParams(taskId=task_id)),
+    )
+
+
+async def _poll_until_terminal(client, task_id: str, timeout_s: float = 2.0):
+    """Poll `tasks/get` until status leaves 'working', or fail the test.
+
+    Returns the terminal GetTaskResult (taskId/status/createdAt/... at the
+    root — the SDK's GetTaskResult is flat, unlike CreateTaskResult which
+    nests under a `task` field).
+    """
+    import asyncio
+    import time
+
+    from mcp.types import GetTaskResult
+
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        result = await client.send_request(
+            _get_task_request(task_id), GetTaskResult,
+        )
+        if result.status != "working":
+            return result
+        await asyncio.sleep(0.01)
+    pytest.fail(f"task {task_id} did not leave 'working' within {timeout_s}s")
+
+
+@pytest.fixture(autouse=False)
+def _clean_task_store():
+    """Per-test isolation for the in-process task registry."""
+    from consult import task_store
+
+    task_store._reset_for_tests()
+    yield
+    task_store._reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_task_mode_returns_create_task_then_completes(
+    mcp_session_factory, monkeypatch, _clean_task_store,
+):
+    """Happy path: tools/call with task.ttl returns a CreateTaskResult
+    synchronously, the background handler runs, and a follow-up tasks/get
+    reports status=completed plus the handler's run_id correlated onto
+    the task record.
+    """
+    from mcp.types import CreateTaskResult
+
+    from consult import task_store
+    from consult.mcp import server as server_mod
+
+    async def fake_consult(args, on_progress=None):
+        # Mimic the consult tool's wire shape so attach_run_id triggers.
+        return {
+            "run_id": "test-run-abc123",
+            "synthesis": "stub synthesis",
+            "manifest": [],
+        }
+
+    monkeypatch.setitem(server_mod._HANDLERS, "consult", fake_consult)
+
+    async with mcp_session_factory() as client:
+        # 1) Kick off the task. The server returns immediately with a
+        #    CreateTaskResult — NOT a CallToolResult — so we use
+        #    send_request directly with the right result_type.
+        create = await client.send_request(
+            _task_call_request(
+                "consult", {"prompt": "x", "tier": "quick"}, ttl_ms=60_000,
+            ),
+            CreateTaskResult,
+        )
+        assert create.task.taskId.startswith("task-")
+        assert create.task.status == "working"
+        assert create.task.ttl == 60_000
+        assert create.task.pollInterval is not None
+        assert create.task.pollInterval > 0
+        task_id = create.task.taskId
+
+        # 2) Poll tasks/get until the background work finishes.
+        terminal = await _poll_until_terminal(client, task_id)
+
+    assert terminal.status == "completed"
+    # Forensic correlation: the handler returned a run_id and the adapter
+    # surfaced it on the TaskRecord.
+    rec = task_store.get(task_id)
+    assert rec is not None
+    assert rec.run_id == "test-run-abc123"
+    # The handler's wire-shape dict is on the record so a future
+    # tasks/result endpoint can serve it.
+    assert rec.result == {
+        "run_id": "test-run-abc123",
+        "synthesis": "stub synthesis",
+        "manifest": [],
+    }
+
+
+@pytest.mark.asyncio
+async def test_task_mode_handler_exception_marks_failed(
+    mcp_session_factory, monkeypatch, _clean_task_store,
+):
+    """A handler raising mid-flight must transition the task to `failed`
+    with a status_message rather than leaving it stuck in `working`. The
+    background-task wrapper catches everything except CancelledError; the
+    test pins that contract.
+    """
+    from mcp.types import CreateTaskResult
+
+    from consult import task_store
+    from consult.mcp import server as server_mod
+
+    async def boom(args, on_progress=None):
+        raise RuntimeError("the upstream provider exploded")
+
+    monkeypatch.setitem(server_mod._HANDLERS, "consult", boom)
+
+    async with mcp_session_factory() as client:
+        create = await client.send_request(
+            _task_call_request(
+                "consult", {"prompt": "x", "tier": "quick"}, ttl_ms=60_000,
+            ),
+            CreateTaskResult,
+        )
+        task_id = create.task.taskId
+        terminal = await _poll_until_terminal(client, task_id)
+
+    # Note: _run_handler_with_envelopes catches exceptions and returns
+    # an ErrorEnvelope dict instead of propagating, so `boom`'s raise is
+    # caught BEFORE it reaches the background-task wrapper. The task
+    # therefore completes (with an envelope body), it does NOT fail.
+    # This pins that wire contract: a tool-level error surfaces as a
+    # completed task whose result carries the structured envelope, not
+    # a transport-level task failure.
+    assert terminal.status == "completed"
+    rec = task_store.get(task_id)
+    assert rec is not None
+    assert isinstance(rec.result, dict)
+    assert rec.result.get("ok") is False
+    assert rec.result["error"]["code"] == "internal_error"
+    assert "upstream provider exploded" in rec.result["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_tasks_get_unknown_task_raises_invalid_params(
+    mcp_session_factory, _clean_task_store,
+):
+    """Polling a taskId the server has never seen raises an McpError with
+    INVALID_PARAMS. The SDK's `GetTaskResult` shape requires `taskId`
+    and `status`, so there's no in-band sentinel for "not found" —
+    clients are expected to resubmit, per SEP-1686."""
+    from mcp.shared.exceptions import McpError
+    from mcp.types import INVALID_PARAMS, GetTaskResult
+
+    async with mcp_session_factory() as client:
+        with pytest.raises(McpError) as exc_info:
+            await client.send_request(
+                _get_task_request("task-doesnotexist"),
+                GetTaskResult,
+            )
+    assert exc_info.value.error.code == INVALID_PARAMS
+    assert "task-doesnotexist" in exc_info.value.error.message

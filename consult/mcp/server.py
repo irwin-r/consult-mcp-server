@@ -36,7 +36,6 @@ from mcp.types import (
     Resource,
     ServerResult,
     Task,
-    TaskStatus,
     TextContent,
     Tool,
     ToolAnnotations,
@@ -257,18 +256,18 @@ def _is_task_request() -> int | None:
     a `CreateTaskResult` immediately and runs the work async. Returns
     the ttl integer when task mode is active (None ttl means "default"
     per the spec — we treat that as 0 = no expiry).
+
+    The SDK surfaces task metadata via `ctx.experimental.task_metadata`
+    (parsed from `params.task` by the lowlevel server). `ctx.request`
+    only gets populated under SSE transport; reading it for stdio
+    would always return None.
     """
     try:
         ctx = server.request_context
     except LookupError:
         return None
-    req = getattr(ctx, "request", None)
-    if req is None:
-        return None
-    params = getattr(req, "params", None)
-    if params is None:
-        return None
-    task_meta = getattr(params, "task", None)
+    experimental = getattr(ctx, "experimental", None)
+    task_meta = getattr(experimental, "task_metadata", None) if experimental else None
     if task_meta is None:
         return None
     return getattr(task_meta, "ttl", None) or 0
@@ -325,7 +324,7 @@ async def handle_call_tool(
     return CreateTaskResult(
         task=Task(
             taskId=rec.task_id,
-            status=TaskStatus(rec.status),
+            status=rec.status,  # already one of the TaskStatus literals
             createdAt=_iso(rec.created_at),
             lastUpdatedAt=_iso(rec.last_updated_at),
             ttl=rec.ttl_ms,
@@ -343,26 +342,32 @@ def _iso(epoch_seconds: float) -> str:
 async def _handle_get_task(req: GetTaskRequest) -> ServerResult:
     """Respond to a `tasks/get` poll.
 
-    Returns the current `Task` snapshot for the requested taskId.
-    Unknown taskIds return an empty (None-task) GetTaskResult — clients
-    that lost the taskId should resubmit rather than hang.
+    Returns the current task snapshot for the requested taskId. Unknown
+    taskIds resolve via the JSON-RPC error path (the SDK has no
+    "task=None" sentinel — `GetTaskResult` is flat, with required
+    taskId/status fields).
     """
     task_id = req.params.taskId
     rec = task_store.get(task_id)
     if rec is None:
-        # Per the spec the result has Optional[Task]; None signals "not found".
-        return ServerResult(GetTaskResult(task=None))  # type: ignore[arg-type]
+        # `GetTaskResult` has no None-task sentinel — its taskId/status
+        # fields are required. The JSON-RPC invalid-params code is the
+        # closest standard match; the spec doesn't reserve a code for
+        # this case. Clients should treat it as "resubmit", per SEP-1686.
+        from mcp.shared.exceptions import McpError
+        from mcp.types import INVALID_PARAMS, ErrorData
+        raise McpError(
+            ErrorData(code=INVALID_PARAMS, message=f"Unknown taskId: {task_id}")
+        )
     return ServerResult(
         GetTaskResult(
-            task=Task(
-                taskId=rec.task_id,
-                status=TaskStatus(rec.status),
-                statusMessage=rec.status_message,
-                createdAt=_iso(rec.created_at),
-                lastUpdatedAt=_iso(rec.last_updated_at),
-                ttl=rec.ttl_ms,
-                pollInterval=rec.poll_interval_ms,
-            ),
+            taskId=rec.task_id,
+            status=rec.status,  # already one of the TaskStatus literals
+            statusMessage=rec.status_message,
+            createdAt=_iso(rec.created_at),
+            lastUpdatedAt=_iso(rec.last_updated_at),
+            ttl=rec.ttl_ms,
+            pollInterval=rec.poll_interval_ms,
         )
     )
 
