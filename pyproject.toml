@@ -19,6 +19,14 @@ dependencies = [
 mcp = [
     "mcp>=1.2.0",
 ]
+# OpenTelemetry tracing — emits gen_ai.* semantic-conventions spans per
+# panellist call when OTEL_EXPORTER_OTLP_ENDPOINT is set. Without this
+# extra, telemetry helpers are no-ops at zero overhead.
+otel = [
+    "opentelemetry-api>=1.20",
+    "opentelemetry-sdk>=1.20",
+    "opentelemetry-exporter-otlp>=1.20",
+]
 dev = [
     "mcp>=1.2.0",
     "pytest>=8.0",
