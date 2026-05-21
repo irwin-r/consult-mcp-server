@@ -72,6 +72,18 @@ The parent can synthesise from this alone in most cases. Bodies are fetched via 
 
 ## Install
 
+Once published to PyPI (not yet — local-only for now), one-shot install via uvx:
+
+```bash
+# Run without any persistent install (recommended for stdio MCP clients):
+uvx --from consult-mcp-server[mcp] consult-mcp
+
+# Or pin into a tool environment:
+uv tool install "consult-mcp-server[mcp]"
+```
+
+For development (and right now, until PyPI publish):
+
 ```bash
 git clone <this repo> ~/Projects/personal/consult-mcp-server
 cd ~/Projects/personal/consult-mcp-server
@@ -83,6 +95,11 @@ uv pip install -e ".[dev]"   # full install: engine + mcp adapter + dev deps
 # uv pip install -e ".[mcp]"
 cp .env.example .env  # then fill in your provider keys
 ```
+
+For one-click discovery / install via the Smithery registry, a `smithery.yaml`
+ships with the package. For container deployments, a `Dockerfile` is also
+included — build with `docker build -t consult-mcp .` then run with the
+provider keys passed as env: `docker run -i --rm -e ANTHROPIC_API_KEY=... consult-mcp`.
 
 Provider keys (set whichever you'll use):
 

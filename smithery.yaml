@@ -1,0 +1,40 @@
+# smithery.yaml — Smithery one-click install config.
+# See https://smithery.ai/docs/build/project-config/smithery.yaml for the
+# field reference. This file describes how the consult MCP server is
+# launched and which env vars (API keys) the user must supply.
+startCommand:
+  type: stdio
+  configSchema:
+    type: object
+    properties:
+      ANTHROPIC_API_KEY:
+        type: string
+        title: Anthropic API key
+        description: Required for Claude family panellists and the default capsule extractor.
+      OPENAI_API_KEY:
+        type: string
+        title: OpenAI API key
+        description: Required for GPT family panellists.
+      GEMINI_API_KEY:
+        type: string
+        title: Google Gemini API key
+        description: Required for Gemini family panellists and the default synthesiser.
+      OPENROUTER_API_KEY:
+        type: string
+        title: OpenRouter API key
+        description: Optional. Unlocks Grok / Kimi / Qwen / DeepSeek / Llama / Mistral / GLM via a single key.
+      CONSULT_MAX_RUN_USD:
+        type: string
+        title: Per-run cost cap (USD)
+        description: "Optional. Default 5.0. Refuses panels whose estimated cost exceeds this."
+      CONSULT_MAX_CONCURRENCY:
+        type: string
+        title: Total in-flight panellist cap
+        description: "Optional. Recommended 5-8 on wide panels (deep tier ~14 models) to smooth bursts."
+  commandFunction: |-
+    (config) => ({
+      command: "consult-mcp",
+      env: Object.fromEntries(
+        Object.entries(config).filter(([_, v]) => v !== undefined && v !== "")
+      ),
+    })
