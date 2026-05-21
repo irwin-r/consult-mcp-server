@@ -98,6 +98,7 @@ async def consult(
         capsule_kind=args.get("capsule_kind", "decision"),
         rubric=args.get("rubric"),
         attachments=args.get("attachments"),
+        gate_synth_at_agreement=args.get("gate_synth_at_agreement"),
         on_progress=on_progress,
     )
     return result.model_dump()
@@ -154,6 +155,7 @@ async def refine(
         # from the prior run's bundle (continuation case) instead of
         # silently defaulting back to "decision".
         capsule_kind=args.get("capsule_kind"),
+        strategy=args.get("strategy", "default"),
         on_progress=on_progress,
     )
     return result.model_dump()

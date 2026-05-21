@@ -130,9 +130,10 @@ def test_artifacts_create_and_uri():
     assert paths.root.exists()
     assert paths.responses.exists()
     uri = paths.resource_uri("alpha")
-    rid, slug = artifacts.parse_resource_uri(uri)
+    rid, kind, name = artifacts.parse_resource_uri(uri)
     assert rid == paths.run_id
-    assert slug == "alpha"
+    assert kind == "responses"
+    assert name == "alpha"
     # cleanup
     import shutil
     shutil.rmtree(paths.root)
@@ -285,6 +286,192 @@ def test_arbiter_json_extractor_tolerates_fences():
     assert data["gaps"] == ["x"]
 
 
+def test_synth_deblind_replaces_word_boundary_only():
+    """`_deblind` must be case-sensitive + word-boundary-anchored.
+
+    The synth's prose may legitimately mention "alpha release" or
+    "alphanumeric" — replacing those with a slug would corrupt the
+    synthesis. Only the exact `Alpha` / `Beta` tokens the synth was
+    told to use should be rewritten.
+    """
+    from consult.synth import _deblind
+
+    mapping = {"Alpha": "claude-opus", "Beta": "gpt-pro"}
+    src = (
+        "Alpha argued for X, while Beta supported Y. "
+        "Both noted that the alpha release of the library "
+        "had alphanumeric IDs. Gamma was not mentioned."
+    )
+    out = _deblind(src, mapping)
+    assert "claude-opus argued for X" in out
+    assert "gpt-pro supported Y" in out
+    # Casual prose preserved
+    assert "alpha release" in out
+    assert "alphanumeric" in out
+    # Unmapped label left alone
+    assert "Gamma was not mentioned" in out
+
+
+def test_synth_deblind_empty_map_is_noop():
+    """Zero-panel runs (or callers that skip blinding) must pass through
+    unchanged. Building a regex of an empty alternation would explode."""
+    from consult.synth import _deblind
+
+    src = "Synthesis with Alpha mentioned."
+    assert _deblind(src, {}) == src
+
+
+def test_refine_arbiter_v2_dimensions_normalised_to_overall_score(monkeypatch):
+    """v2 arbiter prompt: per-dimension 1-5 Likert input is rescaled to
+    [0,1] and averaged into the overall `score`. Round-trips through
+    `_ask_arbiter`'s JSON-parse path.
+    """
+    import asyncio
+    from consult.refine import _ask_arbiter
+
+    arbiter_text = json.dumps({
+        "dimensions": {
+            "coverage": 5,
+            "agreement": 5,
+            "depth": 3,
+            "calibration": 5,
+            "actionability": 5,
+        },
+        "dimension_notes": {
+            "depth": "Beta hand-waved on the cost argument.",
+        },
+        "gaps": ["cost magnitude unclear"],
+        "next_round_focus": "quantify cost",
+        "reasoning": "Strong consensus; depth lags.",
+    })
+
+    class _Choice:
+        def __init__(self, text):
+            self.message = type("M", (), {"content": text})()
+
+    class _Resp:
+        choices = [_Choice(arbiter_text)]
+
+    async def fake_acompletion(**_kw):
+        return _Resp()
+
+    monkeypatch.setattr("consult.refine.litellm.acompletion", fake_acompletion)
+    monkeypatch.setattr(
+        "consult.refine.litellm.completion_cost",
+        lambda completion_response=None: 0.001,
+    )
+
+    verdict = asyncio.run(_ask_arbiter(
+        "Q?", round_num=1, manifest=[], arbiter_alias="claude-haiku",
+    ))
+    assert verdict.parsed_ok is True
+    # 5→1.0, 3→0.5 normalised; avg of [1.0, 1.0, 0.5, 1.0, 1.0] = 0.9
+    assert verdict.score == pytest.approx(0.9, abs=1e-9)
+    # Per-dimension scores in [0,1]
+    assert verdict.dimensions["coverage"] == 1.0
+    assert verdict.dimensions["depth"] == 0.5
+    # Localised note preserved
+    assert verdict.dimension_notes["depth"] == "Beta hand-waved on the cost argument."
+
+
+def test_refine_arbiter_v1_score_field_still_accepted(monkeypatch):
+    """Legacy arbiters (or fine-tuned models that don't emit the v2
+    `dimensions` block) still work: the bare `score` field is honoured
+    when `dimensions` is missing or empty.
+    """
+    import asyncio
+    from consult.refine import _ask_arbiter
+
+    arbiter_text = json.dumps({
+        "score": 0.65,
+        "gaps": ["legacy"],
+        "next_round_focus": "f",
+        "reasoning": "r",
+    })
+
+    class _Choice:
+        def __init__(self, text):
+            self.message = type("M", (), {"content": text})()
+
+    class _Resp:
+        choices = [_Choice(arbiter_text)]
+
+    async def fake_acompletion(**_kw):
+        return _Resp()
+
+    monkeypatch.setattr("consult.refine.litellm.acompletion", fake_acompletion)
+    monkeypatch.setattr(
+        "consult.refine.litellm.completion_cost",
+        lambda completion_response=None: 0.001,
+    )
+
+    verdict = asyncio.run(_ask_arbiter(
+        "Q?", round_num=1, manifest=[], arbiter_alias="claude-haiku",
+    ))
+    assert verdict.parsed_ok is True
+    assert verdict.score == pytest.approx(0.65, abs=1e-9)
+    assert verdict.dimensions == {}
+
+
+def test_refine_build_refinement_prompt_surfaces_weak_dimensions():
+    """The refinement prompt must focus the next round on the lowest-scoring
+    dimensions, not just the generic gaps list. Bottom-3 dimensions are
+    rendered with their localised notes.
+    """
+    from consult.refine import _build_refinement_prompt
+    from consult.types import ArbiterVerdict
+
+    verdict = ArbiterVerdict(
+        round=1,
+        score=0.5,
+        dimensions={
+            "coverage": 0.75,
+            "agreement": 0.25,
+            "depth": 0.5,
+            "calibration": 1.0,
+            "actionability": 0.0,
+        },
+        dimension_notes={
+            "agreement": "Alpha and Beta disagree on the cost model.",
+            "actionability": "No panellist proposed a concrete next step.",
+            "depth": "Reasoning was thin on the SLA implications.",
+        },
+        gaps=["gap-1"],
+        next_round_focus="quantify cost",
+    )
+    out = _build_refinement_prompt("Q?", 2, [], verdict)
+    # Bottom-3 by dimension score: actionability (0.0), agreement (0.25), depth (0.5)
+    assert "actionability" in out
+    assert "agreement" in out
+    assert "depth" in out
+    # Localised notes appear
+    assert "Alpha and Beta disagree" in out
+    assert "No panellist proposed a concrete" in out
+    # Calibration (highest score) should NOT appear in critique
+    # (the prompt header may mention it but the critique section won't)
+    crit_section_start = out.find("Per-dimension critique")
+    crit_section_end = out.find("Gaps the arbiter flagged")
+    assert crit_section_start != -1 and crit_section_end != -1
+    crit_section = out[crit_section_start:crit_section_end]
+    assert "calibration" not in crit_section
+
+
+def test_refine_build_refinement_prompt_handles_legacy_verdict():
+    """Verdicts from legacy (v1) arbiter calls have no `dimensions`. The
+    refinement prompt must still render — falling back to a placeholder
+    line — rather than crashing or rendering an empty critique block.
+    """
+    from consult.refine import _build_refinement_prompt
+    from consult.types import ArbiterVerdict
+
+    legacy = ArbiterVerdict(
+        round=1, score=0.4, gaps=["legacy-gap"], next_round_focus="f",
+    )
+    out = _build_refinement_prompt("Q?", 2, [], legacy)
+    assert "legacy-gap" in out
+    assert "legacy arbiter prompt" in out  # placeholder marker
+
+
 # ---- New (post-review) offline tests --------------------------------------
 
 
@@ -320,7 +507,7 @@ async def test_fanout_emits_progress_callbacks(tmp_path, monkeypatch):
     from consult.runner import fanout
 
     monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
-    monkeypatch.setattr(runner, "estimate_cost", lambda specs, prompt: (0.0, True))
+    monkeypatch.setattr(runner, "estimate_cost", lambda *a, **kw: (0.0, True))
     monkeypatch.setenv("CONSULT_HEARTBEAT_INTERVAL_S", "0")
 
     async def fake_call(spec, slug, per_prompt, paths, provider_sems=None, **_):
@@ -377,12 +564,12 @@ def test_append_progress_log_writes_jsonl(tmp_path):
     parse by `kind` without scraping free-text.
     """
     from consult.progress import CapsuleExtracted, PanellistCompleted
-    from consult.runner import _append_progress_log
+    from consult.progress import append_progress_log
 
-    _append_progress_log(tmp_path, PanellistCompleted(
+    append_progress_log(tmp_path, PanellistCompleted(
         done=1, total=2, slug="haiku", status="OK", latency_ms=42,
     ))
-    _append_progress_log(tmp_path, CapsuleExtracted(done=1, total=2, slug="haiku"))
+    append_progress_log(tmp_path, CapsuleExtracted(done=1, total=2, slug="haiku"))
 
     lines = (tmp_path / "_progress.log").read_text().splitlines()
     assert len(lines) == 2
@@ -752,7 +939,7 @@ async def test_fanout_progress_callback_failure_does_not_abort_run(tmp_path, mon
     from consult.runner import fanout
 
     monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
-    monkeypatch.setattr(runner, "estimate_cost", lambda specs, prompt: (0.0, True))
+    monkeypatch.setattr(runner, "estimate_cost", lambda *a, **kw: (0.0, True))
 
     async def fake_call(spec, slug, per_prompt, paths, provider_sems=None, **_):
         return ManifestEntry(
@@ -799,7 +986,7 @@ async def test_fanout_emits_heartbeat_while_panellists_in_flight(tmp_path, monke
     from consult.runner import fanout
 
     monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
-    monkeypatch.setattr(runner, "estimate_cost", lambda specs, prompt: (0.0, True))
+    monkeypatch.setattr(runner, "estimate_cost", lambda *a, **kw: (0.0, True))
     monkeypatch.setenv("CONSULT_HEARTBEAT_INTERVAL_S", "0.05")
 
     async def fake_call(spec, slug, per_prompt, paths, provider_sems=None, **_):
@@ -847,7 +1034,7 @@ async def test_fanout_heartbeat_disabled_when_interval_zero(tmp_path, monkeypatc
     from consult.runner import fanout
 
     monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
-    monkeypatch.setattr(runner, "estimate_cost", lambda specs, prompt: (0.0, True))
+    monkeypatch.setattr(runner, "estimate_cost", lambda *a, **kw: (0.0, True))
     monkeypatch.setenv("CONSULT_HEARTBEAT_INTERVAL_S", "0")
 
     async def fake_call(spec, slug, per_prompt, paths, provider_sems=None, **_):
@@ -933,7 +1120,7 @@ async def test_fanout_slow_tail_dropout_cancels_stragglers(tmp_path, monkeypatch
     from consult.runner import fanout
 
     monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
-    monkeypatch.setattr(runner, "estimate_cost", lambda specs, prompt: (0.0, True))
+    monkeypatch.setattr(runner, "estimate_cost", lambda *a, **kw: (0.0, True))
     monkeypatch.setenv("CONSULT_TAIL_DROPOUT_S", "0.05")
     monkeypatch.setenv("CONSULT_TAIL_K_FRAC", "0.25")  # k=1 for n=4 → trigger=3
 
@@ -977,7 +1164,7 @@ async def test_fanout_no_dropout_below_threshold_panel_size(tmp_path, monkeypatc
     from consult.runner import fanout
 
     monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
-    monkeypatch.setattr(runner, "estimate_cost", lambda specs, prompt: (0.0, True))
+    monkeypatch.setattr(runner, "estimate_cost", lambda *a, **kw: (0.0, True))
     monkeypatch.setenv("CONSULT_TAIL_DROPOUT_S", "0.05")
     monkeypatch.setenv("CONSULT_TAIL_K_FRAC", "0.5")
 
@@ -1096,6 +1283,80 @@ async def test_acompletion_with_retry_does_not_retry_non_rate_limit(monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_acompletion_with_retry_recovers_from_bare_api_error(monkeypatch):
+    """Bare `litellm.APIError` (no subclass) is the OpenRouter "Unable to
+    get json response" failure mode — upstream returned all-whitespace.
+    Retry must recover from it; previously it surfaced as a one-shot ERROR.
+    """
+    from consult import runner
+
+    bare_api = runner._bare_api_error_class()
+    assert bare_api is not None, "litellm.exceptions.APIError must resolve"
+    monkeypatch.setenv("CONSULT_RETRY_MAX_ATTEMPTS", "3")
+    monkeypatch.setenv("CONSULT_RETRY_BASE_DELAY", "0.01")
+
+    attempts = 0
+
+    async def fake_acompletion(**kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            # Construct a bare APIError the way litellm raises it.
+            raise bare_api(
+                status_code=500,
+                message="Unable to get json response",
+                llm_provider="openrouter",
+                model=kwargs.get("model", "m"),
+            )
+
+        class _Resp:
+            class _Choice:
+                class _Msg:
+                    content = "ok"
+                message = _Msg()
+                finish_reason = "stop"
+            choices = [_Choice()]
+        return _Resp()
+
+    monkeypatch.setattr(runner.litellm, "acompletion", fake_acompletion)
+    resp = await runner._acompletion_with_retry(timeout=10.0, model="m", messages=[])
+    assert attempts == 2
+    assert resp.choices[0].message.content == "ok"
+
+
+@pytest.mark.asyncio
+async def test_acompletion_with_retry_does_not_retry_api_error_subclass(monkeypatch):
+    """A subclass of APIError (e.g. AuthenticationError) must NOT trigger
+    retry — only bare APIError is treated as transient. Subclasses are
+    terminal failures we shouldn't burn spend on.
+    """
+    from consult import runner
+
+    monkeypatch.setenv("CONSULT_RETRY_MAX_ATTEMPTS", "3")
+    monkeypatch.setenv("CONSULT_RETRY_BASE_DELAY", "0.01")
+
+    from litellm import exceptions as lex
+    auth_cls = getattr(lex, "AuthenticationError", None)
+    if auth_cls is None:
+        import pytest as _pytest
+        _pytest.skip("litellm.AuthenticationError not available")
+
+    attempts = 0
+
+    async def fake_acompletion(**kwargs):
+        nonlocal attempts
+        attempts += 1
+        raise auth_cls(
+            message="bad key", llm_provider="openai", model=kwargs.get("model", "m"),
+        )
+
+    monkeypatch.setattr(runner.litellm, "acompletion", fake_acompletion)
+    with pytest.raises(auth_cls):
+        await runner._acompletion_with_retry(timeout=10.0, model="m", messages=[])
+    assert attempts == 1, "AuthenticationError must be terminal, not retried"
+
+
+@pytest.mark.asyncio
 async def test_fanout_caps_per_provider_concurrency(tmp_path, monkeypatch):
     """With CONSULT_PROVIDER_CONCURRENCY=anthropic:1, only one Anthropic
     panellist may be in-flight at a time even if the panel has 5 of them.
@@ -1108,7 +1369,7 @@ async def test_fanout_caps_per_provider_concurrency(tmp_path, monkeypatch):
     from consult.runner import fanout
 
     monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
-    monkeypatch.setattr(runner, "estimate_cost", lambda specs, prompt: (0.0, True))
+    monkeypatch.setattr(runner, "estimate_cost", lambda *a, **kw: (0.0, True))
     monkeypatch.setenv("CONSULT_PROVIDER_CONCURRENCY", "anthropic:1")
     # Drop the registry cache so the env var takes effect on this call.
     registry.models_config.cache_clear()
@@ -1187,7 +1448,7 @@ async def test_fanout_cost_cap_returns_partial(monkeypatch):
     from consult.runner import fanout
 
     # Force a non-zero estimate so the cap path is exercised
-    monkeypatch.setattr(runner, "estimate_cost", lambda specs, prompt: (0.99, True))
+    monkeypatch.setattr(runner, "estimate_cost", lambda *a, **kw: (0.99, True))
     specs = [ModelSpec(model="claude-haiku")]
     handle = await fanout("p", specs, max_run_usd=0.01)
     assert handle.partial is True
@@ -1205,7 +1466,7 @@ async def test_fanout_cost_cap_message_discloses_partial_pricing(monkeypatch):
     from consult import runner
     from consult.runner import fanout
 
-    monkeypatch.setattr(runner, "estimate_cost", lambda specs, prompt: (0.50, False))
+    monkeypatch.setattr(runner, "estimate_cost", lambda *a, **kw: (0.50, False))
     specs = [ModelSpec(model="claude-haiku")]
     handle = await fanout("p", specs, max_run_usd=0.01)
     assert handle.partial is True
@@ -1241,7 +1502,7 @@ async def test_sequence_chains_synthesis_across_steps(tmp_path, monkeypatch):
     from consult import synth as synth_mod
 
     monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
-    monkeypatch.setattr(runner_mod, "estimate_cost", lambda specs, prompt: (0.0, True))
+    monkeypatch.setattr(runner_mod, "estimate_cost", lambda *a, **kw: (0.0, True))
 
     seen_prompts: list[str] = []
 
@@ -1319,7 +1580,7 @@ async def test_sequence_continues_through_partial_pricing(tmp_path, monkeypatch)
     monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
     # Return est_known=False to simulate the openrouter unknown-pricing case.
     monkeypatch.setattr(
-        runner_mod, "estimate_cost", lambda specs, prompt: (0.0, False)
+        runner_mod, "estimate_cost", lambda *a, **kw: (0.0, False)
     )
 
     async def fake_fanout(prompt, specs, **kwargs):
@@ -1448,9 +1709,15 @@ def test_parse_resource_uri_rejects_malformed():
     with pytest.raises(ValueError):
         artifacts.parse_resource_uri("consult://runs/abc/capsules/x")
     # Happy path still works
-    rid, slug = artifacts.parse_resource_uri("consult://runs/r1/responses/alpha.r2")
+    rid, kind, name = artifacts.parse_resource_uri("consult://runs/r1/responses/alpha.r2")
     assert rid == "r1"
-    assert slug == "alpha.r2"
+    assert kind == "responses"
+    assert name == "alpha.r2"
+    # attachments/ kind also parses
+    rid, kind, name = artifacts.parse_resource_uri(
+        "consult://runs/r1/attachments/main.py",
+    )
+    assert (rid, kind, name) == ("r1", "attachments", "main.py")
 
 
 def test_status_classifier_normal_responses():
@@ -1496,11 +1763,14 @@ def test_status_classifier_normal_responses():
     assert s == Status.EMPTY
 
 
-def test_synth_build_input_anonymised_and_filters_failures():
-    """Privacy-relevant for blinded mode + correctness for the synthesiser input.
+def test_synth_build_input_always_blinds_and_filters_failures():
+    """Synth never sees real slug or model_id — bias mitigation per the
+    "When Identity Skews Debate" paper. Tests:
 
-    ERROR/EMPTY entries must be excluded from the synthesiser input, and
-    anonymised mode must not leak model IDs.
+    - ERROR/EMPTY entries are filtered out of the input
+    - The synth input contains blind labels (Alpha, Beta, ...) not slugs
+    - Model IDs never appear regardless of the `anonymised` flag
+    - The returned `label_to_slug` mapping covers every usable panellist
     """
     from consult.synth import _build_input
 
@@ -1534,18 +1804,34 @@ def test_synth_build_input_anonymised_and_filters_failures():
     }
     rubric = "rubric {n}"
 
-    blinded = _build_input(manifest, bodies, rubric=rubric, anonymised=True)
-    assert "anthropic/claude-opus-4-7" not in blinded
-    assert "openai/gpt-5.5" not in blinded
-    assert "panelist-alpha" in blinded
-    assert "panelist-gamma" in blinded
-    assert "panelist-beta" not in blinded  # filtered
-    assert "alpha body" in blinded
-    assert "rubric 2" in blinded  # only OK + TRUNCATED counted
-
-    unblinded = _build_input(manifest, bodies, rubric=rubric, anonymised=False)
-    assert "anthropic/claude-opus-4-7" in unblinded
-    assert "gemini/gemini-3.1-pro-preview" in unblinded
+    # `anonymised` is now vestigial — both values give identical synth
+    # input. The flag is kept only for API compatibility.
+    for flag in (True, False):
+        text, label_to_slug = _build_input(
+            manifest, bodies, rubric=rubric, anonymised=flag,
+        )
+        # Real model identifiers never reach the synth
+        assert "anthropic/claude-opus-4-7" not in text
+        assert "openai/gpt-5.5" not in text
+        assert "gemini/gemini-3.1-pro-preview" not in text
+        # Real slugs are hidden too — replaced by blind labels in the label
+        # row. (Bodies stay verbatim; if a panellist happened to mention
+        # its own slug in the body, that's the panellist's own leak —
+        # `consult` doesn't try to scrub bodies.)
+        assert "[panelist-alpha" not in text
+        assert "[panelist-gamma" not in text
+        # Filtered: EMPTY status entry was dropped before labels were assigned
+        assert "panelist-beta" not in text  # filtered
+        # The mapping covers exactly the 2 usable entries (OK + TRUNCATED)
+        assert set(label_to_slug.values()) == {"panelist-alpha", "panelist-gamma"}
+        assert len(label_to_slug) == 2
+        # Each label appears in the input text somewhere
+        for label in label_to_slug:
+            assert label in text
+        # Bodies survive the relabelling
+        assert "alpha body" in text
+        assert "gamma body" in text
+        assert "rubric 2" in text  # only OK + TRUNCATED counted
 
 
 def test_manifest_entry_validates_error_requirement():
@@ -2427,7 +2713,7 @@ def test_synth_build_input_prepends_original_prompt_section():
          "status": "OK"},
     ]
     bodies = {"alpha": "BODY-TEXT"}
-    out = _build_input(
+    out, _label_map = _build_input(
         manifest, bodies, rubric="rubric for {n} responses",
         anonymised=False, original_prompt="PROMPT-TEXT",
     )
@@ -2447,7 +2733,7 @@ def test_synth_build_input_without_original_prompt_is_legacy_shape():
          "status": "OK"},
     ]
     bodies = {"alpha": "BODY-TEXT"}
-    out = _build_input(
+    out, _label_map = _build_input(
         manifest, bodies, rubric="rubric for {n} responses", anonymised=False,
     )
     assert "Original question / source" not in out
@@ -2611,6 +2897,187 @@ def test_refine_format_capsules_handles_review_kind():
     assert "SQL injection" in out
 
 
+@pytest.mark.asyncio
+async def test_refine_round_two_passes_per_panellist_conversation(
+    tmp_path, monkeypatch,
+):
+    """Round 2's fanout must receive `prior_turns_by_slug` populated with
+    each panellist's round-1 (user, assistant) pair. Round 1 must NOT —
+    it's the round that establishes the history.
+
+    This is the Anthropic prompt-cache mechanism: round-2's prefix
+    (continuation + user-round-1-prompt + assistant-round-1-answer) is
+    byte-stable across rounds 2 and 3, which is what the cache keys on.
+    """
+    from consult import refine as refine_mod
+    from consult.types import (
+        ArbiterVerdict,
+        Capsule,
+        ManifestEntry,
+        ModelSpec,
+        RunHandle,
+        Status,
+    )
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    # Disable heartbeats so the test runs deterministically
+    monkeypatch.setenv("CONSULT_HEARTBEAT_INTERVAL_S", "0")
+
+    fanout_calls: list[dict] = []
+
+    import copy
+
+    async def fake_fanout(prompt, specs, **kwargs):
+        # Capture what each round's fanout sees. Deep-copy the dict so
+        # later mutation by refine's post-round bookkeeping doesn't
+        # retroactively change what we observed (refine reuses the same
+        # `panel_conversations` dict whose values are the lists we'd be
+        # capturing by reference).
+        fanout_calls.append({
+            "prompt": prompt,
+            "specs": [(s.model, s.slug) for s in specs],
+            "prior_turns": copy.deepcopy(kwargs.get("prior_turns")),
+            "prior_turns_by_slug": copy.deepcopy(kwargs.get("prior_turns_by_slug")),
+        })
+        # Use the existing run dir (existing_paths) when refine passes one
+        paths = kwargs.get("existing_paths") or artifacts.create_run()
+        # Write a body file per slug so refine's post-round bookkeeping
+        # can build per-slug history from disk.
+        manifest = []
+        for spec in specs:
+            slug = spec.slug or spec.model
+            body_path = paths.root / "responses" / f"{slug}.txt"
+            body_path.parent.mkdir(parents=True, exist_ok=True)
+            body_path.write_text(f"{slug} body for round")
+            manifest.append(ManifestEntry(
+                slug=slug, model_id="x/a", status=Status.OK,
+                resource_uri=f"consult://x/{slug}",
+                body_path=str(body_path),
+                latency_ms=10, cost_usd=0.001, cost_known=True,
+                capsule=Capsule(position=f"{slug} position"),
+            ))
+        return RunHandle(
+            run_id=paths.run_id,
+            artifacts_dir=str(paths.root),
+            manifest=manifest,
+            cost_usd=0.001 * len(specs),
+            cost_known=True,
+            wall_ms=10,
+        )
+
+    async def fake_annotate(handle, **kwargs):
+        return handle
+
+    arbiter_n = {"n": 0}
+
+    async def fake_arbiter(*args, **kwargs):
+        # Round 1 → low score → triggers round 2. Round 2 → high → stop.
+        arbiter_n["n"] += 1
+        score = 0.2 if arbiter_n["n"] == 1 else 0.95
+        return ArbiterVerdict(round=arbiter_n["n"], score=score, parsed_ok=True)
+
+    async def fake_synth(*args, **kwargs):
+        from consult import synth as _synth_mod
+        return _synth_mod.SynthResult(text="final synth")
+
+    async def fake_aestimate(*a, **kw):
+        return (0.001, True)
+
+    monkeypatch.setattr("consult.refine.runner.fanout", fake_fanout)
+    monkeypatch.setattr("consult.refine.capsule.annotate", fake_annotate)
+    monkeypatch.setattr("consult.refine._ask_arbiter", fake_arbiter)
+    monkeypatch.setattr("consult.refine.synth.synthesise", fake_synth)
+    monkeypatch.setattr("consult.refine.runner.aestimate_cost", fake_aestimate)
+
+    result = await refine_mod.refine(
+        "Should we ship feature X?",
+        [ModelSpec(model="claude-haiku"), ModelSpec(model="gpt-mini")],
+        threshold=0.85,
+        max_rounds=2,
+    )
+
+    # Two rounds fired
+    assert len(fanout_calls) == 2
+
+    # Round 1: no per-slug history (the seed) — falls through to global
+    # `prior_turns` (None here, since no continuation_id).
+    r1 = fanout_calls[0]
+    assert r1["prior_turns_by_slug"] is None
+    assert r1["prior_turns"] is None
+
+    # Round 2: per-slug history populated. Each panellist's slug for
+    # round 2 maps to a 2-turn list (user=round-1 prompt, assistant=body).
+    r2 = fanout_calls[1]
+    assert r2["prior_turns_by_slug"] is not None
+    assert len(r2["prior_turns_by_slug"]) == 2  # one per panellist
+    for slug, history in r2["prior_turns_by_slug"].items():
+        # 2 turns: user(round-1 prompt) + assistant(round-1 body)
+        assert len(history) == 2
+        assert history[0]["role"] == "user"
+        assert history[1]["role"] == "assistant"
+        # The user turn should carry the original question, not the
+        # refinement prompt (round 1's `round_prompt` is the original).
+        assert "Should we ship feature X?" in history[0]["content"]
+        # The assistant turn carries this panellist's round-1 body.
+        # Slug suffix is `.r1` on round-1; the body filename matches.
+        assert "body for round" in history[1]["content"]
+
+    # Refine completed successfully
+    assert result.rounds_completed == 2
+    assert result.converged is True
+
+
+@pytest.mark.asyncio
+async def test_runner_fanout_dispatches_prior_turns_by_slug(monkeypatch, tmp_path):
+    """`prior_turns_by_slug` lets a caller (refine round 2+) give each
+    panellist its own conversation history. The runner must pick the
+    per-slug entry when present and fall back to the global `prior_turns`
+    otherwise."""
+    from consult import registry, runner
+    from consult.types import ModelSpec
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    monkeypatch.setattr(registry, "provider_concurrency", lambda: {})
+    monkeypatch.setenv("CONSULT_HEARTBEAT_INTERVAL_S", "0")
+
+    captured: dict[str, list] = {}
+
+    async def fake_call_one(spec, slug, per_slug_prompt, paths, provider_sems, **kw):
+        captured[slug] = kw.get("prior_turns") or []
+        from consult.types import ManifestEntry, Status
+        return ManifestEntry(
+            slug=slug, model_id=spec.model, status=Status.OK,
+            resource_uri=f"consult://x/{slug}",
+            body_path=str(paths.response_text(slug)),
+            latency_ms=1, cost_usd=0.0, cost_known=True,
+        )
+
+    monkeypatch.setattr(runner, "_call_one", fake_call_one)
+    # Disable token-counter and cost-estimation so the test stays offline
+    monkeypatch.setattr(runner, "estimate_cost", lambda *a, **kw: (0.0, True))
+
+    global_pt = [{"role": "user", "content": "global"}]
+    per_slug_pt = {
+        "claude-haiku": [
+            {"role": "user", "content": "haiku-specific"},
+            {"role": "assistant", "content": "prior haiku answer"},
+        ],
+    }
+    await runner.fanout(
+        "the prompt",
+        [
+            ModelSpec(model="claude-haiku"),
+            ModelSpec(model="gpt-mini"),
+        ],
+        prior_turns=global_pt,
+        prior_turns_by_slug=per_slug_pt,
+    )
+    # claude-haiku used the per-slug override
+    assert captured["claude-haiku"] == per_slug_pt["claude-haiku"]
+    # gpt-mini fell back to the global prior_turns
+    assert captured["gpt-mini"] == global_pt
+
+
 def test_context_bundle_persists_capsule_kind(tmp_path, monkeypatch):
     """ContextBundle records `capsule_kind` so a continuation can inherit
     it without the caller having to re-specify."""
@@ -2757,7 +3224,7 @@ def test_synth_build_input_rubric_with_literal_braces_does_not_crash():
         {"slug": "alpha", "model_id": "x", "persona": None,
          "confidence": None, "status": "OK"},
     ]
-    out = _build_input(
+    out, _label_map = _build_input(
         manifest, {"alpha": "body"}, rubric=rubric_with_braces, anonymised=False
     )
     assert "1 responses" in out
@@ -2808,12 +3275,12 @@ def test_capsule_review_extraction_prompt_directs_enumeration():
 
 
 def test_capsule_review_kind_uses_larger_token_budget():
-    """ReviewCapsule extraction needs more output tokens than decision
+    """ReviewCapsule body+extraction needs more output tokens than decision
     (a thorough review can produce 20+ findings, each ~150 chars)."""
-    from consult.capsule import _MAX_TOKENS_BY_KIND
+    from consult.capsule import MAX_TOKENS_BY_KIND
 
-    assert _MAX_TOKENS_BY_KIND["review"] >= 2000
-    assert _MAX_TOKENS_BY_KIND["review"] > _MAX_TOKENS_BY_KIND["decision"]
+    assert MAX_TOKENS_BY_KIND["review"] >= 2000
+    assert MAX_TOKENS_BY_KIND["review"] > MAX_TOKENS_BY_KIND["decision"]
 
 
 def test_runner_writes_context_bundle_at_run_init(tmp_path, monkeypatch):
@@ -3021,7 +3488,7 @@ async def test_fanout_stream_env_var_enables_streaming(tmp_path, monkeypatch):
 
     captured: dict[str, bool] = {}
 
-    async def fake_call(spec, slug, per_prompt, paths, provider_sems=None, *, stream=False, on_partial=None, prior_turns=None):
+    async def fake_call(spec, slug, per_prompt, paths, provider_sems=None, *, stream=False, on_partial=None, prior_turns=None, **_):
         captured["stream"] = stream
         paths.response_text(slug).write_text("body")
         return ManifestEntry(
@@ -3047,7 +3514,7 @@ async def test_fanout_stream_default_off(tmp_path, monkeypatch):
 
     captured: dict[str, bool] = {}
 
-    async def fake_call(spec, slug, per_prompt, paths, provider_sems=None, *, stream=False, on_partial=None, prior_turns=None):
+    async def fake_call(spec, slug, per_prompt, paths, provider_sems=None, *, stream=False, on_partial=None, prior_turns=None, **_):
         captured["stream"] = stream
         paths.response_text(slug).write_text("body")
         return ManifestEntry(
@@ -3306,20 +3773,20 @@ HAVE_KEYS = bool(
 )
 
 
-# ---- _build_messages: prior_turns role boundaries ---------------------------
+# ---- build_messages: prior_turns role boundaries ---------------------------
 
 
 def test_build_messages_prepends_prior_turns_for_anthropic():
     """prior_turns must be prepended verbatim; the final user turn is
     Anthropic-cache-tagged. This is what gives continuation runs proper
     role boundaries instead of one giant user blob."""
-    from consult.runner import _build_messages
+    from consult.runner import build_messages
 
     prior_turns = [
         {"role": "user", "content": "What database?"},
         {"role": "assistant", "content": "DuckDB."},
     ]
-    msgs = _build_messages("Now for ETL?", "anthropic", prior_turns)
+    msgs = build_messages("Now for ETL?", "anthropic", prior_turns)
     assert len(msgs) == 3
     assert msgs[0] == {"role": "user", "content": "What database?"}
     assert msgs[1] == {"role": "assistant", "content": "DuckDB."}
@@ -3333,13 +3800,13 @@ def test_build_messages_prepends_prior_turns_for_anthropic():
 
 def test_build_messages_prepends_prior_turns_for_non_anthropic():
     """Same shape, OpenAI-style flat string content on the final user turn."""
-    from consult.runner import _build_messages
+    from consult.runner import build_messages
 
     prior_turns = [
         {"role": "user", "content": "Q1"},
         {"role": "assistant", "content": "A1"},
     ]
-    msgs = _build_messages("Q2", "openai", prior_turns)
+    msgs = build_messages("Q2", "openai", prior_turns)
     assert msgs == [
         {"role": "user", "content": "Q1"},
         {"role": "assistant", "content": "A1"},
@@ -3349,9 +3816,9 @@ def test_build_messages_prepends_prior_turns_for_non_anthropic():
 
 def test_build_messages_no_prior_turns_is_unchanged():
     """The default (no prior_turns) path must not regress the existing single-turn shape."""
-    from consult.runner import _build_messages
+    from consult.runner import build_messages
 
-    msgs = _build_messages("hi", "openai")
+    msgs = build_messages("hi", "openai")
     assert msgs == [{"role": "user", "content": "hi"}]
 
 
@@ -3367,7 +3834,7 @@ async def test_fanout_threads_prior_turns_into_call_one(tmp_path, monkeypatch):
     from consult.runner import fanout
 
     monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
-    monkeypatch.setattr(runner, "estimate_cost", lambda specs, prompt: (0.0, True))
+    monkeypatch.setattr(runner, "estimate_cost", lambda *a, **kw: (0.0, True))
     monkeypatch.setenv("CONSULT_HEARTBEAT_INTERVAL_S", "0")
     monkeypatch.setenv("CONSULT_TAIL_DROPOUT_S", "0")
 
@@ -3456,7 +3923,7 @@ async def test_fanout_returns_partial_when_zero_usable_panellists(tmp_path, monk
     from consult.runner import fanout
 
     monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
-    monkeypatch.setattr(runner, "estimate_cost", lambda specs, prompt: (0.0, True))
+    monkeypatch.setattr(runner, "estimate_cost", lambda *a, **kw: (0.0, True))
     monkeypatch.setenv("CONSULT_HEARTBEAT_INTERVAL_S", "0")
     monkeypatch.setenv("CONSULT_TAIL_DROPOUT_S", "0")
 
@@ -3495,7 +3962,7 @@ async def test_fanout_succeeds_when_any_panellist_usable(tmp_path, monkeypatch):
     from consult.runner import fanout
 
     monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
-    monkeypatch.setattr(runner, "estimate_cost", lambda specs, prompt: (0.0, True))
+    monkeypatch.setattr(runner, "estimate_cost", lambda *a, **kw: (0.0, True))
     monkeypatch.setenv("CONSULT_HEARTBEAT_INTERVAL_S", "0")
     monkeypatch.setenv("CONSULT_TAIL_DROPOUT_S", "0")
 
@@ -3597,7 +4064,7 @@ def test_refine_arbiter_cost_pre_estimated_in_cap_check(monkeypatch):
 
     arbiter_estimate_calls = {"n": 0}
 
-    def fake_estimate(specs, prompt):
+    def fake_estimate(specs, prompt, **_):
         if len(specs) == 1 and specs[0].model == refine_mod.registry.default_synthesiser():
             arbiter_estimate_calls["n"] += 1
         return (0.01, True)
@@ -3628,7 +4095,7 @@ async def test_slow_tail_dropout_marks_cost_unknown_for_cancelled(tmp_path, monk
     from consult.runner import fanout
 
     monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
-    monkeypatch.setattr(runner, "estimate_cost", lambda specs, prompt: (0.0, True))
+    monkeypatch.setattr(runner, "estimate_cost", lambda *a, **kw: (0.0, True))
     monkeypatch.setenv("CONSULT_HEARTBEAT_INTERVAL_S", "0")
     monkeypatch.setenv("CONSULT_TAIL_DROPOUT_S", "0.1")  # very short dropout
     monkeypatch.setenv("CONSULT_TAIL_K_FRAC", "0.5")  # drop the slow half
@@ -3882,7 +4349,7 @@ async def test_refine_arbiter_sees_followup_only_under_continuation(tmp_path, mo
     monkeypatch.setattr(refine_mod.capsule, "annotate", fake_annotate)
     monkeypatch.setattr(refine_mod, "_ask_arbiter", fake_arbiter)
     monkeypatch.setattr(refine_mod.synth, "synthesise", fake_synth)
-    monkeypatch.setattr(refine_mod.runner, "estimate_cost", lambda specs, prompt: (0.0, True))
+    monkeypatch.setattr(refine_mod.runner, "estimate_cost", lambda *a, **kw: (0.0, True))
 
     await refine_mod.refine(
         "FOLLOWUP QUESTION TEXT",
@@ -4046,7 +4513,7 @@ async def test_sequence_partial_fanout_rolls_cost_into_total(tmp_path, monkeypat
     from consult import synth as synth_mod
 
     monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
-    monkeypatch.setattr(runner_mod, "estimate_cost", lambda specs, prompt: (0.0, True))
+    monkeypatch.setattr(runner_mod, "estimate_cost", lambda *a, **kw: (0.0, True))
 
     async def fake_fanout(prompt, specs, **kwargs):
         paths = artifacts.create_run()
@@ -4206,7 +4673,7 @@ async def test_fanout_rejects_duplicate_explicit_slugs(tmp_path, monkeypatch):
     from consult import runner as runner_mod
 
     monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
-    monkeypatch.setattr(runner_mod, "estimate_cost", lambda specs, prompt: (0.0, True))
+    monkeypatch.setattr(runner_mod, "estimate_cost", lambda *a, **kw: (0.0, True))
 
     specs = [
         ModelSpec(model="claude-haiku", slug="test"),
@@ -4283,7 +4750,7 @@ async def test_refine_synth_call_passes_anonymised_when_blinded(tmp_path, monkey
     from consult import synth as synth_mod
 
     monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
-    monkeypatch.setattr(runner_mod, "estimate_cost", lambda specs, prompt: (0.0, True))
+    monkeypatch.setattr(runner_mod, "estimate_cost", lambda *a, **kw: (0.0, True))
 
     async def fake_fanout(prompt, specs, **kwargs):
         paths = kwargs.get("existing_paths") or artifacts.create_run()
@@ -4331,6 +4798,57 @@ async def test_refine_synth_call_passes_anonymised_when_blinded(tmp_path, monkey
     assert captured.get("anonymised") is True
 
 
+def test_blinded_fanout_preserves_model_id_in_manifest(tmp_path, monkeypatch):
+    """Blinded panels must keep `model_id` populated on each manifest entry.
+
+    Blinding's job is to (a) scrub brand mentions from the prompt panellists
+    see, (b) hand out greek-letter slugs so panellists referring to each
+    other use anonymous labels, and (c) tell the synth to omit model_ids
+    from its prompt. The manifest itself is for downstream readers (the
+    viewer, ledger, the human) — stripping model_id there hid identities
+    from the final report, which the user needs to see who said what.
+    """
+    import asyncio
+    import json
+
+    from consult.runner import fanout
+    from consult.types import ModelSpec
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    monkeypatch.setattr(
+        "consult.runner.estimate_cost", lambda *a, **kw: (0.0, True),
+    )
+
+    async def fake_call(spec, slug, per_prompt, paths, provider_sems=None, **_):
+        paths.response_text(slug).write_text("body")
+        entry = registry.resolve_model(spec.model)
+        return ManifestEntry(
+            slug=slug, model_id=entry["litellm_id"], status=Status.OK,
+            resource_uri=paths.resource_uri(slug),
+            body_path=str(paths.response_text(slug)),
+            latency_ms=10, tokens_in=1, tokens_out=1,
+            cost_usd=0.0, cost_known=True, confidence=0.5, capsule=None,
+        )
+
+    monkeypatch.setattr("consult.runner._call_one", fake_call)
+    monkeypatch.setenv("CONSULT_HEARTBEAT_INTERVAL_S", "0")
+    monkeypatch.setenv("CONSULT_TAIL_DROPOUT_S", "0")
+
+    handle = asyncio.run(fanout(
+        "prompt", [ModelSpec(model="claude-haiku")], blinded=True,
+    ))
+    assert len(handle.manifest) == 1
+    entry = handle.manifest[0]
+    # Slug is anonymised (greek letter), but model_id stays real.
+    assert entry.slug.startswith("panelist-")
+    assert entry.model_id is not None
+    assert entry.model_id == "anthropic/claude-haiku-4-5-20251001"
+    # On-disk manifest must mirror the in-memory handle.
+    paths = artifacts.load_run(handle.run_id)
+    on_disk = json.loads(paths.manifest_json.read_text())
+    assert on_disk["manifest"][0]["model_id"] == "anthropic/claude-haiku-4-5-20251001"
+
+
 async def test_refine_passes_max_run_usd_to_nested_fanout(tmp_path, monkeypatch):
     """A refine caller's `max_run_usd` must reach the per-round `runner.fanout`
     call. Pre-fix the nested fanout fell back to `registry.default_max_run_usd()`
@@ -4341,7 +4859,7 @@ async def test_refine_passes_max_run_usd_to_nested_fanout(tmp_path, monkeypatch)
     from consult import synth as synth_mod
 
     monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
-    monkeypatch.setattr(runner_mod, "estimate_cost", lambda specs, prompt: (0.0, True))
+    monkeypatch.setattr(runner_mod, "estimate_cost", lambda *a, **kw: (0.0, True))
 
     seen_caps: list[float | None] = []
 
@@ -4459,7 +4977,7 @@ async def test_fanout_cap_early_return_preserves_existing_manifest(tmp_path, mon
     )
     artifacts.write_manifest(paths, seeded.model_dump())
 
-    monkeypatch.setattr(runner_mod, "estimate_cost", lambda specs, prompt: (10.0, True))
+    monkeypatch.setattr(runner_mod, "estimate_cost", lambda *a, **kw: (10.0, True))
     handle = await runner_mod.fanout(
         "x", [ModelSpec(model="claude-haiku")],
         max_run_usd=1.0, existing_paths=paths,
@@ -4483,7 +5001,7 @@ def test_refine_cost_estimate_includes_prior_turns_for_fanout(monkeypatch):
 
     captured_inputs: list[str] = []
 
-    def fake_estimate_cost(specs, text):
+    def fake_estimate_cost(specs, text, *, capsule_kind="decision"):
         captured_inputs.append(text)
         return 0.0, True
 
@@ -4498,7 +5016,7 @@ def test_refine_cost_estimate_includes_prior_turns_for_fanout(monkeypatch):
         {"role": "assistant", "content": "PRIOR SYNTH"},
     ]
     round_prompt = "FOLLOWUP"
-    expected = runner_mod._concat_turn_text(prior_turns) + "\n" + round_prompt
+    expected = runner_mod.concat_turn_text(prior_turns) + "\n" + round_prompt
     assert "PRIOR QUESTION" in expected
     assert "PRIOR SYNTH" in expected
     assert "FOLLOWUP" in expected
@@ -4524,7 +5042,7 @@ async def test_fanout_writes_manifest_on_cap_exceeded(tmp_path, monkeypatch):
     from consult import runner as runner_mod
 
     monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
-    monkeypatch.setattr(runner_mod, "estimate_cost", lambda specs, prompt: (10.0, True))
+    monkeypatch.setattr(runner_mod, "estimate_cost", lambda *a, **kw: (10.0, True))
     handle = await runner_mod.fanout(
         "x", [ModelSpec(model="claude-haiku")], max_run_usd=1.0,
     )
@@ -4739,6 +5257,170 @@ async def test_orchestrate_consult_runs_without_mcp_adapter(tmp_path, monkeypatc
     assert "synth_completed" in progress_events
 
 
+@pytest.mark.asyncio
+async def test_orchestrate_consult_gates_synth_on_high_consensus(
+    tmp_path, monkeypatch,
+):
+    """`gate_synth_at_agreement` short-circuits the flagship synth when the
+    panel converges tightly. The synth model must NOT be called; the
+    returned RunResult.synth_gated must be True and cost_usd must NOT
+    include any synth spend.
+    """
+    from consult import capsule as capsule_mod
+    from consult import orchestrate
+    from consult import runner as runner_mod
+    from consult import synth as synth_mod
+    from consult.types import Capsule, RunResult
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    monkeypatch.setattr(
+        registry, "resolve_tier", lambda t: ["model-a", "model-b", "model-c"],
+    )
+    monkeypatch.setattr(registry, "default_synthesiser", lambda: "model-synth")
+    monkeypatch.setattr(
+        registry, "resolve_model",
+        lambda alias: {"litellm_id": alias, "provider": "x"},
+    )
+
+    async def fake_fanout(prompt, specs, **kwargs):
+        paths = artifacts.create_run()
+        return RunHandle(
+            run_id=paths.run_id,
+            artifacts_dir=str(paths.root),
+            manifest=[
+                ManifestEntry(
+                    slug="m-a", model_id="x/a", status=Status.OK,
+                    resource_uri=paths.resource_uri("m-a"),
+                    body_path=str(paths.response_text("m-a")),
+                    latency_ms=10, cost_usd=0.01, cost_known=True,
+                    capsule=Capsule(
+                        position="ship feature X",
+                        recommendation="ship feature X with caveat",
+                    ),
+                ),
+                ManifestEntry(
+                    slug="m-b", model_id="x/b", status=Status.OK,
+                    resource_uri=paths.resource_uri("m-b"),
+                    body_path=str(paths.response_text("m-b")),
+                    latency_ms=10, cost_usd=0.01, cost_known=True,
+                    capsule=Capsule(
+                        position="ship feature X",
+                        recommendation="ship feature X with caveat",
+                    ),
+                ),
+                ManifestEntry(
+                    slug="m-c", model_id="x/c", status=Status.OK,
+                    resource_uri=paths.resource_uri("m-c"),
+                    body_path=str(paths.response_text("m-c")),
+                    latency_ms=10, cost_usd=0.01, cost_known=True,
+                    capsule=Capsule(
+                        position="ship feature X",
+                        recommendation="ship feature X with caveat",
+                    ),
+                ),
+            ],
+            cost_usd=0.03, cost_known=True, wall_ms=10,
+        )
+
+    async def fake_annotate(handle, **kwargs):
+        return handle
+
+    synth_called = {"n": 0}
+
+    async def fake_synth(*args, **kwargs):
+        synth_called["n"] += 1
+        return synth_mod.SynthResult(text="should not appear", cost_usd=99.0)
+
+    monkeypatch.setattr(runner_mod, "fanout", fake_fanout)
+    monkeypatch.setattr(capsule_mod, "annotate", fake_annotate)
+    monkeypatch.setattr(synth_mod, "synthesise", fake_synth)
+
+    result = await orchestrate.consult(
+        "what's the call?", tier="quick", gate_synth_at_agreement=0.1,
+    )
+    assert isinstance(result, RunResult)
+    assert result.synth_gated is True, "gating did not trigger on identical capsules"
+    assert synth_called["n"] == 0, "flagship synth was called despite gating"
+    assert result.cost_usd == pytest.approx(0.03, abs=1e-9)
+    assert result.disagreement is not None and result.disagreement < 0.1
+    assert "gated" in result.synthesis.lower() or "consensus" in result.synthesis.lower()
+    assert result.synthesiser == "(gated)"
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_consult_does_not_gate_on_high_disagreement(
+    tmp_path, monkeypatch,
+):
+    """When the panel diverges, gating must NOT trigger — the flagship
+    synth runs as usual."""
+    from consult import capsule as capsule_mod
+    from consult import orchestrate
+    from consult import runner as runner_mod
+    from consult import synth as synth_mod
+    from consult.types import Capsule, RunResult
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    monkeypatch.setattr(
+        registry, "resolve_tier", lambda t: ["model-a", "model-b"],
+    )
+    monkeypatch.setattr(registry, "default_synthesiser", lambda: "model-synth")
+    monkeypatch.setattr(
+        registry, "resolve_model",
+        lambda alias: {"litellm_id": alias, "provider": "x"},
+    )
+
+    async def fake_fanout(prompt, specs, **kwargs):
+        paths = artifacts.create_run()
+        return RunHandle(
+            run_id=paths.run_id,
+            artifacts_dir=str(paths.root),
+            manifest=[
+                ManifestEntry(
+                    slug="m-a", model_id="x/a", status=Status.OK,
+                    resource_uri=paths.resource_uri("m-a"),
+                    body_path=str(paths.response_text("m-a")),
+                    latency_ms=10, cost_usd=0.01, cost_known=True,
+                    capsule=Capsule(
+                        position="ship feature X immediately",
+                        recommendation="do A",
+                    ),
+                ),
+                ManifestEntry(
+                    slug="m-b", model_id="x/b", status=Status.OK,
+                    resource_uri=paths.resource_uri("m-b"),
+                    body_path=str(paths.response_text("m-b")),
+                    latency_ms=10, cost_usd=0.01, cost_known=True,
+                    capsule=Capsule(
+                        position="cancel the project entirely",
+                        recommendation="form a steering committee",
+                    ),
+                ),
+            ],
+            cost_usd=0.02, cost_known=True, wall_ms=10,
+        )
+
+    async def fake_annotate(handle, **kwargs):
+        return handle
+
+    synth_called = {"n": 0}
+
+    async def fake_synth(*args, **kwargs):
+        synth_called["n"] += 1
+        return synth_mod.SynthResult(text="real synthesis", cost_usd=0.05)
+
+    monkeypatch.setattr(runner_mod, "fanout", fake_fanout)
+    monkeypatch.setattr(capsule_mod, "annotate", fake_annotate)
+    monkeypatch.setattr(synth_mod, "synthesise", fake_synth)
+
+    result = await orchestrate.consult(
+        "what's the call?", tier="quick", gate_synth_at_agreement=0.1,
+    )
+    assert result.synth_gated is False
+    assert synth_called["n"] == 1, "flagship synth must run on high disagreement"
+    assert result.synthesis == "real synthesis"
+    assert result.cost_usd == pytest.approx(0.07, abs=1e-9)
+
+
 # ---- Iter8 regression tests ------------------------------------------------
 
 
@@ -4797,7 +5479,7 @@ async def test_sequence_persists_cost_on_synth_failure(tmp_path, monkeypatch):
     monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
     monkeypatch.setenv("CONSULT_HEARTBEAT_INTERVAL_S", "0")
     monkeypatch.setenv("CONSULT_TAIL_DROPOUT_S", "0")
-    monkeypatch.setattr(runner, "estimate_cost", lambda specs, prompt: (0.0, True))
+    monkeypatch.setattr(runner, "estimate_cost", lambda *a, **kw: (0.0, True))
 
     async def fake_call(spec, slug, per_prompt, paths, provider_sems=None, **_):
         await asyncio.to_thread(paths.response_text(slug).write_text, "body")
@@ -4862,7 +5544,7 @@ async def test_refine_preserves_final_manifest_when_late_round_partial(
     monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
     monkeypatch.setenv("CONSULT_HEARTBEAT_INTERVAL_S", "0")
     monkeypatch.setenv("CONSULT_TAIL_DROPOUT_S", "0")
-    monkeypatch.setattr(runner, "estimate_cost", lambda specs, prompt: (0.0, True))
+    monkeypatch.setattr(runner, "estimate_cost", lambda *a, **kw: (0.0, True))
 
     call_count = {"n": 0}
 
@@ -5070,7 +5752,7 @@ async def test_orchestrate_consult_accepts_attachments_and_dry_run(
     from consult import orchestrate, runner
 
     monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
-    monkeypatch.setattr(runner, "estimate_cost", lambda specs, prompt: (0.5, True))
+    monkeypatch.setattr(runner, "estimate_cost", lambda *a, **kw: (0.5, True))
 
     f = tmp_path / "atta.txt"
     f.write_text("ATTACHMENT-CONTENT")
@@ -5079,7 +5761,7 @@ async def test_orchestrate_consult_accepts_attachments_and_dry_run(
     # estimate_cost includes the attachment content (proves inlining).
     captured = {}
 
-    def fake_estimate(specs, prompt):
+    def fake_estimate(specs, prompt, **_):
         captured["prompt"] = prompt
         return (0.5, True)
 
@@ -5108,7 +5790,7 @@ async def test_fit_prompt_to_context_no_op_when_under_budget(monkeypatch):
     monkeypatch.setattr(
         runner.litellm, "token_counter", lambda model, text: len(text) // 4,
     )
-    out = await runner._fit_prompt_to_context(
+    out, dropped = await runner._fit_prompt_to_context(
         "short prompt",
         prior_turns=None,
         litellm_id="x/y",
@@ -5116,6 +5798,7 @@ async def test_fit_prompt_to_context_no_op_when_under_budget(monkeypatch):
         max_output_tokens=4000,
     )
     assert out == "short prompt"
+    assert dropped == 0
     assert "[TRIMMED" not in out
 
 
@@ -5131,7 +5814,7 @@ async def test_fit_prompt_to_context_trims_when_over_budget(monkeypatch):
     # Budget: 1000 input - 100 output = 900 available. Build a 2000-char
     # prompt that fakes 1 token/char so we're 2× over.
     long_prompt = "A" * 1000 + "B" * 1000
-    out = await runner._fit_prompt_to_context(
+    out, dropped = await runner._fit_prompt_to_context(
         long_prompt,
         prior_turns=None,
         litellm_id="x/y",
@@ -5141,6 +5824,10 @@ async def test_fit_prompt_to_context_trims_when_over_budget(monkeypatch):
     # Marker present + final size under the budget after the recount loop.
     assert "[TRIMMED" in out
     assert len(out) < len(long_prompt)
+    # `dropped` is the explicit signal callers use to build the manifest
+    # trim note — must be positive when a trim happened.
+    assert dropped > 0
+    assert dropped == len(long_prompt) - len(out)
 
 
 @pytest.mark.asyncio
@@ -5159,7 +5846,7 @@ async def test_fit_prompt_to_context_skips_when_prior_alone_exceeds_budget(
         {"role": "user", "content": "X" * 2000},
         {"role": "assistant", "content": "Y" * 2000},
     ]
-    out = await runner._fit_prompt_to_context(
+    out, dropped = await runner._fit_prompt_to_context(
         "follow-up",
         prior_turns=prior,
         litellm_id="x/y",
@@ -5167,6 +5854,7 @@ async def test_fit_prompt_to_context_skips_when_prior_alone_exceeds_budget(
         max_output_tokens=100,
     )
     assert out == "follow-up"  # not trimmed
+    assert dropped == 0
 
 
 @pytest.mark.asyncio
@@ -5220,13 +5908,189 @@ async def test_call_one_auto_trims_oversized_prompt(tmp_path, monkeypatch):
     entry = await _call_one(spec, "test-slug", long_prompt, paths)
 
     assert entry.status == Status.OK
-    assert "auto-trimmed" in (entry.error or "")
+    # Trim diagnostic lives on `note` (info), not `error` (failure).
+    assert entry.error is None
+    assert "auto-trimmed" in (entry.note or "")
     sent_text = sent_messages["messages"][0]["content"]
     # Anthropic wraps content in a list with cache_control; extract the text.
     if isinstance(sent_text, list):
         sent_text = sent_text[0]["text"]
     assert "[TRIMMED" in sent_text
     assert len(sent_text) < 50_000
+
+
+@pytest.mark.asyncio
+async def test_call_one_no_trim_note_when_prompt_mentions_trimmed_literally(
+    tmp_path, monkeypatch,
+):
+    """A prompt that contains the literal string `[TRIMMED` in its source
+    (e.g. an attached source file from this very codebase) must NOT be
+    misreported as auto-trimmed when the prompt actually fits the context.
+
+    Previously runner sniffed the prompt for `[TRIMMED` to detect trim
+    events. Source-code reviews that attached `context.py` or `runner.py`
+    matched the substring and surfaced a phantom "input auto-trimmed"
+    error on every panellist, even though no trim happened.
+    """
+    from consult import runner
+    from consult.runner import _call_one
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    monkeypatch.setattr(
+        runner, "_max_input_tokens", lambda lid, entry: 1_000_000,
+    )
+    monkeypatch.setattr(
+        runner.litellm, "token_counter", lambda model, text: len(text) // 4,
+    )
+
+    class _Msg:
+        content = "ok"
+    class _Choice:
+        message = _Msg()
+        finish_reason = "stop"
+    class _Resp:
+        choices = [_Choice()]
+        usage = type("U", (), {"prompt_tokens": 100, "completion_tokens": 10})()
+        def model_dump(self): return {"choices": []}
+
+    async def fake_acompletion(**kwargs):
+        return _Resp()
+    monkeypatch.setattr(runner.litellm, "acompletion", fake_acompletion)
+    monkeypatch.setattr(runner.litellm, "completion_cost", lambda **kw: 0.0)
+
+    # Prompt that mentions the literal marker (as a code-review attachment
+    # would). Fits comfortably under the million-token fake budget.
+    prompt = (
+        "review this code:\n"
+        '    marker = f"\\n\\n... [TRIMMED {dropped} chars ...] ...\\n\\n"\n'
+        "    if '[TRIMMED' in per_slug_prompt: ...\n"
+    )
+    spec = ModelSpec(model="claude-haiku")
+    paths = artifacts.create_run()
+    entry = await _call_one(spec, "x-0", prompt, paths)
+    assert entry.status == Status.OK
+    assert entry.error is None, (
+        f"phantom trim note: {entry.error!r}"
+    )
+
+
+def test_extract_inlined_blocks_finds_attachments():
+    """Parser recognises the deterministic block format that
+    `render_attachment` produces, ignores code blocks in the prose
+    section above the separator."""
+    from consult.attachments import (
+        ATTACHMENT_SEPARATOR,
+        extract_inlined_blocks,
+    )
+
+    prompt = (
+        "Here's some prose with a fenced code sample:\n"
+        "```py\nprint('not an attachment')\n```\n"
+        + ATTACHMENT_SEPARATOR
+        + "\n# /Users/x/foo.py\n```python\ndef foo(): pass\n```\n"
+        + "\n## label: /Users/x/bar.py\n```python\nclass B: pass\n```\n"
+    )
+    blocks = extract_inlined_blocks(prompt)
+    assert len(blocks) == 2
+    assert blocks[0].path == "/Users/x/foo.py"
+    assert blocks[0].label is None
+    assert "def foo()" in blocks[0].content
+    assert blocks[1].path == "/Users/x/bar.py"
+    assert blocks[1].label == "label"
+
+
+def test_persist_inlined_attachments_writes_and_uri_resolves(tmp_path, monkeypatch):
+    """Persistence writes each block's content to attachments/<safe-name>
+    and the returned URI is resolvable via parse_resource_uri."""
+    from consult import attachments as att
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    paths = artifacts.create_run()
+    prompt = (
+        "review this:\n"
+        + att.ATTACHMENT_SEPARATOR
+        + "\n# /Users/x/foo.py\n```python\nbody-foo\n```\n"
+        + "\n# /Users/x/bar.py\n```python\nbody-bar\n```\n"
+        + "\n# /Users/x/foo.py\n```python\nbody-foo-2\n```\n"  # name collision
+    )
+    uri_map = att.persist_inlined_attachments(paths, prompt)
+    assert len(uri_map) == 3
+    files = sorted(p.name for p in paths.attachments.iterdir())
+    assert "foo.py" in files
+    assert "bar.py" in files
+    # Collision got a numeric suffix.
+    assert any(f.startswith("foo.py-") for f in files)
+    for uri in uri_map.values():
+        rid, kind, name = artifacts.parse_resource_uri(uri)
+        assert rid == paths.run_id
+        assert kind == "attachments"
+        assert (paths.attachments / name).exists()
+
+
+@pytest.mark.asyncio
+async def test_fit_prompt_drops_largest_attachment_with_stub(tmp_path, monkeypatch):
+    """When the prompt is over budget, the trimmer drops the LARGEST
+    attachment block first, replaces it with a stub referencing the
+    resource URI, and leaves smaller blocks intact. Beats head+tail
+    slicing through the middle of a code file."""
+    from consult import attachments as att
+    from consult import runner
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    paths = artifacts.create_run()
+    monkeypatch.setattr(
+        runner.litellm, "token_counter", lambda model, text: len(text),
+    )
+
+    small_block = "small\n" * 50          # ~300 chars
+    large_block = "X" * 50_000            # 50K chars — dropped first
+    medium_block = "Y" * 5_000            # 5K chars
+
+    prompt = (
+        "instructions here\n"
+        + att.ATTACHMENT_SEPARATOR
+        + f"\n# /src/small.py\n```python\n{small_block}\n```\n"
+        + f"\n# /src/big.py\n```python\n{large_block}\n```\n"
+        + f"\n# /src/medium.py\n```python\n{medium_block}\n```\n"
+    )
+    att.persist_inlined_attachments(paths, prompt)
+
+    out, dropped = await runner._fit_prompt_to_context(
+        prompt,
+        paths=paths,
+        prior_turns=None,
+        litellm_id="x/y",
+        max_input_tokens=11_000,
+        max_output_tokens=1_000,
+    )
+    assert dropped > 0
+    assert large_block not in out
+    assert "Attachment dropped to fit context" in out
+    assert "big.py" in out  # header preserved
+    assert paths.run_id in out  # resource URI for the dropped file
+    assert small_block in out
+
+
+@pytest.mark.asyncio
+async def test_fit_prompt_falls_back_to_head_tail_without_attachments(monkeypatch):
+    """Prompts that aren't structured as attachments still get the
+    head+tail trim — the new path is additive, not a replacement."""
+    from consult import runner
+
+    monkeypatch.setattr(
+        runner.litellm, "token_counter", lambda model, text: len(text),
+    )
+    long_prompt = "A" * 1000 + "B" * 1000  # no ATTACHMENT_SEPARATOR
+    out, dropped = await runner._fit_prompt_to_context(
+        long_prompt,
+        paths=None,
+        prior_turns=None,
+        litellm_id="x/y",
+        max_input_tokens=1000,
+        max_output_tokens=100,
+    )
+    assert "[TRIMMED" in out
+    assert dropped > 0
 
 
 def test_max_input_tokens_registry_override():

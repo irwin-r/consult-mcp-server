@@ -19,8 +19,7 @@ import litellm
 
 from . import artifacts, context, provider_caps, registry
 from .jsonparse import extract_json
-from .progress import CapsuleExtracted, PhaseStarted
-from .runner import ProgressCallback, _append_progress_log
+from .progress import CapsuleExtracted, PhaseStarted, ProgressCallback, append_progress_log
 from .types import AnyCapsule, Capsule, ManifestEntry, ResearchCapsule, ReviewCapsule, RunHandle, Status
 
 logger = logging.getLogger(__name__)
@@ -128,15 +127,17 @@ _RESPONSE_FORMAT_BY_KIND: dict[str, type] = {
     "research": ResearchCapsule,
 }
 
-# Per-kind max-output budget. Review capsules can enumerate ~20-30 findings
-# at ~80-150 chars each, so 800 tokens (which `litellm` caps near 600 chars)
-# leaves the extractor producing `findings=[]` on detailed reviews. 4000
-# tokens covers a thorough panel review. Research capsules are more bounded
-# (claims/evidence are short lists) but still benefit from more headroom.
-_MAX_TOKENS_BY_KIND: dict[str, int] = {
-    "decision": 800,
-    "review": 4000,
-    "research": 2000,
+# Per-kind max-output budget. Sized for the panellist body (free-form prose
+# enumerating findings/claims), not just the structured capsule — a review
+# body needs room for ~20-30 findings with reasoning, so 8000 tokens. The
+# capsule extractor reuses the same budget; overcapping the extractor is
+# harmless (it stops at the actual end-of-output). Review at 4000 truncated
+# claude-haiku mid-review on a long-context architecture review (FRICTION
+# pass #16), so the dimension was flipped from per-model to per-kind.
+MAX_TOKENS_BY_KIND: dict[str, int] = {
+    "decision": 2000,
+    "review": 8000,
+    "research": 4000,
 }
 
 _CAPSULE_PROMPT_RESPONSE_MARKER = "PANELLIST RESPONSE:\n"
@@ -235,7 +236,7 @@ async def _extract_one(
     kwargs: dict[str, Any] = {
         "model": extractor_id,
         "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": _MAX_TOKENS_BY_KIND.get(kind, 800),
+        "max_tokens": MAX_TOKENS_BY_KIND.get(kind, MAX_TOKENS_BY_KIND["decision"]),
         "response_format": capsule_cls,
     }
     provider_caps.apply_temperature(kwargs, extractor_id, 0.0)
@@ -350,7 +351,7 @@ async def annotate(
     # consult flow's progress wrapper shifts done/total into the overall
     # bucket; callers that don't wrap get the per-phase counter.
     phase_event = PhaseStarted(done=0, total=total, phase="capsules")
-    _append_progress_log(paths.root, phase_event)
+    append_progress_log(paths.root, phase_event)
     if on_progress is not None:
         try:
             await on_progress(phase_event)
@@ -375,7 +376,7 @@ async def annotate(
             result = (cls(), None, False)
         done += 1
         event = CapsuleExtracted(done=done, total=total, slug=slug)
-        _append_progress_log(paths.root, event)
+        append_progress_log(paths.root, event)
         if on_progress is not None:
             try:
                 await on_progress(event)

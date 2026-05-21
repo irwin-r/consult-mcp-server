@@ -1,18 +1,23 @@
 """On-disk run layout + MCP resource URI conventions.
 
 Directory tree under ~/.consult/runs/<run_id>/:
-  prompt.txt               # the base prompt sent to every panellist
-  manifest.json            # the full RunHandle serialised
-  registry_snapshot.json   # frozen registry at run time
-  prompts/<slug>.txt       # per-slug prompt (with stance prefix)
-  responses/<slug>.json    # raw provider response (LiteLLM ModelResponse dump)
-  responses/<slug>.txt     # extracted body text (for resource serving)
-  capsules/<slug>.json     # extracted capsule
-  arbiters/round-<n>.json  # refine: per-round ArbiterVerdict (refine runs only)
-  synth_input.txt          # synth: full input sent to the synthesiser
-  synthesis.md             # synth: synthesis output (or error sentinel)
+  prompt.txt                # the base prompt sent to every panellist
+  manifest.json             # the full RunHandle serialised
+  registry_snapshot.json    # frozen registry at run time
+  prompts/<slug>.txt        # per-slug prompt (with stance prefix)
+  responses/<slug>.json     # raw provider response (LiteLLM ModelResponse dump)
+  responses/<slug>.txt      # extracted body text (for resource serving)
+  capsules/<slug>.json      # extracted capsule
+  arbiters/round-<n>.json   # refine: per-round ArbiterVerdict (refine runs only)
+  attachments/<name>        # original inlined attachment text (split out so
+                            # a panellist's trim-stub can reference the
+                            # full source via consult://...)
+  synth_input.txt           # synth: full input sent to the synthesiser
+  synthesis.md              # synth: synthesis output (or error sentinel)
 
-Resource URI scheme: consult://runs/<id>/responses/<slug>
+Resource URI scheme:
+  consult://runs/<id>/responses/<slug>       # panellist body
+  consult://runs/<id>/attachments/<name>     # original attachment source
 
 Note: refine round-suffixes slugs as `<base>.r<n>`, so the URI grammar is
 unchanged but slugs may contain dots and an `.r<digit>` suffix.
@@ -135,6 +140,10 @@ class RunPaths:
         return self.root / "arbiters"
 
     @property
+    def attachments(self) -> Path:
+        return self.root / "attachments"
+
+    @property
     def manifest_json(self) -> Path:
         return self.root / "manifest.json"
 
@@ -164,6 +173,17 @@ class RunPaths:
     def arbiter_for(self, round_num: int) -> Path:
         return self.arbiters / f"round-{round_num}.json"
 
+    def attachment_path(self, name: str) -> Path:
+        return self.attachments / _validate_id(name, "attachment name")
+
+    def attachment_resource_uri(self, name: str) -> str:
+        """URI for an inlined-attachment resource. Bypasses the injectable
+        formatter — attachments are an internal trim-stub concern; the
+        formatter override is only meaningful for panellist response URIs
+        embedded in the wire-shape manifest.
+        """
+        return f"consult://runs/{self.run_id}/attachments/{_validate_id(name, 'attachment name')}"
+
 
 def create_run() -> RunPaths:
     rid = new_run_id()
@@ -174,6 +194,7 @@ def create_run() -> RunPaths:
     paths.responses.mkdir()
     paths.capsules.mkdir()
     paths.arbiters.mkdir()
+    paths.attachments.mkdir()
     return paths
 
 
@@ -240,16 +261,25 @@ async def aaugment_manifest(paths: RunPaths, **fields: object) -> None:
     await asyncio.to_thread(augment_manifest, paths, **fields)
 
 
-def parse_resource_uri(uri: str) -> tuple[str, str]:
-    """Parse `consult://runs/<id>/responses/<slug>` → (run_id, slug)."""
+_RESOURCE_KINDS: tuple[str, ...] = ("responses", "attachments")
+
+
+def parse_resource_uri(uri: str) -> tuple[str, str, str]:
+    """Parse `consult://runs/<id>/<kind>/<name>` → (run_id, kind, name).
+
+    `kind` is one of `responses` (panellist body) or `attachments`
+    (original inlined attachment source). The kind makes the read path
+    explicit at parse time so the MCP resource handler dispatches without
+    re-validating.
+    """
     if not uri.startswith("consult://runs/"):
         raise ValueError(f"Not a consult resource URI: {uri}")
     rest = uri[len("consult://runs/") :]
     parts = rest.split("/")
-    if len(parts) != 3 or parts[1] != "responses":
+    if len(parts) != 3 or parts[1] not in _RESOURCE_KINDS:
         raise ValueError(f"Malformed consult URI: {uri}")
     # Validate before returning so a malicious URI can't reach disk via
     # downstream callers that forget to call `_validate_id` themselves.
     _validate_id(parts[0], "run_id")
-    _validate_id(parts[2], "slug")
-    return parts[0], parts[2]
+    _validate_id(parts[2], parts[1].rstrip("s"))  # "slug" or "attachment"
+    return parts[0], parts[1], parts[2]

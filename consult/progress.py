@@ -19,18 +19,25 @@ event has access to monotonic progress numbers regardless of kind.
 
 from __future__ import annotations
 
+import json
+import logging
 from collections.abc import Awaitable, Callable
-from typing import Annotated, Literal
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
+
+logger = logging.getLogger(__name__)
 
 
 class _BaseProgressEvent(BaseModel):
     """Common shape: every event carries the monotonic `(done, total)` pair."""
 
     # Forbid extras so a typo in an event-emitter kwarg fails loudly rather
-    # than silently dropping the value (see types._STRICT for the same
-    # rationale; this base class propagates the policy to every event kind).
+    # than silently dropping the value (mirrors types.StrictModel; this
+    # base class propagates the policy to every event kind without a
+    # cross-module import).
     model_config = ConfigDict(extra="forbid")
 
     done: int = Field(..., ge=0)
@@ -160,6 +167,29 @@ ProgressEvent = Annotated[
 ]
 
 
+# Async progress callback. Receives a typed `ProgressEvent`; the MCP adapter
+# (consult/mcp/server._build_progress_callback) converts to the wire shape.
+# Wrapped at each engine call site in a try/except so a notification failure
+# never aborts the real work (best-effort observability, not a hard contract).
+ProgressCallback = Callable[[ProgressEvent], Awaitable[None]]
+
+
+def append_progress_log(run_root: Path, event: ProgressEvent) -> None:
+    """Append a JSONL line to `<run>/_progress.log` for client-less tailing.
+
+    Always on — gives mid-run observability via `tail -f` even when the MCP
+    client didn't ask for `notifications/progress`. Each line is the event's
+    `model_dump()` with a `ts` field prepended; a write error here is logged
+    at debug and swallowed.
+    """
+    payload: dict[str, Any] = {"ts": datetime.now(UTC).isoformat(), **event.model_dump()}
+    try:
+        with (run_root / "_progress.log").open("a") as fh:
+            fh.write(json.dumps(payload) + "\n")
+    except OSError as e:  # pragma: no cover — log-write failure is benign
+        logger.debug("progress log write failed: %s", e)
+
+
 def shift_bucket(
     parent: Callable[[ProgressEvent], Awaitable[None]] | None,
     base: int,
@@ -184,6 +214,39 @@ def shift_bucket(
     async def cb(event: ProgressEvent) -> None:
         shifted = event.model_copy(update={"done": base + event.done, "total": total})
         await parent(shifted)
+
+    return cb
+
+
+def make_phase_cb(
+    parent: ProgressCallback | None,
+    base: int,
+    progress_total: int,
+    progress_done: list[int],
+) -> ProgressCallback | None:
+    """Wrap `parent` so child events shift into a caller-wide monotonic bucket,
+    and keep `progress_done[0]` updated so the caller can read it after the
+    callback fires (for subsequent direct emits between phases).
+
+    Multi-phase tools (`refine`, `sequence`) compose fanout + capsule + arbiter
+    (and N rounds/steps of those) into one progress stream. Each phase's child
+    callback ticks within its bucket; this helper centralises the shift +
+    counter-tracking pattern that both refine and sequence previously open-coded
+    as identical local closures — the kind of duplication FRICTION pass #14
+    flagged when one of those closures was miscopied.
+
+    `progress_done` is a single-element list used as a mutable cell: closures
+    can't rebind a name from an enclosing scope without `nonlocal`, but they
+    can mutate a list. The caller reads `progress_done[0]` for direct emits.
+    """
+    if parent is None:
+        return None
+    inner = shift_bucket(parent, base, progress_total)
+    assert inner is not None
+
+    async def cb(event: ProgressEvent) -> None:
+        progress_done[0] = base + event.done
+        await inner(event)
 
     return cb
 

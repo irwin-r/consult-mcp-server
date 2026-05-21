@@ -9,14 +9,17 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+
 # Forbid unknown fields by default. Pydantic v2's default `extra="ignore"`
 # silently drops kwargs that don't match a field — the same mechanism that
 # caused the original `RefineResult` silent-drop incident where `partial`,
-# `partial_reason`, and `wall_ms` were quietly discarded. Forbidding extras
-# turns any future field-mismatch into a loud ValidationError at the call
-# site. Set per-class (not via a shared base) to keep types.py self-contained
-# and avoid surprising inheritance interactions with downstream validators.
-_STRICT = ConfigDict(extra="forbid")
+# `partial_reason`, and `wall_ms` were quietly discarded. Inheriting from
+# this base makes the protection automatic: a new internal model added
+# without remembering to set `model_config = ConfigDict(extra="forbid")`
+# would silently revert to Pydantic's `extra="ignore"` default and reintroduce
+# the same class of bug.
+class StrictModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
 
 # Slug regex shared between ModelSpec input validation and artifacts.py
 # path construction. Module-level so it doesn't collide with Pydantic's
@@ -40,10 +43,8 @@ class Status(StrEnum):
     SKIPPED = "SKIPPED"
 
 
-class ModelSpec(BaseModel):
+class ModelSpec(StrictModel):
     """One panellist slot. Either `model` alone, or with a stance."""
-
-    model_config = _STRICT
 
     model: str = Field(..., description="Registry alias (e.g. 'gpt-pro') or LiteLLM ID")
     stance: str | None = Field(None, description="Stance key from stances.json or a custom prompt")
@@ -69,7 +70,7 @@ class ModelSpec(BaseModel):
         return v
 
 
-class Capsule(BaseModel):
+class Capsule(StrictModel):
     """Structured ~200-token extract from a panellist response (decision shape).
 
     Designed so the parent agent can synthesise from the manifest alone in
@@ -80,8 +81,6 @@ class Capsule(BaseModel):
     so callers that construct `Capsule()` directly (legacy code, tests)
     don't need to thread the literal through.
     """
-
-    model_config = _STRICT
 
     kind: Literal["decision"] = "decision"
     position: str = Field("", description="One-line summary of stance/conclusion")
@@ -96,10 +95,8 @@ class Capsule(BaseModel):
     confidence: float | None = Field(None, ge=0.0, le=1.0)
 
 
-class Finding(BaseModel):
+class Finding(StrictModel):
     """One line-anchored review finding (used by ReviewCapsule)."""
-
-    model_config = _STRICT
 
     severity: Literal["blocker", "major", "minor", "nit", "praise"]
     file: str | None = Field(None, description="File path, if the finding is file-specific.")
@@ -114,14 +111,12 @@ class Finding(BaseModel):
     suggestion: str = Field("", description="≤30 words on the specific change.")
 
 
-class ReviewCapsule(BaseModel):
+class ReviewCapsule(StrictModel):
     """Structured extract for code/PR review panels.
 
     Use `capsule_kind="review"` on `panel`/`consult`/`refine` to ask the
     extractor to produce this shape instead of the decision-shape `Capsule`.
     """
-
-    model_config = _STRICT
 
     kind: Literal["review"] = "review"
     findings: list[Finding] = Field(default_factory=list)
@@ -129,14 +124,12 @@ class ReviewCapsule(BaseModel):
     confidence: float | None = Field(None, ge=0.0, le=1.0)
 
 
-class ResearchCapsule(BaseModel):
+class ResearchCapsule(StrictModel):
     """Structured extract for research-question panels.
 
     Use `capsule_kind="research"` on `panel`/`consult`/`refine`. Suits
     workflows where the panel surveys evidence rather than picks a stance.
     """
-
-    model_config = _STRICT
 
     kind: Literal["research"] = "research"
     claims: list[str] = Field(default_factory=list, description="The panellist's main assertions.")
@@ -160,7 +153,7 @@ AnyCapsule = Annotated[
 ]
 
 
-class ManifestEntry(BaseModel):
+class ManifestEntry(StrictModel):
     """Per-panellist row returned to the parent. ~200 tokens.
 
     Invariants enforced by `_validate_status_payload`:
@@ -169,8 +162,6 @@ class ManifestEntry(BaseModel):
     - `cost_known=False` distinguishes "we couldn't look up the price" from
       a true zero cost (matters for the `max_run_usd` cap math in refine).
     """
-
-    model_config = _STRICT
 
     slug: str
     model_id: str | None = Field(
@@ -189,6 +180,12 @@ class ManifestEntry(BaseModel):
     cost_usd: float | None = Field(0.0, ge=0.0)
     cost_known: bool = True
     error: str | None = None
+    # Informational annotation on a successful call (auto-trim, partial
+    # streaming recovery, etc.). Distinct from `error` so the viewer can
+    # render it as a yellow info chip rather than a red error block — the
+    # call succeeded; we're just surfacing that something noteworthy
+    # happened along the way.
+    note: str | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -226,7 +223,7 @@ class ManifestEntry(BaseModel):
 _MANIFEST_SCHEMA_VERSION = 2
 
 
-class RunHandle(BaseModel):
+class RunHandle(StrictModel):
     """Returned by `panel`. Manifest-only — no raw bodies inlined.
 
     `schema_version=2` indicates a manifest whose `capsule` field may be
@@ -235,8 +232,6 @@ class RunHandle(BaseModel):
     entries; clients pinned to v1 should check `schema_version` before
     structurally parsing `capsule.*`.
     """
-
-    model_config = _STRICT
 
     schema_version: int = Field(_MANIFEST_SCHEMA_VERSION, ge=1)
     run_id: str
@@ -300,14 +295,24 @@ class RunHandle(BaseModel):
         return len(providers) >= min_providers
 
 
-class RunResult(BaseModel):
+class RunResult(StrictModel):
     """Returned by `consult` (the hero tool). Includes the synthesis."""
-
-    model_config = _STRICT
 
     schema_version: int = Field(_MANIFEST_SCHEMA_VERSION, ge=1)
     run_id: str
     synthesis: str
+    # Optional panel-disagreement score from `voting.panel_disagreement`.
+    # 0.0 = perfect consensus, 1.0 = no two panellists agree. `None`
+    # when there are fewer than two usable capsules to compare (the
+    # caller's "I want to gate on this" code must treat None as
+    # "unknown", not as "low disagreement").
+    disagreement: float | None = Field(None, ge=0.0, le=1.0)
+    # True iff the synthesis was produced by the deterministic
+    # aggregator (gating triggered) rather than the flagship synth model.
+    # Lets callers tell "we saved $0.40 because consensus was high" from
+    # "we paid for flagship synth as normal". Default False preserves the
+    # historic shape for callers who don't use gating.
+    synth_gated: bool = False
     manifest: list[ManifestEntry]
     cost_usd: float = Field(..., ge=0.0)
     cost_known: bool = True
@@ -339,22 +344,40 @@ class RunResult(BaseModel):
         return self
 
 
-class ArbiterVerdict(BaseModel):
+class ArbiterVerdict(StrictModel):
     """The arbiter's per-round assessment of panel sufficiency.
 
     `score` is a sufficiency rating (1.0 = strong consensus, ready to ship)
-    rather than absolute truth. `gaps` and `next_round_focus` feed the next
-    round's prompt.
+    rather than absolute truth. For v2 arbiter prompts it is *derived* — the
+    arbiter scores each of the dimensions in `dimensions` on a 1-5 Likert
+    scale, the engine normalises each to [0,1] and averages. Legacy (v1)
+    arbiter responses that emit only a top-level `score` are still
+    supported: in that case `dimensions` is empty.
 
-    `parsed_ok=False` means the arbiter call or JSON parse failed; downstream
-    callers must not feed `gaps` into a follow-up prompt in that case (the
-    "gaps" carry an exception message, not a real arbiter finding).
+    `gaps` and `next_round_focus` feed the next round's prompt as the
+    open-ended punch-list; `dimension_notes` carries per-dimension
+    localised critique (a Self-Refine / G-Eval pattern: localised feedback
+    converges faster than a single global score).
+
+    `parsed_ok=False` means the arbiter call or JSON parse failed;
+    downstream callers must not feed `gaps` into a follow-up prompt in
+    that case (the "gaps" carry an exception message, not a real arbiter
+    finding).
     """
-
-    model_config = _STRICT
 
     round: int
     score: float = Field(..., ge=0.0, le=1.0)
+    # Per-dimension Likert scores, normalised to [0,1] (the arbiter emits
+    # them on a 1-5 scale; `_ask_arbiter` rescales). Keys are dimension
+    # names (coverage / agreement / depth / calibration / actionability for
+    # the default rubric; other rubrics can use other keys). Empty dict =
+    # legacy verdict with only a top-level `score`.
+    dimensions: dict[str, float] = Field(default_factory=dict)
+    # One-sentence localised critique per dimension. Used by
+    # `_build_refinement_prompt` to focus the next-round prompt on the
+    # weakest dimensions — much sharper than the generic `gaps` list
+    # because each note points at a specific panellist or claim.
+    dimension_notes: dict[str, str] = Field(default_factory=dict)
     gaps: list[str] = Field(default_factory=list)
     next_round_focus: str = ""
     reasoning: str = ""
@@ -384,18 +407,25 @@ class ArbiterVerdict(BaseModel):
             raise ValueError(
                 "ArbiterVerdict.parsed_ok=False requires an error message"
             )
+        # Per-dimension scores must obey the same [0,1] bounds as the
+        # overall score. The arbiter's 1-5 input is rescaled in
+        # `_ask_arbiter` before construction, so any out-of-range value
+        # here is a constructor bug, not arbiter noise.
+        for dim, val in self.dimensions.items():
+            if not 0.0 <= val <= 1.0:
+                raise ValueError(
+                    f"ArbiterVerdict.dimensions[{dim!r}]={val} is outside [0,1]"
+                )
         return self
 
 
-class RefineResult(BaseModel):
+class RefineResult(StrictModel):
     """Returned by `refine`. Carries the final round's manifest, the arbiter
     verdicts for every round, and the final synthesis.
 
     Per-round transcripts live as MCP resources at
     consult://runs/<id>/responses/<slug>.r<n>
     """
-
-    model_config = _STRICT
 
     schema_version: int = Field(_MANIFEST_SCHEMA_VERSION, ge=1)
     run_id: str

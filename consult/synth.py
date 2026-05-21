@@ -2,7 +2,22 @@
 
 Default synthesiser is `gemini-pro`. The synthesiser is excluded from
 panellist composition where possible (`consult` hero tool handles this).
-Anonymised mode strips real model identities from the synthesis input.
+
+The synthesiser's *internal view* of the manifest is always blinded: each
+panellist is presented as `Alpha`, `Beta`, `Gamma`, ... (or `P12`, `P13`,
+... for panels bigger than the Greek alphabet) instead of by slug or
+model_id. The synth's output text is then de-anonymised by word-boundary
+regex before being persisted. This is the "When Identity Skews Debate"
+(arxiv 2510.07517) finding: full-pipeline anonymisation drops conformity
+bias ~96% on benchmark tasks, whereas *partial* anonymisation is worse
+than none (the judge picks up identity from style cues). The blinding is
+ALWAYS on regardless of the `anonymised` flag — that flag is kept for
+backwards-compat but is now vestigial (synth no longer references
+model_id in prose because it never sees one).
+
+Capsule order is shuffled per call too — position bias in LLM judging
+is well-documented (MT-Bench measured 75% first-position preference on
+Claude-v1; consult's synth is structurally a judge over the panel).
 """
 
 from __future__ import annotations
@@ -10,6 +25,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
+import re
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
@@ -17,7 +34,7 @@ from typing import Any
 import litellm
 
 from . import artifacts, context, registry
-from .runner import _build_messages
+from .runner import build_messages
 from .types import Status
 
 logger = logging.getLogger(__name__)
@@ -93,6 +110,41 @@ def _resolve_rubric(rubric: str | None) -> str:
     return resolved
 
 
+# Greek letters give human-friendly blind labels up to a 12-panellist
+# panel. Beyond that fall back to numeric IDs `P13`, `P14`, ... — none of
+# the shipped tiers go past 14 (`deep`), and a P-prefix word-boundary
+# matches are uncollidable with English prose.
+_BLIND_LABELS: tuple[str, ...] = (
+    "Alpha", "Beta", "Gamma", "Delta", "Epsilon", "Zeta",
+    "Eta", "Theta", "Iota", "Kappa", "Lambda", "Mu",
+)
+
+
+def _blind_label(index: int) -> str:
+    return _BLIND_LABELS[index] if index < len(_BLIND_LABELS) else f"P{index + 1}"
+
+
+def _deblind(text: str, label_to_slug: dict[str, str]) -> str:
+    """Replace blind labels with display slugs using word-boundary regex.
+
+    Case-sensitive: the synth is told to use the exact "Alpha" / "Beta"
+    tokens, and casual prose words like "alpha release" (lowercase) MUST
+    NOT be rewritten. Labels matched longest-first so panel-specific
+    numeric labels like `P10` don't get partial-matched by `P1`.
+
+    Single combined regex pass: a chained per-label substitution could
+    rewrite something twice if a slug happened to contain another label
+    name (e.g. user-supplied slug "Alpha-1").
+    """
+    if not label_to_slug:
+        return text
+    sorted_labels = sorted(label_to_slug, key=len, reverse=True)
+    pattern = re.compile(
+        r"\b(?:" + "|".join(re.escape(l) for l in sorted_labels) + r")\b"
+    )
+    return pattern.sub(lambda m: label_to_slug[m.group(0)], text)
+
+
 def _build_input(
     manifest: list[dict[str, Any]],
     bodies: dict[str, str],
@@ -100,32 +152,62 @@ def _build_input(
     rubric: str,
     anonymised: bool,
     original_prompt: str | None = None,
-) -> str:
+) -> tuple[str, dict[str, str]]:
+    """Build the synth's input text and return the de-anonymisation map.
+
+    Returns `(synth_input_text, label_to_slug)`. The synth sees blind
+    labels (`Alpha`, `Beta`, ...) — never the real slug or model_id. The
+    `label_to_slug` mapping is used post-call to de-anonymise the synth's
+    output text. Empty when no usable panellists (caller handles).
+
+    Panellist order is shuffled per call (position-bias mitigation).
+    """
     usable = [m for m in manifest if m["status"] in (Status.OK.value, Status.TRUNCATED.value)]
+    # Shuffle once per call. The synth's view of the panel is uncorrelated
+    # with manifest order; position-as-importance shortcuts are removed.
+    random.shuffle(usable)
+    label_to_slug: dict[str, str] = {}
     # `str.replace` (not `str.format`) so a user-supplied rubric in
     # ~/.consult/rubrics/ that contains literal `{` / `}` characters (a JSON
     # example, a template marker for another tool) doesn't crash with
     # `KeyError`. Only the `{n}` placeholder is meaningful here.
     header = rubric.replace("{n}", str(len(usable)))
     blocks = []
-    for entry in usable:
+    for i, entry in enumerate(usable):
         slug = entry["slug"]
+        label = _blind_label(i)
+        label_to_slug[label] = slug
         persona = entry.get("persona") or "neutral"
         conf = entry.get("confidence")
         status = entry["status"]
-        if anonymised:
-            label = f"[{slug} | persona={persona} | confidence={conf} | status={status}]"
-        else:
-            mid = entry.get("model_id") or "unknown"
-            label = f"[{slug} ({mid}) | persona={persona} | confidence={conf} | status={status}]"
+        # `anonymised` is preserved as a parameter for API compat but no
+        # longer changes what the synth sees — model_id and real slugs
+        # are unconditionally hidden by the blind-label substitution.
+        # The flag still records the caller's *intent* in the manifest;
+        # downstream tooling (viewer) may use it to decide whether to
+        # show real identities to the human reader. Reference here so
+        # linters don't flag it as unused.
+        _ = anonymised
+        label_str = (
+            f"[{label} | persona={persona} | confidence={conf} | status={status}]"
+        )
         body = bodies.get(slug, "")
-        blocks.append(f"{label}\n{body.strip()}")
+        blocks.append(f"{label_str}\n{body.strip()}")
     parts: list[str] = []
     if original_prompt:
         parts.append("## Original question / source\n\n" + original_prompt + "\n\n---\n\n")
     parts.append(header)
-    parts.append("\n\n---\nRESPONSES:\n\n" + "\n\n".join(blocks))
-    return "".join(parts)
+    # Prepend a one-line note telling the synth what the blind labels
+    # mean — without this it might invent free-form references to
+    # panellists ("the first model said..."). Word-boundary case-sensitive
+    # de-anonymisation post-call only catches the exact Alpha/Beta/...
+    # tokens, so it's worth nudging the synth to use them in prose.
+    parts.append(
+        "\n\n---\nRESPONSES (panellists are referred to as Alpha, Beta, etc.; "
+        "use these exact labels in your synthesis):\n\n"
+        + "\n\n".join(blocks)
+    )
+    return "".join(parts), label_to_slug
 
 
 async def synthesise(
@@ -174,15 +256,24 @@ async def synthesise(
     original_prompt, bodies = context.trim_synth_input(
         original_prompt=original_prompt, bodies=bodies
     )
-    synth_input = _build_input(
+    synth_input, label_to_slug = _build_input(
         manifest,
         bodies,
         rubric=rub,
         anonymised=anonymised,
         original_prompt=original_prompt,
     )
-    # Persist for reproducibility
+    # Persist for reproducibility — the synth input is what the model
+    # *actually* saw (blind labels in place of slugs).
     (paths.root / "synth_input.txt").write_text(synth_input)
+    # Persist the blind→slug mapping so the viewer (and any forensic
+    # tooling) can reconstruct exactly which panellist each Alpha/Beta
+    # corresponded to on this call. Cheap on disk and uncomplicates
+    # debugging if a de-anonymised synthesis looks wrong.
+    if label_to_slug:
+        (paths.root / "blind_map.json").write_text(
+            json.dumps(label_to_slug, indent=2, sort_keys=True)
+        )
 
     synth_alias = by_model or registry.default_synthesiser()
     entry = registry.resolve_model(synth_alias)
@@ -198,7 +289,7 @@ async def synthesise(
         resp = await asyncio.wait_for(
             litellm.acompletion(
                 model=litellm_id,
-                messages=_build_messages(synth_input, provider),
+                messages=build_messages(synth_input, provider),
                 max_tokens=budget,
             ),
             timeout=timeout,
@@ -269,6 +360,11 @@ async def synthesise(
         )
 
     text = content.strip()
+    # De-anonymise the synth's output: each `\bAlpha\b` / `\bBeta\b` /
+    # ... token reverts to the panellist's display slug. The synth's
+    # internal view stays bias-mitigated; the on-disk synthesis.md still
+    # carries the real slugs the user expects to see in references.
+    text = _deblind(text, label_to_slug)
     (paths.root / "synthesis.md").write_text(text)
     # Persist synthesiser badge + spend to the manifest so the standalone
     # `synthesise` tool's cost reaches `consult-ledger`. `orchestrate.consult`,

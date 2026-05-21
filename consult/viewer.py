@@ -499,10 +499,56 @@ def _brand_glyph_html(provider: str) -> str:
     )
 
 
-def _model_badge_html(model_id: str | None) -> str:
-    """Inline badge + humanised name. Falls back to the raw id when the
-    provider isn't in the map so nothing disappears silently.
+_GREEK_LETTERS: dict[str, str] = {
+    "alpha": "α", "beta": "β", "gamma": "γ", "delta": "δ",
+    "epsilon": "ε", "zeta": "ζ", "eta": "η", "theta": "θ",
+    "iota": "ι", "kappa": "κ", "lambda": "λ", "mu": "μ",
+}
+
+# Slug shape produced by runner._make_slug under blinded=True. The optional
+# `.r<n>` suffix preserves the round identity in refine runs.
+_BLINDED_SLUG_RE = re.compile(r"^panelist-([a-z]+)(?:\.r\d+)?$")
+
+
+def _blinded_greek_for_slug(slug: str | None) -> str | None:
+    """Return the greek glyph for a blinded panelist slug, or None for
+    non-blinded slugs. `panelist-alpha.r1` → `α`.
     """
+    if not slug:
+        return None
+    m = _BLINDED_SLUG_RE.match(slug)
+    return _GREEK_LETTERS.get(m.group(1)) if m else None
+
+
+def _blinded_inline_glyph(letter: str) -> str:
+    """Inline SVG text glyph for a blinded panelist — bypasses the brand
+    sprite so each blinded panelist gets a distinct letter without
+    pre-baking 12 symbols. Matches `_brand_symbol_body`'s text styling.
+    """
+    return (
+        f'<svg class="brand-icon" viewBox="0 0 24 24" aria-hidden="true">'
+        f'<text x="12" y="17" text-anchor="middle" '
+        f'font-family="-apple-system,BlinkMacSystemFont,Roboto,sans-serif" '
+        f'font-size="15" font-weight="700" fill="currentColor">'
+        f'{html.escape(letter)}</text></svg>'
+    )
+
+
+def _model_badge_html(model_id: str | None, slug: str | None = None) -> str:
+    """Inline badge + humanised name. Falls back to the raw id when the
+    provider isn't in the map so nothing disappears silently. For blinded
+    panels (model_id=None, slug like `panelist-alpha`), uses the greek
+    letter as the glyph so each panelist stays visually distinct.
+    """
+    greek = _blinded_greek_for_slug(slug) if model_id is None else None
+    if greek is not None:
+        title = html.escape(f"blinded panellist · {slug}")
+        return (
+            f'<span class="model-tag" title="{title}">'
+            f'<span class="brand brand-other">{_blinded_inline_glyph(greek)}</span>'
+            f'<span class="model-name">Panellist {html.escape(greek)}</span>'
+            f'</span>'
+        )
     provider, model_part = _provider_of(model_id)
     _, brand_name = _PROVIDER_INFO[provider]
     display = _humanise_model(model_part) or (model_id or "—")
@@ -539,6 +585,27 @@ def _cite_pill(
     """
     if anchor_slug is None:
         anchor_slug = slug
+    # Round chip reflects the resolved target, not the bare citation text,
+    # so `[claude-haiku-2]` → `claude-haiku-2.r3` still shows `r3`.
+    round_num = _round_of(anchor_slug)
+    round_chip = (
+        f' <span class="cite-round">r{round_num}</span>'
+        if round_num is not None else ""
+    )
+    # Anchor to the matching panellist card so citations are click-to-jump.
+    # Slugs are `[a-zA-Z0-9._-]+` by registry convention, so html.escape is
+    # sufficient — no URL-encoding edge cases.
+    href = "#card-" + html.escape(anchor_slug, quote=True)
+    greek = _blinded_greek_for_slug(anchor_slug) if model_id is None else None
+    if greek is not None:
+        title = html.escape(f"blinded panellist · {slug}")
+        return (
+            f'<a href="{href}" class="cite cite-other" title="{title}">'
+            f'<span class="brand brand-other">{_blinded_inline_glyph(greek)}</span>'
+            f'<span class="cite-name">Panellist {html.escape(greek)}</span>'
+            f'{round_chip}'
+            f'</a>'
+        )
     provider, model_part = _provider_of(model_id)
     _, brand_name = _PROVIDER_INFO[provider]
     # Prefer the humanised model name over the raw slug — "Claude Opus 4.7"
@@ -548,13 +615,6 @@ def _cite_pill(
     display = _humanise_model(model_part) if model_id else slug
     if not display:
         display = slug
-    # Round chip reflects the resolved target, not the bare citation text,
-    # so `[claude-haiku-2]` → `claude-haiku-2.r3` still shows `r3`.
-    round_num = _round_of(anchor_slug)
-    round_chip = (
-        f' <span class="cite-round">r{round_num}</span>'
-        if round_num is not None else ""
-    )
     # Tooltip carries the raw slug + full model_id so the underlying
     # identity is one hover away even after we've prettified the label.
     tip_bits = [brand_name] if brand_name else []
@@ -562,10 +622,6 @@ def _cite_pill(
     if model_id:
         tip_bits.append(model_id)
     title = html.escape(" · ".join(tip_bits))
-    # Anchor to the matching panellist card so citations are click-to-jump.
-    # Slugs are `[a-zA-Z0-9._-]+` by registry convention, so html.escape is
-    # sufficient — no URL-encoding edge cases.
-    href = "#card-" + html.escape(anchor_slug, quote=True)
     return (
         f'<a href="{href}" class="cite cite-{provider}" title="{title}">'
         f'<span class="brand brand-{provider}">{_brand_glyph_html(provider)}</span>'
@@ -1175,6 +1231,16 @@ _CSS = """
     border-radius: 6px; margin: 6px 0; white-space: pre-wrap;
     overflow-x: auto;
   }
+  /* Informational annotation on a successful call (e.g. auto-trim). Same
+     shape as .error-msg but neutral colours — the call succeeded; we're
+     just surfacing context that affected this panellist's view. */
+  .note-msg {
+    color: var(--muted-fg); font-size: 12px;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: var(--muted-bg); padding: 6px 10px;
+    border-radius: 6px; margin: 6px 0; white-space: pre-wrap;
+    overflow-x: auto;
+  }
   .footer { color: var(--muted-text); font-size: 12px; margin-top: 48px; padding-top: 12px; border-top: 1px solid var(--border); }
   .body-pre {
     white-space: pre-wrap; font-family: -apple-system, BlinkMacSystemFont, sans-serif;
@@ -1515,6 +1581,7 @@ def _panellist_card(
     tokens_in = entry.get("tokens_in")
     tokens_out = entry.get("tokens_out")
     error = entry.get("error")
+    note = entry.get("note")
     capsule = entry.get("capsule")
     reconstructed = entry.get("_reconstructed", False)
 
@@ -1533,6 +1600,7 @@ def _panellist_card(
         stats.append(f"<span>persona <b>{html.escape(persona)}</b></span>")
 
     err_block = f'<div class="error-msg">{html.escape(error)}</div>' if error else ""
+    note_block = f'<div class="note-msg">{html.escape(note)}</div>' if note else ""
     cap_block = _capsule_block(capsule, slug_to_model, bare_resolution)
     recon_tag = (
         '<span class="recon-badge" title="Reconstructed from on-disk artifacts '
@@ -1556,12 +1624,13 @@ def _panellist_card(
     return f"""
     <article class="card" id="card-{html.escape(slug, quote=True)}" title="{html.escape(slug)}">
       <div class="card-head">
-        {_model_badge_html(model_id)}
+        {_model_badge_html(model_id, slug)}
         {_pill(status, _status_tone(status))}
         {recon_tag}
       </div>
       <div class="card-stats">{"".join(stats)}</div>
       {err_block}
+      {note_block}
       {cap_block}
       {body_block}
     </article>

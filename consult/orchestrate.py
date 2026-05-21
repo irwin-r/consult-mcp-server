@@ -15,10 +15,10 @@ from __future__ import annotations
 import logging
 from collections.abc import Awaitable, Callable
 
-from . import artifacts, capsule, registry, runner, synth
+from . import artifacts, capsule, registry, runner, synth, voting
 from . import attachments as attachments_mod
 from .progress import ProgressEvent, SynthCompleted, SynthStarted, shift_bucket
-from .types import ModelSpec, RunResult
+from .types import Capsule, ManifestEntry, ModelSpec, RunResult, Status
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +43,49 @@ async def _safe_emit(
         logger.debug("progress callback failed: %s", e)
 
 
+def _deterministic_aggregate(manifest: list[ManifestEntry], disagreement: float) -> str:
+    """Produce a synthesis-shaped markdown without calling the flagship.
+
+    Used when `gate_synth_at_agreement` is set and the panel's
+    `disagreement` falls below the threshold — high consensus means the
+    flagship's added cost buys little. We surface each usable
+    panellist's position/recommendation as a bulleted aggregate and tag
+    the synthesis with the gating score so the caller can audit the
+    decision.
+
+    Only `Capsule` (decision-kind) entries get a structured rendering;
+    review/research kinds fall back to their slug + status because their
+    "position" semantics differ enough that a one-line summary would
+    mislead.
+    """
+    lines = [
+        "# Synthesis (gated — high consensus)",
+        "",
+        (
+            f"The panel converged with low disagreement (score "
+            f"{disagreement:.2f}). The flagship synth was skipped to "
+            f"save cost; each panellist's position is listed below."
+        ),
+        "",
+        "## Positions",
+        "",
+    ]
+    for entry in manifest:
+        if entry.status not in (Status.OK, Status.TRUNCATED) or entry.capsule is None:
+            continue
+        cap = entry.capsule
+        if isinstance(cap, Capsule):
+            line = f"- **{entry.slug}** — {cap.position}"
+            if cap.recommendation and cap.recommendation != cap.position:
+                line += f"; recommends: {cap.recommendation}"
+        else:
+            # Non-decision capsules: defer to the structured artefact;
+            # don't try to one-line them.
+            line = f"- **{entry.slug}** — see capsule artefact (`{type(cap).__name__}`)"
+        lines.append(line)
+    return "\n".join(lines)
+
+
 async def consult(
     prompt: str,
     *,
@@ -57,6 +100,7 @@ async def consult(
     attachments: list | None = None,
     dry_run: bool = False,
     on_progress: ProgressCallback | None = None,
+    gate_synth_at_agreement: float | None = None,
 ) -> RunResult:
     """Run the 3-phase hero: fanout → capsule extract → synth.
 
@@ -80,11 +124,29 @@ async def consult(
     progress events across all three phases — child events from each
     stage are shifted into a consult-wide `(done, total)` bucket.
 
+    `gate_synth_at_agreement` (default None = always synth): when set
+    and the post-capsule panel `disagreement` score is BELOW this value
+    (i.e. the panel agreed strongly), the flagship synth is skipped and
+    a deterministic per-panellist aggregate is returned instead. The
+    returned RunResult has `synth_gated=True`. Useful for cost-aware
+    cascades (MAgICoRe / FrugalGPT pattern): pay flagship only when the
+    panel disagrees, accept aggregation when it doesn't. A reasonable
+    starting threshold is 0.15-0.25 — calibrate against your panel.
+    Requires `extract_capsules=True` to compute the score; with
+    `extract_capsules=False` the gate is a no-op.
+
     Returns a fully-populated `RunResult`. On a partial/failed panel,
     returns a `RunResult` with `partial=True`, empty `synthesis`, and
     `partial_reason` set — same shape as the success path so callers
     can branch on the flag rather than the envelope.
     """
+    if gate_synth_at_agreement is not None and not (
+        0.0 <= gate_synth_at_agreement <= 1.0
+    ):
+        raise ValueError(
+            f"gate_synth_at_agreement must be in [0,1] or None; got "
+            f"{gate_synth_at_agreement!r}"
+        )
     tier_models = registry.resolve_tier(tier)
     roles = roles or {}
     synth_alias = synthesiser or registry.default_synthesiser()
@@ -144,6 +206,53 @@ async def consult(
             kind=capsule_kind,
         )
 
+    # Compute disagreement post-capsule-extraction. None when fewer than
+    # two usable capsules to compare (e.g. extract_capsules=False, or a
+    # panel where most entries failed).
+    disagreement = voting.panel_disagreement(handle.manifest)
+
+    # Gating decision: skip the flagship synth when the panel converged
+    # tightly. Requires both a configured threshold AND a computable
+    # disagreement score (the None-case happens when capsules are off or
+    # most panellists failed — gating in those cases would obscure the
+    # real signal).
+    gated = (
+        gate_synth_at_agreement is not None
+        and disagreement is not None
+        and disagreement < gate_synth_at_agreement
+    )
+
+    if gated:
+        # Deterministic aggregate. No model call, no synth spend rolled in.
+        # We still write `synthesis.md` so the on-disk artifact dir stays
+        # consistent (consult-view + consult-ledger work the same way).
+        paths = artifacts.load_run(handle.run_id)
+        synth_text = _deterministic_aggregate(handle.manifest, disagreement or 0.0)
+        (paths.root / "synthesis.md").write_text(synth_text)
+        await _safe_emit(
+            on_progress, SynthCompleted(done=overall_total, total=overall_total)
+        )
+        total_cost = handle.cost_usd
+        total_cost_known = handle.cost_known
+        await artifacts.aaugment_manifest(
+            paths,
+            synthesiser="(gated)",  # marker so the ledger entry is unambiguous
+            cost_usd=total_cost,
+            cost_known=total_cost_known,
+        )
+        return RunResult(
+            run_id=handle.run_id,
+            synthesis=synth_text,
+            manifest=handle.manifest,
+            cost_usd=total_cost,
+            cost_known=total_cost_known,
+            wall_ms=handle.wall_ms,
+            partial=False,
+            synthesiser="(gated)",
+            disagreement=disagreement,
+            synth_gated=True,
+        )
+
     # The outer total was sized for fanout + capsules + synth, so synth's
     # `done` starts at the synth offset regardless of whether capsules ran.
     await _safe_emit(
@@ -183,4 +292,5 @@ async def consult(
         wall_ms=handle.wall_ms,
         partial=False,
         synthesiser=synth_alias,
+        disagreement=disagreement,
     )

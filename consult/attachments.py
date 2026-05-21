@@ -13,11 +13,16 @@ so server.py stays focused on MCP wiring + tool orchestration.
 
 from __future__ import annotations
 
+import logging
 import os
+import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from . import sources
+
+logger = logging.getLogger(__name__)
 
 # Hard cap on a single attachment's size. A panel call against a multi-GB
 # log file would burn token budget and may also OOM the server before
@@ -178,7 +183,163 @@ def inline_attachments(prompt: str, attachments: list | None) -> str:
     """
     if not attachments:
         return prompt
-    parts = [prompt, "\n\n--- ATTACHMENTS ---\n"]
+    parts = [prompt, ATTACHMENT_SEPARATOR]
     for item in attachments:
         parts.append(render_attachment(item))
     return "".join(parts)
+
+
+# --------------------------------------------------------------------------
+# Parsing & persistence — used by runner to (a) write each inlined block to
+# disk as a resource and (b) trim by dropping whole blocks (replaced with a
+# stub that references the resource URI) instead of head+tail-slicing through
+# the middle of a code file.
+# --------------------------------------------------------------------------
+
+ATTACHMENT_SEPARATOR = "\n\n--- ATTACHMENTS ---\n"
+
+# Block shape produced by `render_attachment`:
+#   \n# <path>\n```<lang>\n<content>\n```\n
+#   \n## <label>: <path>\n```<lang>\n<content>\n```\n
+#   \n## <label-only>\n```<lang>\n<content>\n```\n   (git_diff)
+# The non-greedy `(.*?)` between fences terminates at the first closing
+# triple-backtick. Source files rarely contain literal triple-backticks;
+# attached markdown could trip this, but a slightly-short block is a
+# softer failure mode than mis-parsing the whole prompt.
+_BLOCK_RE = re.compile(
+    r"(?P<header>^#{1,2} [^\n]+)\n```(?P<lang>[^\n]*)\n(?P<content>.*?)\n```",
+    re.DOTALL | re.MULTILINE,
+)
+_HEADER_LABEL_PATH_RE = re.compile(r"^## (?P<label>[^:]+): (?P<path>.+)$")
+_HEADER_PATH_ONLY_RE = re.compile(r"^# (?P<path>.+)$")
+_HEADER_LABEL_ONLY_RE = re.compile(r"^## (?P<label>.+)$")
+_NAME_SANITISE_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+@dataclass(frozen=True)
+class InlinedBlock:
+    """A parsed attachment block in an inlined prompt.
+
+    `start`/`end` are character offsets into the prompt covering the
+    *whole* block (from the leading header line through the closing
+    fence). Replacing prompt[start:end] with a stub is how the trimmer
+    drops a block without disturbing the surrounding prose.
+    """
+
+    header: str
+    label: str | None
+    path: str | None
+    lang: str
+    content: str
+    start: int
+    end: int
+
+
+def _parse_header(header: str) -> tuple[str | None, str | None]:
+    """Decompose a block header into (label, path).
+
+    Three shapes from `render_attachment`:
+      `# <path>`              → (None, path)
+      `## <label>: <path>`    → (label, path)
+      `## <label-only>`       → (label, None)   (git_diff)
+    """
+    m = _HEADER_LABEL_PATH_RE.match(header)
+    if m:
+        return m.group("label").strip(), m.group("path").strip()
+    m = _HEADER_PATH_ONLY_RE.match(header)
+    if m:
+        return None, m.group("path").strip()
+    m = _HEADER_LABEL_ONLY_RE.match(header)
+    if m:
+        return m.group("label").strip(), None
+    return None, None
+
+
+def extract_inlined_blocks(prompt: str) -> list[InlinedBlock]:
+    """Find every attachment block that `inline_attachments` would have
+    produced. Returns an empty list when the `--- ATTACHMENTS ---`
+    separator isn't present (the prompt has no inlined attachments to
+    enumerate).
+
+    Blocks before the separator are ignored — those would be triple-fenced
+    code in the user's prose, not attachments. Without this guard, a
+    user pasting ```py blocks in their question would mis-classify them
+    as attachments and the trimmer could drop genuine question content.
+    """
+    sep_idx = prompt.find(ATTACHMENT_SEPARATOR)
+    if sep_idx < 0:
+        return []
+    region_start = sep_idx + len(ATTACHMENT_SEPARATOR)
+    blocks: list[InlinedBlock] = []
+    for m in _BLOCK_RE.finditer(prompt, region_start):
+        label, path = _parse_header(m.group("header"))
+        blocks.append(InlinedBlock(
+            header=m.group("header"),
+            label=label,
+            path=path,
+            lang=m.group("lang"),
+            content=m.group("content"),
+            start=m.start(),
+            end=m.end(),
+        ))
+    return blocks
+
+
+def safe_attachment_name(block: InlinedBlock, used: set[str]) -> str:
+    """Filename-safe identifier for an inlined block. Prefers the file's
+    basename; falls back to a sanitised label (git_diff case). On
+    collision within `used`, appends `-N` until unique. Always passes
+    `artifacts._SAFE_ID_RE` so the on-disk write can't traverse.
+    """
+    raw: str
+    if block.path:
+        raw = Path(block.path).name or block.path
+    elif block.label:
+        raw = block.label
+    else:
+        raw = "attachment"
+    cleaned = _NAME_SANITISE_RE.sub("-", raw).strip("-.")
+    if not cleaned or not cleaned[0].isalnum():
+        cleaned = f"x-{cleaned}" if cleaned else "attachment"
+    name = cleaned
+    n = 1
+    while name in used:
+        name = f"{cleaned}-{n}"
+        n += 1
+    used.add(name)
+    return name
+
+
+def persist_inlined_attachments(paths: Any, prompt: str) -> dict[int, str]:
+    """Write each inlined attachment's content to `paths.attachments/<name>`
+    and return `{block_start_offset: resource_uri}`.
+
+    Idempotent enough: re-writes files if called twice with the same
+    prompt. Used by the runner at run-init so panellist trim stubs can
+    reference a resource URI that actually resolves, and so the human
+    reader of the report can read the original source even after the
+    trim stub replaced it in the panellist prompt.
+
+    `paths` is duck-typed for `artifacts.RunPaths` to avoid a
+    `attachments` → `artifacts` cycle. It must expose `.attachments`
+    (dir Path) and `.attachment_resource_uri(name) -> str`.
+    """
+    blocks = extract_inlined_blocks(prompt)
+    if not blocks:
+        return {}
+    paths.attachments.mkdir(exist_ok=True)
+    used: set[str] = set()
+    out: dict[int, str] = {}
+    for block in blocks:
+        name = safe_attachment_name(block, used)
+        target = paths.attachments / name
+        try:
+            target.write_text(block.content)
+        except OSError as e:
+            logger.warning(
+                "could not persist attachment block %r → %s: %s",
+                block.path or block.label, target, e,
+            )
+            continue
+        out[block.start] = paths.attachment_resource_uri(name)
+    return out

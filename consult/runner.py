@@ -12,7 +12,6 @@ import os
 import random
 import re
 import time
-from collections.abc import Awaitable, Callable
 from contextlib import nullcontext, suppress
 from datetime import UTC, datetime
 from pathlib import Path
@@ -20,25 +19,22 @@ from typing import Any
 
 import litellm
 
-from . import artifacts, context, registry
+from . import artifacts, attachments as attachments_mod, context, registry, telemetry
+from .capsule import MAX_TOKENS_BY_KIND
 from .progress import (
     Heartbeat,
     PanellistCompleted,
     PanellistPartial,
     PanellistStarted,
     PhaseStarted,
+    ProgressCallback,
     ProgressEvent,
+    append_progress_log,
 )
 from .status import classify
 from .types import ManifestEntry, ModelSpec, RunHandle, Status
 
 logger = logging.getLogger(__name__)
-
-# Async progress callback. Receives a typed `ProgressEvent`; the server-side
-# adapter (server._progress_callback) converts to the MCP wire shape. Wrapped
-# at each call site in a try/except so a notification failure never aborts
-# the real work (best-effort observability, not a hard contract).
-ProgressCallback = Callable[[ProgressEvent], Awaitable[None]]
 
 
 async def _write_text_async(path: Path, content: str) -> None:
@@ -50,21 +46,6 @@ async def _write_text_async(path: Path, content: str) -> None:
     """
     await asyncio.to_thread(path.write_text, content)
 
-
-def _append_progress_log(run_root: Path, event: ProgressEvent) -> None:
-    """Append a JSONL line to `<run>/_progress.log` for client-less tailing.
-
-    Always on — gives mid-run observability via `tail -f` even when the MCP
-    client didn't ask for `notifications/progress`. Each line is the event's
-    `model_dump()` with a `ts` field prepended; a write error here is logged
-    at debug and swallowed.
-    """
-    payload: dict[str, Any] = {"ts": datetime.now(UTC).isoformat(), **event.model_dump()}
-    try:
-        with (run_root / "_progress.log").open("a") as fh:
-            fh.write(json.dumps(payload) + "\n")
-    except OSError as e:  # pragma: no cover — log-write failure is benign
-        logger.debug("progress log write failed: %s", e)
 
 _LITELLM_CONFIGURED = False
 
@@ -124,7 +105,7 @@ _SLUG_BAD_CHARS_RE = re.compile(r"[^A-Za-z0-9._-]+")
 _ROUND_SUFFIX_RE = re.compile(r"\.r\d+$")
 
 
-def _sanitise_derived_slug(base: str) -> str:
+def sanitise_derived_slug(base: str) -> str:
     """Coerce a model-derived slug fragment into the safe-id character set.
 
     Multiple bad characters in a row collapse to a single `-` and any
@@ -194,6 +175,49 @@ def _rate_limit_class() -> type[BaseException]:
     return _NeverRaised
 
 
+def _transient_error_classes() -> tuple[type[BaseException], ...]:
+    """Resolve the set of LiteLLM exception subclasses we treat as retriable
+    but distinct from RateLimitError. Returns an empty tuple (matches
+    nothing via isinstance) when litellm is unavailable or the classes
+    have moved.
+
+    Specifically: connection drops and transient upstream 5xx. Does NOT
+    include bare `APIError` — that's the root of the openai/litellm
+    exception tree and would also match `AuthenticationError`,
+    `BadRequestError`, etc. (terminal failures we don't want to retry).
+    The bare-`APIError` case (e.g. OpenRouter's "Unable to get json
+    response" all-whitespace body) is caught separately by exact-type
+    match in `_acompletion_with_retry`.
+    """
+    try:
+        from litellm import exceptions as lex
+    except Exception:  # pragma: no cover — litellm always present in prod
+        return ()
+    classes: list[type[BaseException]] = []
+    for name in (
+        "APIConnectionError",
+        "InternalServerError",
+        "ServiceUnavailableError",
+    ):
+        cls = getattr(lex, name, None)
+        if cls is not None:
+            classes.append(cls)
+    return tuple(classes)
+
+
+def _bare_api_error_class() -> type[BaseException] | None:
+    """Resolve the root `litellm.exceptions.APIError` class for exact-type
+    matching. Used to retry the bare-`APIError` failure mode (e.g.
+    OpenRouter returning whitespace) without sweeping in auth/bad-request
+    subclasses.
+    """
+    try:
+        from litellm import exceptions as lex
+    except Exception:  # pragma: no cover
+        return None
+    return getattr(lex, "APIError", None)
+
+
 _RETRY_MAX_ATTEMPTS = 3
 _RETRY_BASE_DELAY_S = 2.0
 
@@ -234,20 +258,29 @@ def _get_provider_sems() -> dict[str, asyncio.Semaphore]:
 
 
 async def _acompletion_with_retry(*, timeout: float, **kwargs: Any) -> Any:
-    """`litellm.acompletion` with bounded, jittered retry on RateLimitError.
+    """`litellm.acompletion` with bounded, jittered retry on transient errors.
 
-    Only `RateLimitError` retries — auth, content-filter, bad-request, and
-    other terminal errors propagate immediately (retrying them just burns
-    spend). The total wall-clock (calls + sleeps) is bounded by `timeout`:
-    each attempt's `asyncio.wait_for` uses the *remaining* budget, so the
-    last retry can't push the run past the per-spec ceiling.
+    Retries on `RateLimitError` and the transient-API family (`APIError`,
+    `APIConnectionError`, `InternalServerError`, `ServiceUnavailableError`).
+    The OpenRouter "Unable to get json response" failure (upstream returned
+    all-whitespace) surfaces as `APIError` and was previously a one-shot
+    ERROR — recovers cleanly on a second attempt. Auth, content-filter,
+    bad-request, and other terminal errors propagate immediately (retrying
+    them just burns spend).
+
+    Total wall-clock (calls + sleeps) is bounded by `timeout`: each
+    attempt's `asyncio.wait_for` uses the *remaining* budget, so the last
+    retry can't push the run past the per-spec ceiling.
 
     Configurable via env: `CONSULT_RETRY_MAX_ATTEMPTS` (default 3, set to 1
     to disable), `CONSULT_RETRY_BASE_DELAY` (default 2.0s). Backoff is
     `base * 2^attempt * (0.5 + random())` — exponential with ±50% jitter
-    so panels of N concurrently-rate-limited siblings don't retry in lockstep.
+    so panels of N concurrently-failing siblings don't retry in lockstep.
     """
     rate_cls = _rate_limit_class()
+    transient_classes = _transient_error_classes()
+    bare_api_cls = _bare_api_error_class()
+    retriable: tuple[type[BaseException], ...] = (rate_cls, *transient_classes)
     max_attempts = max(
         1, int(os.environ.get("CONSULT_RETRY_MAX_ATTEMPTS", _RETRY_MAX_ATTEMPTS))
     )
@@ -263,29 +296,82 @@ async def _acompletion_with_retry(*, timeout: float, **kwargs: Any) -> Any:
             raise TimeoutError(
                 f"retry budget exhausted before attempt {attempt + 1}"
             )
+        last_exc: BaseException
         try:
             return await asyncio.wait_for(
                 litellm.acompletion(**kwargs), timeout=remaining
             )
-        except rate_cls as e:
-            if attempt == max_attempts - 1:
+        except retriable as e:
+            # Rate-limit or known transient subclass.
+            last_exc = e
+        except Exception as e:
+            # Bare `APIError` (not a subclass) is the OpenRouter
+            # "Unable to get json response" failure mode — retriable.
+            # Any subclass (auth/bad-request/content-policy) is terminal.
+            if bare_api_cls is None or type(e) is not bare_api_cls:
                 raise
-            delay = base_delay * (2 ** attempt) * (0.5 + random.random())
-            remaining_after = timeout - (time.monotonic() - start)
-            # Leave a 0.5s margin so the next attempt has time to start.
-            sleep_for = min(delay, remaining_after - 0.5)
-            if sleep_for <= 0:
-                raise
-            logger.warning(
-                "rate-limited on %s attempt %d/%d (%s); retry in %.2fs",
-                model_label, attempt + 1, max_attempts, type(e).__name__, sleep_for,
-            )
-            await asyncio.sleep(sleep_for)
+            last_exc = e
+        if attempt == max_attempts - 1:
+            raise last_exc
+        delay = base_delay * (2 ** attempt) * (0.5 + random.random())
+        remaining_after = timeout - (time.monotonic() - start)
+        # Leave a 0.5s margin so the next attempt has time to start.
+        sleep_for = min(delay, remaining_after - 0.5)
+        if sleep_for <= 0:
+            raise last_exc
+        kind = "rate-limited" if isinstance(last_exc, rate_cls) else "transient API error"
+        logger.warning(
+            "%s on %s attempt %d/%d (%s); retry in %.2fs",
+            kind, model_label, attempt + 1, max_attempts,
+            type(last_exc).__name__, sleep_for,
+        )
+        await asyncio.sleep(sleep_for)
     # Unreachable — the loop either returns or raises above.
     raise TimeoutError(f"retry budget exhausted ({timeout}s)")
 
 
-def _concat_turn_text(turns: list[dict[str, Any]]) -> str:
+_ERROR_MAX_CHARS = 4096
+
+
+def _format_error_message(exc: BaseException) -> str:
+    """Coerce a provider exception into a compact manifest-friendly string.
+
+    LiteLLM happily includes the upstream's raw response in the exception
+    message, which for OpenRouter's "Unable to get json response" failure
+    means 500+ blank lines of whitespace get embedded. The manifest gets
+    enormous and the feed renders a giant empty error block.
+
+    Strategy: keep the first non-empty line (the diagnostic), then collapse
+    long runs of consecutive whitespace-only lines into a single `[...]`
+    marker, and hard-cap at `_ERROR_MAX_CHARS`. Original raw response is
+    still available in `responses/<slug>.json` if forensic detail is
+    needed.
+    """
+    raw = str(exc)
+    if not raw:
+        return type(exc).__name__
+    lines = raw.split("\n")
+    out: list[str] = []
+    blank_run = 0
+    for line in lines:
+        if not line.strip():
+            blank_run += 1
+            continue
+        if blank_run >= 3:
+            out.append(f"[... {blank_run} blank lines elided ...]")
+        elif blank_run > 0:
+            out.extend([""] * blank_run)
+        blank_run = 0
+        out.append(line)
+    # Trailing blank run — drop unless meaningful (we already lost any
+    # content there by definition).
+    collapsed = "\n".join(out).strip()
+    if len(collapsed) > _ERROR_MAX_CHARS:
+        collapsed = collapsed[: _ERROR_MAX_CHARS - 1] + "…"
+    return collapsed or type(exc).__name__
+
+
+def concat_turn_text(turns: list[dict[str, Any]]) -> str:
     """Flatten a list of `{role, content}` turns into a single text blob
     for token counting. `content` may be a string or a list of content
     parts (Anthropic-style blocks); we only count text. Other block kinds
@@ -303,12 +389,17 @@ def _concat_turn_text(turns: list[dict[str, Any]]) -> str:
     return "\n".join(parts)
 
 
-def _build_messages(
+def build_messages(
     prompt: str,
     provider: str,
     prior_turns: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Assemble the messages array for one panellist call.
+
+    Public so `synth.py` can share the exact same message-construction logic
+    (including the Anthropic `cache_control` breakpoint placement) without
+    importing a private symbol. Drift between fanout and synth on this
+    structure has been a recurring source of silent failures.
 
     `prior_turns`, when set, is a sequence of `{role, content}` turns
     prepended verbatim before the final user prompt — used by `refine`
@@ -374,7 +465,7 @@ def _make_slug(spec: ModelSpec, idx: int, blinded: bool) -> str:
     # Derive a stable, readable slug from the alias/id. Raw LiteLLM IDs may
     # contain characters the safe-id regex rejects (e.g. `:free` on
     # OpenRouter); sanitise so a valid model never crashes the path build.
-    base = _sanitise_derived_slug(spec.model.split("/")[-1].lower())
+    base = sanitise_derived_slug(spec.model.split("/")[-1].lower())
     return f"{base}-{idx}" if idx > 0 else base
 
 
@@ -396,7 +487,7 @@ def _make_slugs(specs: list[ModelSpec], blinded: bool) -> list[str]:
         if blinded or spec.slug:
             out.append(_make_slug(spec, i, blinded))
             continue
-        base = _sanitise_derived_slug(spec.model.split("/")[-1].lower())
+        base = sanitise_derived_slug(spec.model.split("/")[-1].lower())
         count = seen.get(base, 0)
         out.append(f"{base}-{count}" if count else base)
         seen[base] = count + 1
@@ -452,22 +543,102 @@ def _max_input_tokens(litellm_id: str, entry: dict[str, Any]) -> int | None:
     return None
 
 
+def _replace_attachments_with_stubs(
+    prompt: str,
+    paths: artifacts.RunPaths,
+    available_chars: int,
+) -> str:
+    """Drop oversized inlined attachment blocks largest-first, replacing
+    each with a short stub that references the persisted resource URI.
+
+    Stops as soon as the prompt fits `available_chars`. Returns the
+    prompt unchanged when there are no parseable attachment blocks or
+    when no single drop would help (a block smaller than its stub isn't
+    worth dropping). The caller still re-counts tokens after this —
+    char→token is approximate, so this is a fast pre-filter, not the
+    final budget check.
+
+    Why drop whole blocks instead of head+tail-slicing through them:
+    half a source file with `[TRIMMED 50000 chars from middle]` in the
+    middle is worse than useless for a code reviewer — they can't trust
+    any claim about the body. A clean "this file was too big, here's
+    where to read it" stub lets the panellist reason about what it
+    can't see rather than pretending the partial view is complete.
+    """
+    blocks = attachments_mod.extract_inlined_blocks(prompt)
+    if not blocks:
+        return prompt
+    used: set[str] = set()
+    named = [(b, attachments_mod.safe_attachment_name(b, used)) for b in blocks]
+
+    def _stub(block: attachments_mod.InlinedBlock, name: str) -> str:
+        uri = paths.attachment_resource_uri(name)
+        line_count = block.content.count("\n") + 1
+        return (
+            f"{block.header}\n"
+            f"[Attachment dropped to fit context: {line_count:,} lines, "
+            f"{len(block.content):,} chars. Full source at {uri}]"
+        )
+
+    # Largest-first drop priority. We commit each drop only if it
+    # actually shrinks the prompt — pathological case: a 60-char block
+    # whose stub is 200 chars is not worth dropping.
+    drop_priority = sorted(
+        range(len(named)),
+        key=lambda i: -(named[i][0].end - named[i][0].start),
+    )
+    dropped: set[int] = set()
+    current_chars = len(prompt)
+    for idx in drop_priority:
+        if current_chars <= available_chars:
+            break
+        block, name = named[idx]
+        block_len = block.end - block.start
+        stub_len = len(_stub(block, name))
+        if stub_len >= block_len:
+            continue  # would grow the prompt
+        dropped.add(idx)
+        current_chars -= (block_len - stub_len)
+
+    if not dropped:
+        return prompt
+
+    parts: list[str] = []
+    last_end = 0
+    for i, (block, name) in enumerate(named):
+        parts.append(prompt[last_end:block.start])
+        parts.append(_stub(block, name) if i in dropped else prompt[block.start:block.end])
+        last_end = block.end
+    parts.append(prompt[last_end:])
+    logger.info(
+        "attachment-aware trim: dropped %d/%d blocks (%d chars → ~%d chars)",
+        len(dropped), len(named), len(prompt), current_chars,
+    )
+    return "".join(parts)
+
+
 async def _fit_prompt_to_context(
     per_slug_prompt: str,
     *,
+    paths: artifacts.RunPaths | None = None,
     prior_turns: list[dict[str, Any]] | None,
     litellm_id: str,
     max_input_tokens: int,
     max_output_tokens: int,
-) -> str:
+) -> tuple[str, int]:
     """Trim `per_slug_prompt` so input+output fits the model's context.
 
-    Returns the prompt unchanged when already within budget. Otherwise
-    head+tail truncates the prompt via `context.trim_text` (preserves the
-    stance preface at the head and the CONFIDENCE/KEY_REASON footer at
-    the tail) and re-counts; if still over budget after one pass (rare —
-    usually means `prior_turns` alone exceed the budget), shrinks further
-    via a smaller char target.
+    Returns `(maybe_trimmed_prompt, dropped_chars)`. `dropped_chars == 0`
+    means no trim happened (prompt already fit, or budget made trimming
+    impossible). Callers use the explicit count to surface a quantified
+    trim note in the manifest — sniffing the prompt for a marker substring
+    false-positives on source-code attachments that contain the word.
+
+    Trim strategy: head+tail truncates the prompt via `context.trim_text`
+    (preserves the stance preface at the head and the CONFIDENCE/KEY_REASON
+    footer at the tail) and re-counts; if still over budget after one pass
+    (rare — usually means `prior_turns` alone exceed the budget), shrinks
+    further via a smaller char target.
 
     The `prior_turns` text is included in the token count but never
     trimmed — those are the prior consultation's role-separated exchange
@@ -477,14 +648,14 @@ async def _fit_prompt_to_context(
     """
     from . import context
 
-    prior_text = _concat_turn_text(prior_turns) if prior_turns else ""
+    prior_text = concat_turn_text(prior_turns) if prior_turns else ""
     target_input = max_input_tokens - max_output_tokens
     if target_input <= 0:
         # Defensive: the registry's `default_budget_tokens` shouldn't ever
         # be larger than the model's whole context, but if it is, return
         # the prompt as-is and let the provider reject — the caller's
         # config is the real bug.
-        return per_slug_prompt
+        return per_slug_prompt, 0
 
     async def _count(text: str) -> int:
         # token_counter is sync + CPU-bound; offload so we don't block the
@@ -498,7 +669,7 @@ async def _fit_prompt_to_context(
 
     prior_tokens = await _count(prior_text) if prior_text else 0
     if prior_tokens < 0:
-        return per_slug_prompt  # token_counter is broken; let provider decide
+        return per_slug_prompt, 0  # token_counter is broken; let provider decide
     available_for_prompt = target_input - prior_tokens
     if available_for_prompt <= 0:
         # prior_turns alone exceed the budget. We don't trim prior_turns
@@ -509,20 +680,39 @@ async def _fit_prompt_to_context(
             "budget (%d). Returning prompt untrimmed; provider will reject.",
             prior_tokens, target_input,
         )
-        return per_slug_prompt
+        return per_slug_prompt, 0
 
     prompt_tokens = await _count(per_slug_prompt)
     if prompt_tokens < 0:
-        return per_slug_prompt
+        return per_slug_prompt, 0
     if prompt_tokens <= available_for_prompt:
-        return per_slug_prompt  # already fits, no-op
+        return per_slug_prompt, 0  # already fits, no-op
 
-    # Trim. token_counter <-> char-count is approximate; aim for 90% of the
-    # available budget so a recount comes in under cleanly. The 500-char
-    # floor prevents pathological "shrink to nothing" outcomes on
-    # tiny-context models — below that the panellist has no signal at all
-    # and the trim would just produce a marker stub. Cap iterations at 3
-    # — usually one pass suffices.
+    original_len = len(per_slug_prompt)
+    # Attachment-aware shrink first (when we have a run dir to anchor
+    # resource URIs to). Drops whole attachment blocks largest-first,
+    # replaces each with a stub pointing at the persisted resource.
+    # Better signal than head+tail slicing through code files. The 4x
+    # char-per-token rule of thumb sets the char target — final budget
+    # check is the re-count below.
+    if paths is not None:
+        avail_chars = available_for_prompt * 4
+        shrunk = _replace_attachments_with_stubs(
+            per_slug_prompt, paths, avail_chars,
+        )
+        if shrunk is not per_slug_prompt:
+            per_slug_prompt = shrunk
+            prompt_tokens = await _count(per_slug_prompt)
+            if prompt_tokens < 0:
+                return per_slug_prompt, original_len - len(per_slug_prompt)
+            if prompt_tokens <= available_for_prompt:
+                return per_slug_prompt, original_len - len(per_slug_prompt)
+
+    # Still over budget — fall back to head+tail trim. token_counter
+    # <-> char-count is approximate; aim for 90% of the available
+    # budget so a recount comes in under cleanly. The 500-char floor
+    # prevents pathological "shrink to nothing" outcomes on tiny-context
+    # models. Cap iterations at 3 — usually one pass suffices.
     trimmed = per_slug_prompt
     for _attempt in range(3):
         ratio = (available_for_prompt * 0.9) / prompt_tokens
@@ -537,7 +727,8 @@ async def _fit_prompt_to_context(
         prompt_tokens = await _count(trimmed)
         if prompt_tokens < 0 or prompt_tokens <= available_for_prompt:
             break
-    return trimmed
+    dropped = max(0, original_len - len(trimmed))
+    return trimmed, dropped
 
 
 async def _stream_acompletion(
@@ -615,6 +806,7 @@ async def _call_one(
     stream: bool = False,
     on_partial: Callable[[int, int], Awaitable[None]] | None = None,
     prior_turns: list[dict[str, Any]] | None = None,
+    capsule_kind: str = "decision",
 ) -> ManifestEntry:
     # An unknown alias must fail this single panellist, not the whole panel.
     # `asyncio.gather` without return_exceptions=True would otherwise cancel
@@ -644,8 +836,16 @@ async def _call_one(
             confidence=None,
             capsule=None,
         )
-    litellm_id = entry["litellm_id"]
-    budget = entry.get("default_budget_tokens", 8000)
+    # CLI panellists don't have a LiteLLM ID — they invoke a subprocess.
+    # Use `litellm_id` when present, otherwise fall back to the spec's
+    # alias for logging/diagnostics so error messages stay attributable.
+    litellm_id = entry.get("litellm_id") or spec.model
+    # Output budget is sized by what we're asking for (the capsule_kind),
+    # not by which model is answering. A "review" needs ~8K tokens of
+    # body to enumerate findings regardless of whether haiku or opus is
+    # writing it; previously the per-model default_budget_tokens (4K on
+    # haiku) silently truncated reviews on small models.
+    budget = MAX_TOKENS_BY_KIND.get(capsule_kind, MAX_TOKENS_BY_KIND["decision"])
     timeout = entry.get("default_timeout_s", 180)
     provider = entry.get("provider", "")
 
@@ -695,81 +895,150 @@ async def _call_one(
     trim_note: str | None = None
     max_in = _max_input_tokens(litellm_id, entry)
     if max_in is not None:
-        per_slug_prompt = await _fit_prompt_to_context(
+        original_chars = len(per_slug_prompt)
+        per_slug_prompt, dropped_chars = await _fit_prompt_to_context(
             per_slug_prompt,
+            paths=paths,
             prior_turns=prior_turns,
             litellm_id=litellm_id,
             max_input_tokens=max_in,
             max_output_tokens=budget,
         )
-        # `_fit_prompt_to_context` annotates the prompt with a `[TRIMMED ...]`
-        # marker when it cut anything; surface a one-line note in the manifest
-        # so the caller can see at a glance that this panellist's input was
-        # narrower than the others'.
-        if "[TRIMMED" in per_slug_prompt:
-            trim_note = "input auto-trimmed to fit model context window"
+        # `_fit_prompt_to_context` reports dropped chars explicitly — we
+        # used to sniff for a `[TRIMMED` substring, which false-positived
+        # on source-code attachments that mention the word. Now the
+        # manifest note is both accurate (no false alarms when we didn't
+        # actually trim) and quantified (drops and budget surfaced).
+        if dropped_chars > 0:
+            pct = (dropped_chars / original_chars * 100) if original_chars else 0.0
+            trim_note = (
+                f"input auto-trimmed: dropped ~{dropped_chars:,} chars "
+                f"(~{pct:.0f}% of {original_chars:,}c source) to fit "
+                f"{max_in:,}-token context (reserved {budget:,} tok for output)"
+            )
 
-    try:
-        async with sem if sem is not None else nullcontext():
-            messages = _build_messages(per_slug_prompt, provider, prior_turns)
-            if stream:
-                resp = await _stream_acompletion(
-                    timeout=timeout,
-                    on_partial=on_partial,
-                    start=start,
-                    model=litellm_id,
-                    messages=messages,
-                    max_tokens=budget,
-                    **extra,
-                )
+    # OpenTelemetry span per panellist call. No-op when OTel isn't
+    # installed or the user hasn't set OTEL_EXPORTER_OTLP_ENDPOINT.
+    # Follows the gen_ai.* semantic conventions so consult shows up in
+    # off-the-shelf AI-observability dashboards without a custom mapping.
+    # Wraps the whole try/except so cost/tokens/finish_reason can be set
+    # after the response comes back, the exception handlers can record
+    # errors on the span, and the span is guaranteed to close.
+    otel_span_name = f"gen_ai.chat {litellm_id}"
+    otel_attrs = {
+        "gen_ai.system": provider or "unknown",
+        "gen_ai.request.model": litellm_id,
+        "gen_ai.operation.name": "chat",
+        "app.consult.slug": slug,
+        "app.consult.run_id": paths.run_id,
+    }
+    with telemetry.span(otel_span_name, attributes=otel_attrs) as tspan:
+        try:
+            async with sem if sem is not None else nullcontext():
+                messages = build_messages(per_slug_prompt, provider, prior_turns)
+                if provider == "cli":
+                    # CLI panellists bypass LiteLLM entirely: spawn the
+                    # configured executable, send the prompt on stdin,
+                    # capture stdout. Cost is zero (the CLI's own auth
+                    # covers usage); per-provider semaphore still applies
+                    # if the registry configures one for "cli".
+                    from . import cli_executor
+                    cli_command = entry.get("cli_command") or []
+                    if not cli_command:
+                        raise ValueError(
+                            f"CLI provider for {spec.model!r} has no "
+                            "cli_command in the registry entry"
+                        )
+                    resp = await cli_executor.call_cli(
+                        cli_command,
+                        per_slug_prompt,
+                        timeout=timeout,
+                        extra_env=entry.get("cli_env"),
+                    )
+                elif stream:
+                    resp = await _stream_acompletion(
+                        timeout=timeout,
+                        on_partial=on_partial,
+                        start=start,
+                        model=litellm_id,
+                        messages=messages,
+                        max_tokens=budget,
+                        **extra,
+                    )
+                else:
+                    resp = await _acompletion_with_retry(
+                        timeout=timeout,
+                        model=litellm_id,
+                        messages=messages,
+                        max_tokens=budget,
+                        **extra,
+                    )
+            # Persist raw response — use model_dump for Pydantic, fall
+            # back to dict
+            try:
+                raw = resp.model_dump()  # type: ignore[attr-defined]
+            except AttributeError:
+                raw = dict(resp) if hasattr(resp, "__iter__") else {"_repr": repr(resp)}
+            await _write_text_async(
+                paths.response_raw(slug), json.dumps(raw, indent=2, default=str)
+            )
+
+            status, finish, body = classify(resp)
+            usage = getattr(resp, "usage", None)
+            if usage:
+                tokens_in = getattr(usage, "prompt_tokens", None)
+                tokens_out = getattr(usage, "completion_tokens", None)
+            if provider == "cli":
+                # CLI panellists are free at the per-call level. Skip
+                # LiteLLM's cost lookup (it would error on the synthetic
+                # response object built by `cli_executor.call_cli`).
+                cost = 0.0
+                cost_known = True
             else:
-                resp = await _acompletion_with_retry(
-                    timeout=timeout,
-                    model=litellm_id,
-                    messages=messages,
-                    max_tokens=budget,
-                    **extra,
-                )
-        # Persist raw response — use model_dump for Pydantic, fall back to dict
-        try:
-            raw = resp.model_dump()  # type: ignore[attr-defined]
-        except AttributeError:
-            raw = dict(resp) if hasattr(resp, "__iter__") else {"_repr": repr(resp)}
-        await _write_text_async(
-            paths.response_raw(slug), json.dumps(raw, indent=2, default=str)
-        )
+                try:
+                    cost = litellm.completion_cost(completion_response=resp)
+                    cost_known = cost is not None
+                except Exception as ce:  # noqa: BLE001
+                    logger.warning("cost lookup failed for %s: %s", litellm_id, ce)
+                    cost = None
+                    cost_known = False
+            # Populate the OTel span with per-call telemetry (tokens /
+            # cost / finish_reason). No-op when the span is None.
+            if tokens_in is not None:
+                telemetry.set_attribute(tspan, "gen_ai.usage.input_tokens", tokens_in)
+            if tokens_out is not None:
+                telemetry.set_attribute(tspan, "gen_ai.usage.output_tokens", tokens_out)
+            if cost is not None:
+                telemetry.set_attribute(tspan, "app.consult.cost_usd", cost)
+            telemetry.set_attribute(tspan, "app.consult.cost_known", cost_known)
+            if finish:
+                telemetry.set_attribute(tspan, "gen_ai.response.finish_reasons", [finish])
+            telemetry.set_attribute(tspan, "app.consult.status", status.value)
 
-        status, finish, body = classify(resp)
-        usage = getattr(resp, "usage", None)
-        if usage:
-            tokens_in = getattr(usage, "prompt_tokens", None)
-            tokens_out = getattr(usage, "completion_tokens", None)
-        try:
-            cost = litellm.completion_cost(completion_response=resp)
-            cost_known = cost is not None
-        except Exception as ce:  # noqa: BLE001
-            logger.warning("cost lookup failed for %s: %s", litellm_id, ce)
+        except TimeoutError as te:
+            status, finish, body = Status.TIMEOUT, None, ""
+            error = f"timeout after {timeout}s"
+            # Conservative: a TimeoutError from `asyncio.wait_for` means
+            # we gave up waiting, NOT that the HTTP request never landed.
+            # The provider may have processed and billed us;
+            # cost_known=False surfaces that uncertainty in the ledger
+            # as a lower bound rather than silently understating spend.
+            # Mirrors slow-tail dropout.
             cost = None
             cost_known = False
-
-    except TimeoutError:
-        status, finish, body = Status.TIMEOUT, None, ""
-        error = f"timeout after {timeout}s"
-        # Conservative: a TimeoutError from `asyncio.wait_for` means we
-        # gave up waiting, NOT that the HTTP request never landed. The
-        # provider may have processed and billed us; cost_known=False
-        # surfaces that uncertainty in the ledger as a lower bound rather
-        # than silently understating spend. Mirrors slow-tail dropout.
-        cost = None
-        cost_known = False
-    except Exception as e:  # noqa: BLE001 — LiteLLM raises many concrete types
-        status, finish, body = classify(None, exception=e)
-        error = str(e)[:4096] or f"{type(e).__name__}"
-        # Same logic: most provider exceptions imply no billable call, but
-        # we can't be sure for every case (e.g. 502 mid-stream may have
-        # billed). cost_known=False is the conservative encoding.
-        cost = None
-        cost_known = False
+            telemetry.record_exception(tspan, te)
+            telemetry.set_attribute(tspan, "app.consult.status", status.value)
+        except Exception as e:  # noqa: BLE001 — LiteLLM raises many concrete types
+            status, finish, body = classify(None, exception=e)
+            error = _format_error_message(e)
+            # Same logic: most provider exceptions imply no billable
+            # call, but we can't be sure for every case (e.g. 502
+            # mid-stream may have billed). cost_known=False is the
+            # conservative encoding.
+            cost = None
+            cost_known = False
+            telemetry.record_exception(tspan, e)
+            telemetry.set_attribute(tspan, "app.consult.status", status.value)
 
     await _write_text_async(paths.response_text(slug), body)
     latency_ms = int((time.time() - start) * 1000)
@@ -785,7 +1054,7 @@ async def _call_one(
     # makes programmatic consumers easy; (done, total) here are placeholders
     # since `_call_one` doesn't know the panel size — the wrapper in `fanout`
     # constructs the real progress event for the callback path.
-    _append_progress_log(
+    append_progress_log(
         paths.root,
         PanellistCompleted(
             done=0,
@@ -805,13 +1074,10 @@ async def _call_one(
     if status in (Status.ERROR, Status.TIMEOUT) and not error:
         error = f"{status.value}: no provider exception captured"
 
-    # Surface the pre-flight trim note on the OK path too. `error` is
-    # primarily for failure reasons but doubles as a soft annotation
-    # channel here so the caller can spot when this panellist saw less
-    # input than the others (their capsule may be thinner as a result).
-    if trim_note and not error:
-        error = trim_note
-
+    # Trim note goes to `note` (info annotation on a successful call),
+    # NOT `error` (failure reason). Conflating them made the viewer render
+    # the trim message in red error styling on a green-OK card, which read
+    # like a contradiction.
     return ManifestEntry(
         slug=slug,
         model_id=litellm_id,
@@ -826,12 +1092,18 @@ async def _call_one(
         cost_usd=cost,
         cost_known=cost_known,
         error=error,
+        note=trim_note,
         confidence=None,  # populated by capsule extractor
         capsule=None,
     )
 
 
-async def aestimate_cost(specs: list[ModelSpec], prompt: str) -> tuple[float, bool]:
+async def aestimate_cost(
+    specs: list[ModelSpec],
+    prompt: str,
+    *,
+    capsule_kind: str = "decision",
+) -> tuple[float, bool]:
     """Async wrapper around `estimate_cost`.
 
     `litellm.token_counter` is blocking and on a cache miss takes 50-200ms
@@ -841,10 +1113,15 @@ async def aestimate_cost(specs: list[ModelSpec], prompt: str) -> tuple[float, bo
     `estimate_cost` symbol — this wrapper picks up whatever's currently
     bound there, so test setup is unchanged.
     """
-    return await asyncio.to_thread(estimate_cost, specs, prompt)
+    return await asyncio.to_thread(estimate_cost, specs, prompt, capsule_kind=capsule_kind)
 
 
-def estimate_cost(specs: list[ModelSpec], prompt: str) -> tuple[float, bool]:
+def estimate_cost(
+    specs: list[ModelSpec],
+    prompt: str,
+    *,
+    capsule_kind: str = "decision",
+) -> tuple[float, bool]:
     """Returns (total_estimate, all_known).
 
     Uses LiteLLM's per-token price tables via `cost_per_token()`. Models that
@@ -868,10 +1145,18 @@ def estimate_cost(specs: list[ModelSpec], prompt: str) -> tuple[float, bool]:
         except KeyError:
             all_known = False
             continue
+        # CLI panellists have no per-call dollar cost: the user's CLI
+        # auth covers usage. Estimating them as $0 is honest (not
+        # cost-unknown — that would inappropriately make the cap-check
+        # conservative for what is genuinely free at this layer).
+        if entry.get("provider") == "cli":
+            continue
         litellm_id = entry["litellm_id"]
         try:
             tin = litellm.token_counter(model=litellm_id, text=prompt)
-            tout = entry.get("default_budget_tokens", 8000)
+            # Match _call_one: estimate output by capsule_kind, not per-model
+            # default. Keeps the cap-check honest after the dimension flip.
+            tout = MAX_TOKENS_BY_KIND.get(capsule_kind, MAX_TOKENS_BY_KIND["decision"])
             in_per_tok, out_per_tok = litellm.cost_per_token(
                 model=litellm_id, prompt_tokens=tin, completion_tokens=tout
             )
@@ -898,6 +1183,8 @@ async def fanout(
     stream: bool = False,
     capsule_kind: str = "decision",
     prior_turns: list[dict[str, Any]] | None = None,
+    prior_turns_by_slug: dict[str, list[dict[str, Any]]] | None = None,
+    max_concurrency: int | None = None,
 ) -> RunHandle:
     """Parallel fan-out. Creates a fresh run by default. Pass `existing_paths`
     to write into an existing run dir (used by `refine` to keep all rounds
@@ -908,6 +1195,23 @@ async def fanout(
     `refine` with a `continuation_id` to expose the prior consultation as
     a proper user/assistant exchange. The text is included in cost
     estimation so the cap check stays accurate.
+
+    `prior_turns_by_slug`, when set, is a per-slug override of `prior_turns`.
+    A slug present in the dict uses its dict value; a slug absent falls
+    back to `prior_turns`. Used by `refine` round-2+ to give each
+    panellist its OWN conversation history (its prior question +
+    answer) — round-1 question + answer become a stable prefix that
+    Anthropic's prompt cache can reuse across rounds, instead of the
+    monolithic refinement prompt that changes every round.
+
+    `max_concurrency` (or `CONSULT_MAX_CONCURRENCY` env var) caps the
+    *total* number of panellists in flight at once. The existing
+    per-provider semaphores in `_get_provider_sems()` cap concurrency
+    *per provider*; on the deep tier (~14 models across ~6 providers)
+    they don't bound the aggregate, so all 14 calls launch simultaneously
+    and 14 inbound HTTP connections + 14 token-counter cache misses fire
+    at once. A global cap (default uncapped, recommended ~5-8 for wide
+    panels) smooths this without changing per-provider behaviour.
 
     If `on_progress` is set, it's called once per panellist as it completes
     with `(done, total, message)`. Failures inside the callback are logged
@@ -947,6 +1251,16 @@ async def fanout(
             paths,
             context.build(prompt, blinded=blinded, capsule_kind=capsule_kind),
         )
+        # Split inlined attachments out to `paths.attachments/<name>` so
+        # (a) the per-panellist trim stub can reference a resolvable
+        # resource URI and (b) the report and any tool-using downstream
+        # model can still read the original source. Best-effort: a parse
+        # failure leaves the panellist call unaffected — they still see
+        # the inlined blocks in the prompt.
+        try:
+            attachments_mod.persist_inlined_attachments(paths, prompt)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("persist_inlined_attachments failed: %s", e)
     else:
         paths = existing_paths
 
@@ -955,8 +1269,8 @@ async def fanout(
     # text in the token count so the cap check sees the real input size.
     cost_input = prompt
     if prior_turns:
-        cost_input = _concat_turn_text(prior_turns) + "\n" + prompt
-    estimate, all_known = await aestimate_cost(specs, cost_input)
+        cost_input = concat_turn_text(prior_turns) + "\n" + prompt
+    estimate, all_known = await aestimate_cost(specs, cost_input, capsule_kind=capsule_kind)
     cap = max_run_usd if max_run_usd is not None else registry.default_max_run_usd()
     # Don't clobber an existing manifest with the empty-manifest early-return
     # payload. Refine drives multiple rounds through the same `paths`; an
@@ -1029,6 +1343,25 @@ async def fanout(
     # in the same event loop). See `_get_provider_sems` for the rationale.
     provider_sems = _get_provider_sems()
 
+    # Total in-flight cap across the whole fanout. None = uncapped (rely on
+    # per-provider sems alone). Resolved at call time so a test that sets
+    # the env var per case works.
+    if max_concurrency is None:
+        env_cap = os.environ.get("CONSULT_MAX_CONCURRENCY", "").strip()
+        if env_cap:
+            try:
+                parsed = int(env_cap)
+                if parsed >= 1:
+                    max_concurrency = parsed
+            except ValueError:
+                logger.warning(
+                    "CONSULT_MAX_CONCURRENCY=%r is not a positive int; ignoring",
+                    env_cap,
+                )
+    fanout_sem: asyncio.Semaphore | None = (
+        asyncio.Semaphore(max_concurrency) if max_concurrency else None
+    )
+
     start = time.time()
     total = len(specs)
     done = 0
@@ -1055,7 +1388,7 @@ async def fanout(
     # parent sees fanout starting rather than receiving silence until the
     # first panellist completes.
     phase_event = PhaseStarted(done=0, total=total, phase="fanout")
-    _append_progress_log(paths.root, phase_event)
+    append_progress_log(paths.root, phase_event)
     await _safe_notify(phase_event)
 
     # Heartbeat task: periodic liveness pulse. Set CONSULT_HEARTBEAT_INTERVAL_S=0
@@ -1079,49 +1412,63 @@ async def fanout(
                     pending_count=len(pending),
                     pending_slugs=pending,
                 )
-                _append_progress_log(paths.root, event)
+                append_progress_log(paths.root, event)
                 await _safe_notify(event)
         heartbeat_task = asyncio.create_task(_heartbeat_loop())
 
     async def _run_one(spec: ModelSpec, slug: str, per_prompt: str) -> ManifestEntry:
         nonlocal done, started
-        # PanellistStarted: fires BEFORE the LiteLLM call so the parent
-        # sees which slugs are in flight, not just which have completed.
-        started += 1
-        started_event = PanellistStarted(
-            done=done, total=total, slug=slug, started_count=started,
-        )
-        _append_progress_log(paths.root, started_event)
-        await _safe_notify(started_event)
+        # Acquire the global fanout slot BEFORE emitting PanellistStarted so
+        # the started_count reflects "doing real work", not "queued". The
+        # per-provider semaphores inside `_call_one` are still acquired below
+        # — this gate is additive, never replacing them. `nullcontext()` is
+        # async-compatible (Python 3.10+), same shape as Semaphore.
+        async with fanout_sem if fanout_sem is not None else nullcontext():
+            # PanellistStarted: fires BEFORE the LiteLLM call so the parent
+            # sees which slugs are in flight, not just which have completed.
+            started += 1
+            started_event = PanellistStarted(
+                done=done, total=total, slug=slug, started_count=started,
+            )
+            append_progress_log(paths.root, started_event)
+            await _safe_notify(started_event)
 
-        # When streaming is enabled, wire each panellist's mid-stream chunk
-        # callback to emit `PanellistPartial` events. Throttled to
-        # ~1 chunk/sec by `_STREAM_PARTIAL_INTERVAL_S` so the progress
-        # channel doesn't drown in micro-updates.
-        on_partial: Callable[[int, int], Awaitable[None]] | None = None
-        if stream and on_progress is not None:
-            async def _emit_partial(chars: int, elapsed_ms: int) -> None:
-                await _safe_notify(PanellistPartial(
-                    done=done, total=total, slug=slug,
-                    chars_so_far=chars, elapsed_ms=elapsed_ms,
-                ))
-            on_partial = _emit_partial
-        entry = await _call_one(
-            spec, slug, per_prompt, paths, provider_sems,
-            stream=stream, on_partial=on_partial,
-            prior_turns=prior_turns,
-        )
-        done += 1
-        completed_entries.append(entry)
-        pending_slugs_set.discard(slug)
-        await _safe_notify(PanellistCompleted(
-            done=done,
-            total=total,
-            slug=slug,
-            status=entry.status.value,
-            latency_ms=entry.latency_ms,
-        ))
-        return entry
+            # When streaming is enabled, wire each panellist's mid-stream chunk
+            # callback to emit `PanellistPartial` events. Throttled to
+            # ~1 chunk/sec by `_STREAM_PARTIAL_INTERVAL_S` so the progress
+            # channel doesn't drown in micro-updates.
+            on_partial: Callable[[int, int], Awaitable[None]] | None = None
+            if stream and on_progress is not None:
+                async def _emit_partial(chars: int, elapsed_ms: int) -> None:
+                    await _safe_notify(PanellistPartial(
+                        done=done, total=total, slug=slug,
+                        chars_so_far=chars, elapsed_ms=elapsed_ms,
+                    ))
+                on_partial = _emit_partial
+            # Per-slug history takes precedence when set (refine round-2+
+            # passes each panellist its own conversation). Falls back to
+            # the global `prior_turns` (set by `_apply_continuation` for
+            # cross-run continuations) when the slug isn't in the dict.
+            pt = prior_turns_by_slug.get(slug) if prior_turns_by_slug else None
+            if pt is None:
+                pt = prior_turns
+            entry = await _call_one(
+                spec, slug, per_prompt, paths, provider_sems,
+                stream=stream, on_partial=on_partial,
+                prior_turns=pt,
+                capsule_kind=capsule_kind,
+            )
+            done += 1
+            completed_entries.append(entry)
+            pending_slugs_set.discard(slug)
+            await _safe_notify(PanellistCompleted(
+                done=done,
+                total=total,
+                slug=slug,
+                status=entry.status.value,
+                latency_ms=entry.latency_ms,
+            ))
+            return entry
 
     # Slow-tail dropout: once most of the panel has returned, cancel the
     # slowest stragglers rather than waiting for the per-spec timeout. FRICTION
@@ -1220,7 +1567,7 @@ async def fanout(
                     done=done, total=total, slug=slug,
                     status=Status.TIMEOUT.value, latency_ms=latency_ms,
                 ))
-                _append_progress_log(paths.root, PanellistCompleted(
+                append_progress_log(paths.root, PanellistCompleted(
                     done=0, total=0, slug=slug,
                     status=Status.TIMEOUT.value, latency_ms=latency_ms,
                 ))
@@ -1239,10 +1586,13 @@ async def fanout(
 
     wall_ms = int((time.time() - start) * 1000)
 
-    # If blinded, scrub model_id from the manifest (kept in registry_snapshot for audit)
-    if blinded:
-        for m in manifest:
-            m.model_id = None
+    # `blinded=True` controls what panellists see of each other DURING the
+    # run (the brand-scrub in `context.build` and the greek-letter slugs in
+    # `_make_slug`), and the synth's `anonymised` switch hides model_id
+    # from the synthesiser prompt. The manifest itself keeps real
+    # model_ids so the final report (viewer, ledger) can surface them to
+    # the human reader. Earlier code scrubbed manifest model_ids here,
+    # which leaked the blinding past its useful boundary.
 
     cost_total = sum((m.cost_usd or 0.0) for m in manifest)
     all_known = all(m.cost_known for m in manifest)

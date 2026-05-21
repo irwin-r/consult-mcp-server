@@ -21,16 +21,15 @@ import logging
 import os
 import re
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import Field
 
 from . import artifacts, registry
+from .types import StrictModel
 
 logger = logging.getLogger(__name__)
 
 _CONTEXT_SCHEMA_VERSION = 2
 _CONTEXT_FILENAME = "context.json"
-
-_STRICT = ConfigDict(extra="forbid")
 
 # Words that are alpha-only, ≥3 chars, but too common to scrub safely.
 # (Adding "the" would mangle ordinary English. Adding nothing here means
@@ -135,7 +134,7 @@ def scrub_brands(text: str) -> str:
     return out
 
 
-class ContextBundle(BaseModel):
+class ContextBundle(StrictModel):
     """Immutable per-run context written once at run-init.
 
     Downstream stages (synth, capsule, arbiter) load this rather than
@@ -147,8 +146,6 @@ class ContextBundle(BaseModel):
     can inherit the prior run's shape without the caller having to
     specify it again.
     """
-
-    model_config = _STRICT
 
     # schema_version=2 added `capsule_kind`. v1 bundles are still loaded
     # (the field has a default), and the validator below upgrades them.

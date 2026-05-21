@@ -15,13 +15,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
 import re
 import time
 from typing import Any
 
 import litellm
 
-from . import artifacts, capsule, context, provider_caps, registry, runner, synth
+from . import artifacts, capsule, context, provider_caps, registry, runner, strategies, synth
 from . import progress as progress_mod
 from .jsonparse import extract_json
 from .types import (
@@ -37,6 +38,18 @@ from .types import (
 
 logger = logging.getLogger(__name__)
 
+# v2 arbiter prompt: per-dimension 1-5 Likert with explicit anchors per
+# level (Prometheus-style). The five dimensions decompose "sufficiency"
+# into orthogonal axes so the next-round prompt can target the *weakest*
+# axis rather than rephrasing a single global score. The shipped overall
+# `score` is derived (averaged from the five dimensions normalised to
+# [0,1]); the arbiter does not emit it directly to avoid the model
+# double-counting its own per-dimension scoring.
+#
+# Capsules are presented in shuffled order each round — position-bias
+# mitigation from the MT-Bench / "When Identity Skews Debate" literature.
+# The shuffle happens at the formatter call site; the prompt text just
+# reminds the arbiter not to infer importance from order.
 _ARBITER_PROMPT = """\
 You are evaluating whether a multi-model panel has reached sufficient \
 agreement to ship a final answer. You are scoring **sufficiency for action**, \
@@ -46,32 +59,60 @@ Original question:
 {question}
 
 Panel health: {usable_count} of {total_count} panellists returned usable \
-responses ({health_breakdown}). Down-weight your sufficiency score if a \
-significant fraction of the panel failed — consensus from half a panel is \
-weaker evidence than consensus from a full panel.
+responses ({health_breakdown}). Down-weight your scoring if a significant \
+fraction of the panel failed — consensus from half a panel is weaker evidence \
+than consensus from a full panel.
 
-Round {round_num} panel capsules:
+Round {round_num} panel capsules (presented in randomised order — do NOT \
+infer importance or model identity from position):
 {capsules}
 
 How positions changed since the prior round:
 {position_diff}
 
+Score the panel on FIVE dimensions, each on the same 1-5 Likert scale:
+
+  1 = critical gap   — panellists missed the question, contradict each other, or no usable signal
+  2 = weak           — substantial disagreement or hand-wavy assertions; not ready to act on
+  3 = mixed          — useful signal but real gaps; another round would likely help
+  4 = strong         — good consensus, or principled disagreement well-explained; minor gaps
+  5 = ship-ready     — panellists agree on the load-bearing point and the action is clear
+
+The five dimensions:
+- coverage      — did the panel address all aspects of the question?
+- agreement     — how aligned are the panellists' recommendations? (productive disagreement is not the same as contradiction)
+- depth         — is the reasoning substantiated rather than asserted?
+- calibration   — do panellists' stated confidence levels match how well-backed their claims are?
+- actionability — is the panel converging on a concrete recommendation a caller can act on?
+
+For each dimension, also give a one-sentence note explaining the score — \
+focused and localised (point at a specific panellist or claim), not generic.
+
 Return EXACTLY this JSON object (no commentary, no markdown fences):
 
 {{
-  "score": 0.0,
-  "gaps": ["..."],
-  "next_round_focus": "...",
-  "reasoning": "..."
+  "dimensions": {{
+    "coverage": <int 1-5>,
+    "agreement": <int 1-5>,
+    "depth": <int 1-5>,
+    "calibration": <int 1-5>,
+    "actionability": <int 1-5>
+  }},
+  "dimension_notes": {{
+    "coverage": "<one sentence — why this score>",
+    "agreement": "<one sentence>",
+    "depth": "<one sentence>",
+    "calibration": "<one sentence>",
+    "actionability": "<one sentence>"
+  }},
+  "gaps": ["<one specific item the panel hasn't resolved>", "..."],
+  "next_round_focus": "<one sentence telling the next round what to address>",
+  "reasoning": "<1-3 sentences summarising the verdict>"
 }}
 
-Where:
-- score: 0.0-1.0. 1.0 = strong consensus, ready to ship the final answer.
-                  0.5 = useful signal but material disagreement or missing detail.
-                  0.0 = panellists contradict each other or miss the question.
-- gaps: 1-4 specific items the panel hasn't resolved
-- next_round_focus: one sentence telling the next round what to address
-- reasoning: 1-3 sentences explaining the score
+Notes:
+- gaps: 1-4 specific items. dimensions tell us *how* the panel is short; gaps enumerate *what* exactly.
+- The engine derives the overall sufficiency score from your dimensions (normalised average). Do NOT output an overall score yourself.
 """
 
 _REFINEMENT_PROMPT_TEMPLATE = """\
@@ -84,13 +125,17 @@ Original question:
 Positions from the prior round:
 {positions}
 
+Per-dimension critique from the arbiter (focus on the weakest axes):
+{dim_critique}
+
 Gaps the arbiter flagged that the next round should address:
 {gaps}
 
 Specifically focus on: {focus}
 
-Now give your refined answer to the original question, addressing the gaps. \
-Be concrete; don't simply restate the prior position."""
+Now give your refined answer to the original question, addressing the \
+weakest dimensions and the gaps. Be concrete; don't simply restate the \
+prior position."""
 
 def _capsule_summary(cap: Capsule | ReviewCapsule | ResearchCapsule) -> str:
     """One-line summary of any capsule kind. Used in arbiter prompts where
@@ -148,9 +193,25 @@ def _capsule_detail(cap: Capsule | ReviewCapsule | ResearchCapsule) -> str:
     )
 
 
+def _shuffled(manifest: list[ManifestEntry]) -> list[ManifestEntry]:
+    """Return a shuffled copy of `manifest`.
+
+    Position-bias mitigation: judges (the arbiter, and panellists reading
+    prior-round positions for refinement) systematically over-weight items
+    they see first. MT-Bench measured 75% first-position bias in Claude-v1
+    judging; the "When Identity Skews Debate" paper showed similar effects
+    in multi-agent settings. Shuffling per-call (not per-run) is enough —
+    we just need the order the judge sees to be uncorrelated with anything
+    the judge could use as a heuristic shortcut.
+    """
+    out = list(manifest)
+    random.shuffle(out)
+    return out
+
+
 def _format_capsules(manifest: list[ManifestEntry]) -> str:
     lines = []
-    for m in manifest:
+    for m in _shuffled(manifest):
         if m.status not in (Status.OK, Status.TRUNCATED):
             lines.append(f"- {m.slug} [status={m.status.value}, no usable response]")
             continue
@@ -167,7 +228,7 @@ def _format_capsules(manifest: list[ManifestEntry]) -> str:
 
 def _format_positions(manifest: list[ManifestEntry]) -> str:
     lines = []
-    for m in manifest:
+    for m in _shuffled(manifest):
         if not m.capsule or m.status not in (Status.OK, Status.TRUNCATED):
             continue
         lines.append(f"- {m.slug}: {_capsule_summary(m.capsule)}")
@@ -234,6 +295,27 @@ def _format_position_diff(
     return "\n".join(lines) or "(no comparable positions)"
 
 
+def _format_dim_critique(verdict: ArbiterVerdict) -> str:
+    """Render the three weakest dimensions with their localised notes.
+
+    The next-round prompt focuses panellists on the axes the arbiter scored
+    lowest — sharper guidance than the generic `gaps` list because each
+    note points at a specific panellist or claim. Falls back to a
+    placeholder for legacy verdicts that have no `dimensions`.
+    """
+    if not verdict.dimensions:
+        return "(no per-dimension critique — legacy arbiter prompt)"
+    weakest = sorted(verdict.dimensions.items(), key=lambda kv: kv[1])
+    lines: list[str] = []
+    for dim, dim_score in weakest[:3]:
+        note = verdict.dimension_notes.get(dim, "").strip()
+        if note:
+            lines.append(f"- {dim} (scored {dim_score:.2f}): {note}")
+        else:
+            lines.append(f"- {dim} (scored {dim_score:.2f})")
+    return "\n".join(lines) or "(no critique recorded)"
+
+
 def _build_refinement_prompt(
     question: str, round_num: int, prior_manifest: list[ManifestEntry], verdict: ArbiterVerdict
 ) -> str:
@@ -241,6 +323,7 @@ def _build_refinement_prompt(
         round_num=round_num,
         question=question,
         positions=_format_positions(prior_manifest),
+        dim_critique=_format_dim_critique(verdict),
         gaps="\n".join(f"- {g}" for g in verdict.gaps) if verdict.gaps else "(none flagged)",
         focus=verdict.next_round_focus or "any remaining ambiguity",
     )
@@ -330,27 +413,62 @@ async def _ask_arbiter(
             error="json_parse_failed",
         )
 
-    # 4) Score coercion — strings like "high" must not silently float-fail
-    try:
-        score = float(data.get("score", 0.0))
-        if not 0.0 <= score <= 1.0:
-            raise ValueError(f"out of range: {score}")
-    except (TypeError, ValueError) as e:
-        logger.warning("arbiter score not parseable: %s", e)
-        return ArbiterVerdict(
-            round=round_num,
-            score=0.0,
-            gaps=[],
-            reasoning="arbiter score field malformed",
-            cost_usd=cost,
-            cost_known=cost_known,
-            parsed_ok=False,
-            error=f"bad_score: {e!s:.100}",
-        )
+    # 4) Score derivation. v2 prompt: arbiter emits per-dimension 1-5
+    # scores; engine clamps to [1,5], normalises each to [0,1], averages.
+    # v1 fallback: legacy arbiters or off-rubric responses may emit a bare
+    # `score` field — accept it for backwards compatibility, but mark the
+    # verdict so the viewer can show "legacy" vs "per-dim". A response that
+    # has neither dimensions nor a parseable score is a parse failure.
+    dimensions_normalised: dict[str, float] = {}
+    dimensions_raw = data.get("dimensions")
+    if isinstance(dimensions_raw, dict):
+        for k, v in dimensions_raw.items():
+            try:
+                n = float(v)
+            except (TypeError, ValueError):
+                # Skip non-numeric entries — a single bad value shouldn't
+                # nuke the whole verdict. If ALL are non-numeric the empty
+                # `dimensions_normalised` triggers the v1 fallback below.
+                continue
+            n = max(1.0, min(5.0, n))
+            dimensions_normalised[str(k)] = (n - 1.0) / 4.0
+
+    dimension_notes_raw = data.get("dimension_notes")
+    dimension_notes: dict[str, str] = {}
+    if isinstance(dimension_notes_raw, dict):
+        dimension_notes = {
+            str(k): str(v) for k, v in dimension_notes_raw.items() if v
+        }
+
+    if dimensions_normalised:
+        score = sum(dimensions_normalised.values()) / len(dimensions_normalised)
+    else:
+        # v1 fallback: legacy `score` 0..1
+        try:
+            score = float(data.get("score", 0.0))
+            if not 0.0 <= score <= 1.0:
+                raise ValueError(f"out of range: {score}")
+        except (TypeError, ValueError) as e:
+            logger.warning(
+                "arbiter emitted neither dimensions nor a parseable score: %s",
+                e,
+            )
+            return ArbiterVerdict(
+                round=round_num,
+                score=0.0,
+                gaps=[],
+                reasoning="arbiter returned no parseable dimensions or score",
+                cost_usd=cost,
+                cost_known=cost_known,
+                parsed_ok=False,
+                error=f"no_dimensions_or_score: {e!s:.100}",
+            )
 
     return ArbiterVerdict(
         round=round_num,
         score=score,
+        dimensions=dimensions_normalised,
+        dimension_notes=dimension_notes,
         gaps=list(data.get("gaps") or []),
         next_round_focus=str(data.get("next_round_focus") or ""),
         reasoning=str(data.get("reasoning") or ""),
@@ -370,7 +488,7 @@ def _suffix_specs(specs: list[ModelSpec], round_num: int) -> list[ModelSpec]:
         # `openrouter/meta-llama/llama-3.1-8b:free` would otherwise carry
         # the `:` straight into the slug and trip ModelSpec's safe-id
         # field validator. User-supplied slugs are already constrained.
-        base = s.slug or runner._sanitise_derived_slug(s.model.split("/")[-1].lower())
+        base = s.slug or runner.sanitise_derived_slug(s.model.split("/")[-1].lower())
         out.append(
             ModelSpec(model=s.model, stance=s.stance, slug=f"{base}-{i}.r{round_num}")
         )
@@ -476,12 +594,16 @@ async def refine(
     continuation_id: str | None = None,
     rubric: str | None = None,
     capsule_kind: str | None = None,
+    strategy: str = "default",
     on_progress: runner.ProgressCallback | None = None,
 ) -> RefineResult:
     if max_rounds < 1 or max_rounds > 5:
         raise ValueError("max_rounds must be between 1 and 5")
     if not 0.0 <= threshold <= 1.0:
         raise ValueError("threshold must be in [0.0, 1.0]")
+    # Resolve the strategy now so a typo on the caller's `strategy="…"`
+    # surfaces as ValueError before the panel spends any money.
+    strategy_inst = strategies.strategy_for(strategy)
 
     # Resolve capsule_kind precedence: explicit caller value > inherited
     # from prior run's ContextBundle (when continuation_id is set) >
@@ -550,7 +672,9 @@ async def refine(
     # the whole refine call so the client never sees `done` go backwards.
     panel_n = len(specs)
     progress_total = max_rounds * (panel_n * 2 + 1) + 1  # rounds × (fanout+capsule+arbiter) + synth
-    progress_done = 0
+    # Mutable cell so `progress_mod.make_phase_cb` can update it; we read
+    # `progress_done[0]` for the direct emits between phases (arbiter, synth).
+    progress_done = [0]
 
     async def emit(event: progress_mod.ProgressEvent) -> None:
         if on_progress is not None:
@@ -558,25 +682,6 @@ async def refine(
                 await on_progress(event)
             except Exception as e:  # noqa: BLE001
                 logger.debug("refine on_progress failed: %s", e)
-
-    def make_phase_cb(base: int) -> runner.ProgressCallback | None:
-        """Shift child events into the refine-wide monotonic bucket.
-
-        Tracks `progress_done` so subsequent direct `emit()` calls (e.g.
-        ArbiterScored at the end of a round) start from the right offset.
-        The actual shift is delegated to `progress_mod.shift_bucket`.
-        """
-        if on_progress is None:
-            return None
-        inner = progress_mod.shift_bucket(emit, base, progress_total)
-
-        async def cb(event: progress_mod.ProgressEvent) -> None:
-            nonlocal progress_done
-            progress_done = base + event.done
-            assert inner is not None  # shift_bucket only returns None when parent is None
-            await inner(event)
-
-        return cb
 
     # Pre-resolve the arbiter spec so its cost estimate can roll into the
     # per-round budget check below. The arbiter call is sequential after
@@ -589,7 +694,45 @@ async def refine(
     # continuation, `followup_only` equals `prompt` so this is a no-op.
     round_prompt = followup_only if prior_turns else prompt
     prior_manifest: list[ManifestEntry] | None = None
+
+    # Per-panellist conversation history across rounds. Keyed by *base*
+    # slug (the part before `.r<n>`) so a panellist's slug-suffixed
+    # round-N spec maps to its base's accumulated history. Round 1's
+    # answer becomes round 2's assistant turn; round 2's refinement
+    # prompt + answer become rounds 3+'s context. The first-turn prefix
+    # stays byte-identical across rounds, which is what Anthropic's
+    # prompt cache keys on — round-2 and round-3 calls reuse the cached
+    # round-1 prefix for a ~50% input-token discount + faster TTFT.
+    #
+    # Seeded with the continuation `prior_turns` (if any) so a refine
+    # follow-up's panellists still see the prior consultation as their
+    # first turns. Reads of this dict in round-1 fall through to the
+    # global `prior_turns` (since the dict is empty); round-2+ uses the
+    # accumulated per-slug history exclusively.
+    panel_conversations: dict[str, list[dict[str, Any]]] = {}
+
+    def _base_for_slug(slug: str) -> str:
+        return _base_slug(slug)
+
+    if prior_turns:
+        for s in _suffix_specs(specs, 1):
+            panel_conversations[_base_for_slug(s.slug)] = list(prior_turns)
+
     for round_num in range(1, max_rounds + 1):
+        # Strategy decides which panellists run this round. The default
+        # strategy passes `specs` through unchanged; `elimination` drops
+        # the most-divergent panellist from round 2 onwards.
+        round_base_specs = strategy_inst.before_round(
+            round_num=round_num,
+            base_specs=specs,
+            prior_manifest=prior_manifest,
+        )
+        if not round_base_specs:
+            partial_reason = (
+                f"strategy {strategy!r} returned an empty panel for round "
+                f"{round_num}; aborting to avoid a zero-panel fanout"
+            )
+            break
         # Estimate next-round cost (fanout + arbiter); refuse if it'd blow
         # the cap. The arbiter's prompt isn't known until after fanout, but
         # token_counter on the round prompt is a reasonable proxy — the
@@ -604,10 +747,16 @@ async def refine(
         fanout_cost_input = round_prompt
         if prior_turns:
             fanout_cost_input = (
-                runner._concat_turn_text(prior_turns) + "\n" + round_prompt
+                runner.concat_turn_text(prior_turns) + "\n" + round_prompt
             )
-        fanout_est, fanout_known = await runner.aestimate_cost(specs, fanout_cost_input)
-        arbiter_est, arbiter_known = await runner.aestimate_cost([arbiter_spec], round_prompt)
+        fanout_est, fanout_known = await runner.aestimate_cost(
+            round_base_specs, fanout_cost_input, capsule_kind=resolved_kind,
+        )
+        # Arbiter call has its own hardcoded max_tokens=2000 (see _ask_arbiter);
+        # "decision" matches that budget so the estimate is honest.
+        arbiter_est, arbiter_known = await runner.aestimate_cost(
+            [arbiter_spec], round_prompt, capsule_kind="decision",
+        )
         estimate = fanout_est + arbiter_est
         est_known = fanout_known and arbiter_known
         if cumulative_cost + estimate > cap:
@@ -633,7 +782,20 @@ async def refine(
             break
 
         round_base = (round_num - 1) * (panel_n * 2 + 1)
-        round_specs = _suffix_specs(specs, round_num)
+        round_specs = _suffix_specs(round_base_specs, round_num)
+        # Per-panellist conversation history for round 2+. Map each
+        # round-N slug to its base's accumulated turns. Round 1 falls
+        # back to the global `prior_turns` (continuation context) since
+        # `panel_conversations` only has continuation seeds at this point.
+        round_prior_by_slug: dict[str, list[dict[str, Any]]] | None
+        if round_num == 1:
+            round_prior_by_slug = None
+        else:
+            round_prior_by_slug = {}
+            for rspec in round_specs:
+                base = _base_for_slug(rspec.slug)
+                if base in panel_conversations:
+                    round_prior_by_slug[rspec.slug] = panel_conversations[base]
         # Pass the remaining budget so fanout's internal cap matches the
         # refine cap — without this the nested call falls back to
         # `registry.default_max_run_usd()` and a caller's higher refine
@@ -644,8 +806,13 @@ async def refine(
             blinded=blinded,
             max_run_usd=cap - cumulative_cost,
             existing_paths=paths,
-            on_progress=make_phase_cb(round_base),
-            prior_turns=prior_turns,
+            on_progress=progress_mod.make_phase_cb(
+                emit if on_progress else None, round_base, progress_total, progress_done,
+            ),
+            # Round 1 uses the global continuation; round 2+ uses the
+            # per-slug accumulated history.
+            prior_turns=prior_turns if round_num == 1 else None,
+            prior_turns_by_slug=round_prior_by_slug,
         )
         # Short-circuit when fanout itself is partial. Running the arbiter
         # on a zero-usable-panel manifest just burns the arbiter's price for
@@ -667,9 +834,38 @@ async def refine(
             )
             break
         final_manifest = handle.manifest
+
+        # Append this round's (user turn, assistant turn) to each
+        # panellist's per-slug conversation history. The next round's
+        # fanout will pass these as `prior_turns_by_slug` so the
+        # panellist sees its prior answer as a proper assistant turn
+        # rather than receiving the question fresh. The round-1 user
+        # turn (`round_prompt`) is byte-stable across rounds 2+'s
+        # prefix — that's what Anthropic's prompt cache keys on.
+        for entry in handle.manifest:
+            if entry.status not in (Status.OK, Status.TRUNCATED):
+                continue
+            try:
+                body_text = (paths.root / "responses" / f"{entry.slug}.txt").read_text()
+            except OSError:
+                # Body file missing — skip this panellist's history
+                # update. The next round will fall back to a fresh
+                # turn for this slug (no per-slug entry in the dict).
+                logger.debug("could not read body for %s; skipping history", entry.slug)
+                continue
+            base = _base_for_slug(entry.slug)
+            history = panel_conversations.setdefault(base, [])
+            history.append({"role": "user", "content": round_prompt})
+            history.append({"role": "assistant", "content": body_text})
+
         handle = await capsule.annotate(
             handle,
-            on_progress=make_phase_cb(round_base + panel_n),
+            on_progress=progress_mod.make_phase_cb(
+                emit if on_progress else None,
+                round_base + panel_n,
+                progress_total,
+                progress_done,
+            ),
             kind=resolved_kind,
         )
         # Accumulate AFTER capsule.annotate — it mutates handle.cost_usd in
@@ -690,9 +886,9 @@ async def refine(
         verdict = await _ask_arbiter(
             arbiter_question, round_num, handle.manifest, arbiter_alias, prior_manifest
         )
-        progress_done = round_base + panel_n * 2 + 1
+        progress_done[0] = round_base + panel_n * 2 + 1
         await emit(progress_mod.ArbiterScored(
-            done=progress_done, total=progress_total,
+            done=progress_done[0], total=progress_total,
             round=round_num, score=verdict.score,
         ))
         verdicts.append(verdict)
@@ -741,8 +937,8 @@ async def refine(
 
     # Synthesise from the final round
     if final_manifest:
-        progress_done = progress_total - 1
-        await emit(progress_mod.SynthStarted(done=progress_done, total=progress_total))
+        progress_done[0] = progress_total - 1
+        await emit(progress_mod.SynthStarted(done=progress_done[0], total=progress_total))
         # `anonymised=blinded` so a refine-with-blinded-True doesn't leak the
         # raw original prompt into synth_input.txt — without it the synth
         # call defaults to `anonymised=False`, which makes the context bundle
@@ -757,8 +953,8 @@ async def refine(
         cumulative_cost += synth_result.cost_usd
         if not synth_result.cost_known:
             cost_all_known = False
-        progress_done = progress_total
-        await emit(progress_mod.SynthCompleted(done=progress_done, total=progress_total))
+        progress_done[0] = progress_total
+        await emit(progress_mod.SynthCompleted(done=progress_done[0], total=progress_total))
         # Persist synthesiser + cumulative cost. Refine writes the manifest
         # once per round from `runner.fanout`, which only knows that round's
         # fanout spend; capsule + arbiter + synth costs were rolled into

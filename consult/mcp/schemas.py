@@ -197,6 +197,18 @@ REFINE_SCHEMA = {
                 "summary' before the new round runs. Unknown IDs raise an error."
             ),
         },
+        "strategy": {
+            "type": "string",
+            "enum": ["default", "elimination"],
+            "default": "default",
+            "description": (
+                "Round-to-round strategy. 'default' runs the full panel "
+                "every round. 'elimination' drops the most-divergent "
+                "panellist (max-distance from the panel medoid) from "
+                "round 2 onwards — tightens the consensus signal by "
+                "removing structural outliers."
+            ),
+        },
     },
 }
 
@@ -334,5 +346,18 @@ def consult_schema() -> dict[str, Any]:
             },
             "blinded": {"type": "boolean", "default": False},
             "max_run_usd": {"type": "number"},
+            "gate_synth_at_agreement": {
+                "type": "number",
+                "minimum": 0.0,
+                "maximum": 1.0,
+                "description": (
+                    "When set, skip the flagship synth and emit a deterministic "
+                    "per-panellist aggregate if the post-capsule disagreement "
+                    "score is BELOW this threshold (i.e. consensus is strong). "
+                    "Cost-aware cascade pattern; reasonable starting threshold "
+                    "0.15-0.25. Requires extract_capsules=true (default) to be "
+                    "able to compute the disagreement score."
+                ),
+            },
         },
     }

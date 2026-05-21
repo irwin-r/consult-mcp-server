@@ -15,21 +15,17 @@ from __future__ import annotations
 import logging
 import time
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import Field, model_validator
 
 from . import artifacts, capsule, registry, runner, synth
 from . import progress as progress_mod
-from .types import ModelSpec
-
-_STRICT = ConfigDict(extra="forbid")
+from .types import ModelSpec, StrictModel
 
 logger = logging.getLogger(__name__)
 
 
-class SequenceStep(BaseModel):
+class SequenceStep(StrictModel):
     """One step in a sequence — its run_id, prompt-as-sent, and synth."""
-
-    model_config = _STRICT
 
     step: int = Field(..., ge=1)
     run_id: str
@@ -43,10 +39,8 @@ class SequenceStep(BaseModel):
     # check lives on SequenceResult.
 
 
-class SequenceResult(BaseModel):
+class SequenceResult(StrictModel):
     """Aggregate result of a sequence run."""
-
-    model_config = _STRICT
 
     steps: list[SequenceStep] = Field(default_factory=list)
     final_synthesis: str
@@ -124,7 +118,10 @@ async def sequence(
     # within their bucket.
     panel_n = len(specs)
     progress_total = total * (panel_n * 2 + 1)
-    progress_done = 0
+    # Mutable cell so `progress_mod.make_phase_cb` can update it; we read
+    # `progress_done[0]` for the direct emits between phases (synth, step
+    # completed).
+    progress_done = [0]
 
     async def emit(event: progress_mod.ProgressEvent) -> None:
         if on_progress is not None:
@@ -133,29 +130,13 @@ async def sequence(
             except Exception as e:  # noqa: BLE001
                 logger.debug("sequence on_progress failed: %s", e)
 
-    def phase_cb(base: int) -> runner.ProgressCallback | None:
-        """Shift child events into the sequence-wide monotonic bucket.
-
-        Tracks `progress_done` for subsequent direct `emit()` calls; the
-        shift itself is delegated to `progress_mod.shift_bucket`.
-        """
-        if on_progress is None:
-            return None
-        inner = progress_mod.shift_bucket(emit, base, progress_total)
-
-        async def cb(event: progress_mod.ProgressEvent) -> None:
-            nonlocal progress_done
-            progress_done = base + event.done
-            assert inner is not None
-            await inner(event)
-
-        return cb
-
     for i, body in enumerate(prompts, start=1):
         step_base = (i - 1) * (panel_n * 2 + 1)
         full_prompt = _step_prompt(i, total, prior_synth, body)
 
-        estimate, est_known = await runner.aestimate_cost(specs, full_prompt)
+        estimate, est_known = await runner.aestimate_cost(
+            specs, full_prompt, capsule_kind=capsule_kind,
+        )
         if cumulative_cost + estimate > cap:
             partial_reason = (
                 f"would exceed cap: spent ${cumulative_cost:.2f}, step {i} estimate "
@@ -180,7 +161,9 @@ async def sequence(
             specs,
             blinded=blinded,
             max_run_usd=cap - cumulative_cost,
-            on_progress=phase_cb(step_base),
+            on_progress=progress_mod.make_phase_cb(
+                emit if on_progress else None, step_base, progress_total, progress_done,
+            ),
             capsule_kind=capsule_kind,
         )
         if handle.partial or not handle.manifest:
@@ -198,15 +181,20 @@ async def sequence(
 
         handle = await capsule.annotate(
             handle,
-            on_progress=phase_cb(step_base + panel_n),
+            on_progress=progress_mod.make_phase_cb(
+                emit if on_progress else None,
+                step_base + panel_n,
+                progress_total,
+                progress_done,
+            ),
             kind=capsule_kind,
         )
         cumulative_cost += handle.cost_usd
         if not handle.cost_known:
             cost_all_known = False
 
-        progress_done = step_base + panel_n * 2
-        await emit(progress_mod.SynthStarted(done=progress_done, total=progress_total))
+        progress_done[0] = step_base + panel_n * 2
+        await emit(progress_mod.SynthStarted(done=progress_done[0], total=progress_total))
         synth_result = await synth.synthesise(
             handle.run_id, by_model=synth_alias, anonymised=blinded, rubric=rubric
         )
@@ -255,9 +243,9 @@ async def sequence(
             )
             break
 
-        progress_done = step_base + panel_n * 2 + 1
+        progress_done[0] = step_base + panel_n * 2 + 1
         await emit(progress_mod.SequenceStepCompleted(
-            done=progress_done, total=progress_total, step=i,
+            done=progress_done[0], total=progress_total, step=i,
         ))
         prior_synth = synth_result.text
 

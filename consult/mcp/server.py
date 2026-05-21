@@ -17,6 +17,7 @@ Owns the MCP-specific glue that used to leak into handlers:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from collections.abc import Awaitable, Callable
@@ -29,12 +30,19 @@ from mcp.server.models import InitializationOptions
 from mcp.server.stdio import stdio_server
 from mcp.types import (
     AnyUrl,
+    CreateTaskResult,
+    GetTaskRequest,
+    GetTaskResult,
     Resource,
+    ServerResult,
+    Task,
+    TaskStatus,
     TextContent,
     Tool,
+    ToolAnnotations,
 )
 
-from .. import artifacts
+from .. import artifacts, task_store
 from ..progress import ProgressEvent, event_message
 from . import errors, handlers, schemas
 
@@ -53,6 +61,55 @@ server: Server = Server("consult")
 # ---- Tool listing -----------------------------------------------------------
 
 
+# Tool annotations are *hints* to clients (Claude Code, Cursor, ChatGPT
+# dev-mode) for auto-approval / confirmation UX. They are NOT security
+# boundaries — the spec is explicit that an untrusted server's annotations
+# cannot be trusted. They reflect the *consult* engine's behaviour:
+# - every tool here calls external LLMs (openWorldHint=True) — costs money,
+#   the parent agent should usually surface a confirmation
+# - none of them destroy anything on the local filesystem outside the
+#   `~/.consult/runs/<id>/` artifact dir (destructiveHint=False)
+# - `synthesise(run_id)` is idempotent: same inputs replay the same on-disk
+#   artifacts (LLM stochasticity aside; the manifest contract is stable).
+# - the four panel/consult/refine/sequence tools each create a fresh run_id
+#   on every call, so idempotentHint=False.
+_PANEL_ANN = ToolAnnotations(
+    title="Multi-model panel",
+    readOnlyHint=False,
+    destructiveHint=False,
+    idempotentHint=False,
+    openWorldHint=True,
+)
+_SYNTH_ANN = ToolAnnotations(
+    title="Synthesise existing run",
+    readOnlyHint=False,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=True,
+)
+_CONSULT_ANN = ToolAnnotations(
+    title="Consult multi-model panel",
+    readOnlyHint=False,
+    destructiveHint=False,
+    idempotentHint=False,
+    openWorldHint=True,
+)
+_REFINE_ANN = ToolAnnotations(
+    title="Iterative refine loop",
+    readOnlyHint=False,
+    destructiveHint=False,
+    idempotentHint=False,
+    openWorldHint=True,
+)
+_SEQUENCE_ANN = ToolAnnotations(
+    title="Chained multi-step consultation",
+    readOnlyHint=False,
+    destructiveHint=False,
+    idempotentHint=False,
+    openWorldHint=True,
+)
+
+
 @server.list_tools()
 async def handle_list_tools() -> list[Tool]:
     return [
@@ -64,6 +121,7 @@ async def handle_list_tools() -> list[Tool]:
                 "bodies. Use when the parent agent wants to synthesise itself."
             ),
             inputSchema=schemas.PANEL_SCHEMA,
+            annotations=_PANEL_ANN,
         ),
         Tool(
             name="synthesise",
@@ -72,6 +130,7 @@ async def handle_list_tools() -> list[Tool]:
                 "manifest + bodies and returns markdown under a consensus rubric."
             ),
             inputSchema=schemas.SYNTH_SCHEMA,
+            annotations=_SYNTH_ANN,
         ),
         Tool(
             name="consult",
@@ -80,6 +139,7 @@ async def handle_list_tools() -> list[Tool]:
                 "+ manifest. Use for 'just give me the answer' workflows."
             ),
             inputSchema=schemas.consult_schema(),
+            annotations=_CONSULT_ANN,
         ),
         Tool(
             name="refine",
@@ -89,6 +149,7 @@ async def handle_list_tools() -> list[Tool]:
                 "Hard cap at 3 rounds. Per-round transcripts available as MCP resources."
             ),
             inputSchema=schemas.REFINE_SCHEMA,
+            annotations=_REFINE_ANN,
         ),
         Tool(
             name="sequence",
@@ -100,6 +161,7 @@ async def handle_list_tools() -> list[Tool]:
                 "the final synthesis."
             ),
             inputSchema=schemas.SEQUENCE_SCHEMA,
+            annotations=_SEQUENCE_ANN,
         ),
     ]
 
@@ -155,46 +217,160 @@ def _build_progress_callback() -> Callable[[ProgressEvent], Awaitable[None]] | N
     return notify
 
 
-@server.call_tool()
-async def handle_call_tool(
-    name: str, arguments: dict[str, Any]
+async def _run_handler_with_envelopes(
+    name: str, arguments: dict[str, Any], on_progress: Callable | None,
 ) -> dict[str, Any] | list[TextContent]:
-    # All failures funnel into the structured `ErrorEnvelope` shape so the
-    # agent never has to parse free-text. Map known exception types to stable
-    # error codes; anything unhandled becomes INTERNAL_ERROR (and we log the
-    # traceback so the maintainer can find the bug).
+    """Execute a tool handler, mapping exceptions into ErrorEnvelopes.
+
+    Extracted from `handle_call_tool` so the same engine flow runs in
+    foreground (synchronous response) and Task mode (background asyncio
+    Task storing into `task_store`). Both paths return the same wire
+    shape so a client polling `tasks/get` sees identical data to a
+    client receiving the synchronous response.
+    """
     handler = _HANDLERS.get(name)
     if handler is None:
         return errors.envelope(errors.ErrorCode.INVALID_INPUT, f"Unknown tool: {name}")
-    on_progress = _build_progress_callback()
     try:
         result = await handler(arguments, on_progress=on_progress)
     except ValueError as e:
-        # Caller-side problems: out-of-range params, bad continuation_id,
-        # empty prompt list, missing required fields, etc. Raised
-        # synchronously by the handler / library code before any model call.
         return errors.envelope(errors.ErrorCode.INVALID_INPUT, str(e))
     except KeyError as e:
-        # `registry.resolve_model` raises KeyError on unknown alias — relevant
-        # for `synthesise.by_model` and explicit `arbiter`/`synthesiser`
-        # overrides that don't go through `_call_one`'s per-spec ERROR path.
         return errors.envelope(errors.ErrorCode.UNKNOWN_MODEL, str(e))
     except FileNotFoundError as e:
-        # `artifacts.load_run` raises this when a run_id doesn't exist on
-        # disk. Relevant for `synthesise(run_id=...)` and any `continuation_id`
-        # that bypasses `_apply_continuation`'s wrapping.
         return errors.envelope(errors.ErrorCode.RUN_NOT_FOUND, str(e))
-    except Exception as e:  # noqa: BLE001 — last-resort envelope
+    except Exception as e:  # noqa: BLE001
         logger.exception("unhandled exception in tool %s", name)
         return errors.envelope(
             errors.ErrorCode.INTERNAL_ERROR, f"{type(e).__name__}: {e}"
         )
-    # Wire-shape adaptation for synthesise: a markdown blob is more usefully
-    # delivered as `TextContent` so clients render it directly rather than
-    # forcing them to unwrap a dict.
     if name in _TEXT_RESULT_TOOLS and isinstance(result, str):
         return [TextContent(type="text", text=result)]
     return result
+
+
+def _is_task_request() -> int | None:
+    """Return the request's `task.ttl` (or None if non-task mode).
+
+    SEP-1686 task augmentation: when the client sends
+    `params.task: {ttl: N}` on a tools/call request, the server returns
+    a `CreateTaskResult` immediately and runs the work async. Returns
+    the ttl integer when task mode is active (None ttl means "default"
+    per the spec — we treat that as 0 = no expiry).
+    """
+    try:
+        ctx = server.request_context
+    except LookupError:
+        return None
+    req = getattr(ctx, "request", None)
+    if req is None:
+        return None
+    params = getattr(req, "params", None)
+    if params is None:
+        return None
+    task_meta = getattr(params, "task", None)
+    if task_meta is None:
+        return None
+    return getattr(task_meta, "ttl", None) or 0
+
+
+@server.call_tool()
+async def handle_call_tool(
+    name: str, arguments: dict[str, Any]
+) -> dict[str, Any] | list[TextContent] | CreateTaskResult:
+    """Dispatch a tool call. Two modes:
+
+    - **Foreground** (`params.task` absent or null): runs the handler
+      to completion, returns the result inline. Exceptions land on the
+      structured `ErrorEnvelope` shape.
+
+    - **Task** (`params.task: {ttl}` set): kicks off the handler as a
+      background asyncio Task, returns `CreateTaskResult` immediately
+      with a freshly-minted `taskId`. The client polls `tasks/get`
+      until terminal. Per the SEP-1686 spec, `taskSupport: "optional"`
+      on every consult tool — clients can use either mode.
+    """
+    on_progress = _build_progress_callback()
+    ttl = _is_task_request()
+
+    if ttl is None:
+        # Foreground path — original behaviour.
+        return await _run_handler_with_envelopes(name, arguments, on_progress)
+
+    # Task path: register, spawn, return immediately.
+    rec = task_store.create(ttl_ms=ttl or None)
+    # Background tasks cannot use `server.request_context` (it's tied
+    # to the originating request which is about to end). Pass a None
+    # callback — clients polling `tasks/get` see status changes via the
+    # status field; per-panellist progress is still tailable on disk
+    # via `~/.consult/runs/<id>/_progress.log`.
+    async def _bg() -> None:
+        try:
+            result = await _run_handler_with_envelopes(name, arguments, None)
+            # If the handler returned a dict containing run_id, attach it
+            # for forensic correlation.
+            if isinstance(result, dict) and isinstance(result.get("run_id"), str):
+                task_store.attach_run_id(rec.task_id, result["run_id"])
+            task_store.complete(rec.task_id, result)
+        except asyncio.CancelledError:
+            # Already marked CANCELLED by task_store.cancel(); just exit.
+            raise
+        except Exception as e:  # noqa: BLE001
+            logger.exception("background task %s failed", rec.task_id)
+            task_store.fail(rec.task_id, f"{type(e).__name__}: {e}")
+
+    bg = asyncio.create_task(_bg())
+    task_store.attach_bg_task(rec.task_id, bg)
+
+    return CreateTaskResult(
+        task=Task(
+            taskId=rec.task_id,
+            status=TaskStatus(rec.status),
+            createdAt=_iso(rec.created_at),
+            lastUpdatedAt=_iso(rec.last_updated_at),
+            ttl=rec.ttl_ms,
+            pollInterval=rec.poll_interval_ms,
+        ),
+    )
+
+
+def _iso(epoch_seconds: float) -> str:
+    """ISO-8601 timestamp from an `epoch_seconds` float, UTC."""
+    from datetime import UTC, datetime
+    return datetime.fromtimestamp(epoch_seconds, tz=UTC).isoformat()
+
+
+async def _handle_get_task(req: GetTaskRequest) -> ServerResult:
+    """Respond to a `tasks/get` poll.
+
+    Returns the current `Task` snapshot for the requested taskId.
+    Unknown taskIds return an empty (None-task) GetTaskResult — clients
+    that lost the taskId should resubmit rather than hang.
+    """
+    task_id = req.params.taskId
+    rec = task_store.get(task_id)
+    if rec is None:
+        # Per the spec the result has Optional[Task]; None signals "not found".
+        return ServerResult(GetTaskResult(task=None))  # type: ignore[arg-type]
+    return ServerResult(
+        GetTaskResult(
+            task=Task(
+                taskId=rec.task_id,
+                status=TaskStatus(rec.status),
+                statusMessage=rec.status_message,
+                createdAt=_iso(rec.created_at),
+                lastUpdatedAt=_iso(rec.last_updated_at),
+                ttl=rec.ttl_ms,
+                pollInterval=rec.poll_interval_ms,
+            ),
+        )
+    )
+
+
+# Wire the tasks/get handler. The standard `Server` class doesn't
+# expose a decorator for this (it's not part of the "core" surface)
+# so we register it directly on `request_handlers`.
+server.request_handlers[GetTaskRequest] = _handle_get_task
 
 
 # ---- Resources --------------------------------------------------------------
@@ -231,12 +407,19 @@ async def handle_list_resources() -> list[Resource]:
 
 @server.read_resource()
 async def handle_read_resource(uri: AnyUrl) -> str:
-    run_id, slug = artifacts.parse_resource_uri(str(uri))
+    run_id, kind, name = artifacts.parse_resource_uri(str(uri))
     paths = artifacts.load_run(run_id)
-    body_file = paths.response_text(slug)
-    if not body_file.exists():
-        raise FileNotFoundError(f"Body not found: {uri}")
-    return body_file.read_text()
+    if kind == "responses":
+        f = paths.response_text(name)
+        if not f.exists():
+            raise FileNotFoundError(f"Body not found: {uri}")
+        return f.read_text()
+    if kind == "attachments":
+        f = paths.attachment_path(name)
+        if not f.exists():
+            raise FileNotFoundError(f"Attachment not found: {uri}")
+        return f.read_text()
+    raise ValueError(f"Unsupported resource kind: {kind}")
 
 
 # ---- Main loop --------------------------------------------------------------
