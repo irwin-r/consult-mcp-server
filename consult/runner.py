@@ -1588,8 +1588,10 @@ async def fanout(
 
     # `blinded=True` controls what panellists see of each other DURING the
     # run (the brand-scrub in `context.build` and the greek-letter slugs in
-    # `_make_slug`), and the synth's `anonymised` switch hides model_id
-    # from the synthesiser prompt. The manifest itself keeps real
+    # `_make_slug`); the synth's `anonymised` switch additionally selects
+    # the brand-scrubbed prompt for the synthesiser's view of the original
+    # question. Panellist labels are blinded to the synth unconditionally
+    # via blind labels (Alpha/Beta/...). The manifest itself keeps real
     # model_ids so the final report (viewer, ledger) can surface them to
     # the human reader. Earlier code scrubbed manifest model_ids here,
     # which leaked the blinding past its useful boundary.

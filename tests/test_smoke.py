@@ -1769,7 +1769,7 @@ def test_synth_build_input_always_blinds_and_filters_failures():
 
     - ERROR/EMPTY entries are filtered out of the input
     - The synth input contains blind labels (Alpha, Beta, ...) not slugs
-    - Model IDs never appear regardless of the `anonymised` flag
+    - Model IDs never appear in the synth input
     - The returned `label_to_slug` mapping covers every usable panellist
     """
     from consult.synth import _build_input
@@ -1804,34 +1804,29 @@ def test_synth_build_input_always_blinds_and_filters_failures():
     }
     rubric = "rubric {n}"
 
-    # `anonymised` is now vestigial — both values give identical synth
-    # input. The flag is kept only for API compatibility.
-    for flag in (True, False):
-        text, label_to_slug = _build_input(
-            manifest, bodies, rubric=rubric, anonymised=flag,
-        )
-        # Real model identifiers never reach the synth
-        assert "anthropic/claude-opus-4-7" not in text
-        assert "openai/gpt-5.5" not in text
-        assert "gemini/gemini-3.1-pro-preview" not in text
-        # Real slugs are hidden too — replaced by blind labels in the label
-        # row. (Bodies stay verbatim; if a panellist happened to mention
-        # its own slug in the body, that's the panellist's own leak —
-        # `consult` doesn't try to scrub bodies.)
-        assert "[panelist-alpha" not in text
-        assert "[panelist-gamma" not in text
-        # Filtered: EMPTY status entry was dropped before labels were assigned
-        assert "panelist-beta" not in text  # filtered
-        # The mapping covers exactly the 2 usable entries (OK + TRUNCATED)
-        assert set(label_to_slug.values()) == {"panelist-alpha", "panelist-gamma"}
-        assert len(label_to_slug) == 2
-        # Each label appears in the input text somewhere
-        for label in label_to_slug:
-            assert label in text
-        # Bodies survive the relabelling
-        assert "alpha body" in text
-        assert "gamma body" in text
-        assert "rubric 2" in text  # only OK + TRUNCATED counted
+    text, label_to_slug = _build_input(manifest, bodies, rubric=rubric)
+    # Real model identifiers never reach the synth
+    assert "anthropic/claude-opus-4-7" not in text
+    assert "openai/gpt-5.5" not in text
+    assert "gemini/gemini-3.1-pro-preview" not in text
+    # Real slugs are hidden too — replaced by blind labels in the label
+    # row. (Bodies stay verbatim; if a panellist happened to mention
+    # its own slug in the body, that's the panellist's own leak —
+    # `consult` doesn't try to scrub bodies.)
+    assert "[panelist-alpha" not in text
+    assert "[panelist-gamma" not in text
+    # Filtered: EMPTY status entry was dropped before labels were assigned
+    assert "panelist-beta" not in text  # filtered
+    # The mapping covers exactly the 2 usable entries (OK + TRUNCATED)
+    assert set(label_to_slug.values()) == {"panelist-alpha", "panelist-gamma"}
+    assert len(label_to_slug) == 2
+    # Each label appears in the input text somewhere
+    for label in label_to_slug:
+        assert label in text
+    # Bodies survive the relabelling
+    assert "alpha body" in text
+    assert "gamma body" in text
+    assert "rubric 2" in text  # only OK + TRUNCATED counted
 
 
 def test_manifest_entry_validates_error_requirement():
@@ -2715,7 +2710,7 @@ def test_synth_build_input_prepends_original_prompt_section():
     bodies = {"alpha": "BODY-TEXT"}
     out, _label_map = _build_input(
         manifest, bodies, rubric="rubric for {n} responses",
-        anonymised=False, original_prompt="PROMPT-TEXT",
+        original_prompt="PROMPT-TEXT",
     )
     assert "Original question / source" in out
     assert "PROMPT-TEXT" in out
@@ -2734,7 +2729,7 @@ def test_synth_build_input_without_original_prompt_is_legacy_shape():
     ]
     bodies = {"alpha": "BODY-TEXT"}
     out, _label_map = _build_input(
-        manifest, bodies, rubric="rubric for {n} responses", anonymised=False,
+        manifest, bodies, rubric="rubric for {n} responses",
     )
     assert "Original question / source" not in out
     assert "BODY-TEXT" in out
@@ -3225,7 +3220,7 @@ def test_synth_build_input_rubric_with_literal_braces_does_not_crash():
          "confidence": None, "status": "OK"},
     ]
     out, _label_map = _build_input(
-        manifest, {"alpha": "body"}, rubric=rubric_with_braces, anonymised=False
+        manifest, {"alpha": "body"}, rubric=rubric_with_braces,
     )
     assert "1 responses" in out
     assert '{ "verdict": "ship" }' in out

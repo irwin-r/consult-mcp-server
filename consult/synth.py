@@ -10,10 +10,16 @@ model_id. The synth's output text is then de-anonymised by word-boundary
 regex before being persisted. This is the "When Identity Skews Debate"
 (arxiv 2510.07517) finding: full-pipeline anonymisation drops conformity
 bias ~96% on benchmark tasks, whereas *partial* anonymisation is worse
-than none (the judge picks up identity from style cues). The blinding is
-ALWAYS on regardless of the `anonymised` flag — that flag is kept for
-backwards-compat but is now vestigial (synth no longer references
-model_id in prose because it never sees one).
+than none (the judge picks up identity from style cues). Panellist-level
+blinding is unconditional — independent of the `anonymised` flag.
+
+The `anonymised` flag on `synthesise()` controls a different axis: whether
+the synth sees the brand-scrubbed version of the *original prompt*
+(`bundle.prompt_scrubbed`) or the raw one. Callers set it via
+`prompt_for_downstream(anonymised=...)`; engine entry points
+(`orchestrate.consult`, `refine`, `sequence`) pass `anonymised=blinded`
+so a blinded run also keeps brand names out of the synth's view of the
+question. Standalone synth callers can override per-call.
 
 Capsule order is shuffled per call too — position bias in LLM judging
 is well-documented (MT-Bench measured 75% first-position preference on
@@ -150,7 +156,6 @@ def _build_input(
     bodies: dict[str, str],
     *,
     rubric: str,
-    anonymised: bool,
     original_prompt: str | None = None,
 ) -> tuple[str, dict[str, str]]:
     """Build the synth's input text and return the de-anonymisation map.
@@ -180,14 +185,6 @@ def _build_input(
         persona = entry.get("persona") or "neutral"
         conf = entry.get("confidence")
         status = entry["status"]
-        # `anonymised` is preserved as a parameter for API compat but no
-        # longer changes what the synth sees — model_id and real slugs
-        # are unconditionally hidden by the blind-label substitution.
-        # The flag still records the caller's *intent* in the manifest;
-        # downstream tooling (viewer) may use it to decide whether to
-        # show real identities to the human reader. Reference here so
-        # linters don't flag it as unused.
-        _ = anonymised
         label_str = (
             f"[{label} | persona={persona} | confidence={conf} | status={status}]"
         )
@@ -260,7 +257,6 @@ async def synthesise(
         manifest,
         bodies,
         rubric=rub,
-        anonymised=anonymised,
         original_prompt=original_prompt,
     )
     # Persist for reproducibility — the synth input is what the model
