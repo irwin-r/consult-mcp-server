@@ -35,10 +35,23 @@ _CONTEXT_FILENAME = "context.json"
 # (Adding "the" would mangle ordinary English. Adding nothing here means
 # we'd scrub e.g. "max" out of "qwen-max" — which is actually fine, but
 # also out of "max(a, b)" in code, which is not.) Kept narrow on purpose.
-_COMMON_NON_BRAND_WORDS: frozenset[str] = frozenset({
-    "max", "pro", "mini", "nano", "flash", "lite", "preview", "latest",
-    "ultra", "turbo", "instruct", "chat", "base",
-})
+_COMMON_NON_BRAND_WORDS: frozenset[str] = frozenset(
+    {
+        "max",
+        "pro",
+        "mini",
+        "nano",
+        "flash",
+        "lite",
+        "preview",
+        "latest",
+        "ultra",
+        "turbo",
+        "instruct",
+        "chat",
+        "base",
+    }
+)
 
 
 @functools.cache
@@ -89,8 +102,16 @@ def _brand_patterns() -> tuple[re.Pattern[str], re.Pattern[str]]:
 
     # Always include the known lab/provider names even if not in the
     # registry yet — anchors a stable baseline of coverage.
-    for w in ("anthropic", "openai", "google", "openrouter", "perplexity",
-              "deepmind", "moonshotai", "xiaomi"):
+    for w in (
+        "anthropic",
+        "openai",
+        "google",
+        "openrouter",
+        "perplexity",
+        "deepmind",
+        "moonshotai",
+        "xiaomi",
+    ):
         provider_words.add(w)
 
     # Provider words appear in BOTH regexes:
@@ -154,8 +175,7 @@ class ContextBundle(StrictModel):
     prompt_scrubbed: str = Field(
         ...,
         description=(
-            "Brand-scrubbed variant for blinded mode. Identical to prompt "
-            "when scrubbing is a no-op."
+            "Brand-scrubbed variant for blinded mode. Identical to prompt when scrubbing is a no-op."
         ),
     )
     blinded: bool = Field(
@@ -299,10 +319,7 @@ def trim_synth_input(
     if over > 0 and new_prompt:
         target = max(2000, len(new_prompt) - over)
         new_prompt = trim_text(new_prompt, target, label="original_prompt")
-        over = (
-            (len(new_prompt) if new_prompt else 0)
-            + sum(len(b) for b in new_bodies.values())
-        ) - budget
+        over = ((len(new_prompt) if new_prompt else 0) + sum(len(b) for b in new_bodies.values())) - budget
 
     # Final hard pass — only triggers when pass-1 hit the per-body floor
     # on at least one body, i.e. the budget genuinely can't accommodate
@@ -320,7 +337,9 @@ def trim_synth_input(
                 target = max(500, int(cur * scale))
                 if target < cur:
                     new_bodies[slug] = trim_text(
-                        new_bodies[slug], target, label=f"body[{slug}]/hardtrim",
+                        new_bodies[slug],
+                        target,
+                        label=f"body[{slug}]/hardtrim",
                     )
 
     return new_prompt, new_bodies
@@ -356,7 +375,5 @@ def load_or_none(paths: artifacts.RunPaths) -> ContextBundle | None:
     try:
         return ContextBundle.model_validate_json(path.read_text())
     except Exception as e:  # noqa: BLE001 — any parse/validate error is "legacy"
-        logger.warning(
-            "context.json present but unreadable for run %s: %s", paths.run_id, e
-        )
+        logger.warning("context.json present but unreadable for run %s: %s", paths.run_id, e)
         return None

@@ -127,10 +127,7 @@ class EliminationStrategy(Strategy):
                 "EliminationStrategy: no clear outlier in round %d; keeping full panel",
                 round_num - 1,
             )
-            return [
-                s for s in base_specs
-                if (s.model, s.stance, s.slug) not in self._eliminated
-            ]
+            return [s for s in base_specs if (s.model, s.stance, s.slug) not in self._eliminated]
 
         # `worst_slug` carries the `.r<round_num-1>` suffix from
         # _suffix_specs. Map back to the base ModelSpec by stripping
@@ -147,13 +144,12 @@ class EliminationStrategy(Strategy):
         self._eliminated.add(key)
         logger.info(
             "EliminationStrategy: eliminating %s (slug=%s) for round %d",
-            target.model, worst_slug, round_num,
+            target.model,
+            worst_slug,
+            round_num,
         )
 
-        usable_specs = [
-            s for s in base_specs
-            if (s.model, s.stance, s.slug) not in self._eliminated
-        ]
+        usable_specs = [s for s in base_specs if (s.model, s.stance, s.slug) not in self._eliminated]
         # Floor at 2 panellists — eliminating below that loses the
         # consensus signal. Stop further eliminations rather than
         # walking the panel to zero.
@@ -162,17 +158,17 @@ class EliminationStrategy(Strategy):
         return usable_specs
 
     def _compute_worst(
-        self, prior_manifest: list[ManifestEntry],
+        self,
+        prior_manifest: list[ManifestEntry],
     ) -> str | None:
         """Return the slug of the panellist with the lowest mean
         similarity to the rest of the panel. None when there's no clear
         outlier (e.g. all-failed manifest, or insufficient usable
         capsules)."""
         usable = [
-            m for m in prior_manifest
-            if m.status in (Status.OK, Status.TRUNCATED)
-            and m.capsule is not None
-            and _feature_string(m)
+            m
+            for m in prior_manifest
+            if m.status in (Status.OK, Status.TRUNCATED) and m.capsule is not None and _feature_string(m)
         ]
         if len(usable) < 3:
             # 2 or fewer: dropping one leaves at most one — pointless
@@ -181,18 +177,17 @@ class EliminationStrategy(Strategy):
         worst_slug: str | None = None
         worst_score = float("inf")
         for i, entry in enumerate(usable):
-            others = features[:i] + features[i + 1:]
-            mean_sim = (
-                sum(SequenceMatcher(None, features[i], o).ratio() for o in others)
-                / len(others)
-            )
+            others = features[:i] + features[i + 1 :]
+            mean_sim = sum(SequenceMatcher(None, features[i], o).ratio() for o in others) / len(others)
             if mean_sim < worst_score:
                 worst_score = mean_sim
                 worst_slug = entry.slug
         return worst_slug
 
     def _find_worst_base_index(
-        self, worst_slug: str, base_specs: list[ModelSpec],
+        self,
+        worst_slug: str,
+        base_specs: list[ModelSpec],
     ) -> int | None:
         """Map a round-suffixed slug back to its base-spec index.
 
@@ -218,7 +213,7 @@ class EliminationStrategy(Strategy):
         # _suffix_specs)
         rdash = base_part.rfind("-")
         if rdash != -1:
-            tail = base_part[rdash + 1:]
+            tail = base_part[rdash + 1 :]
             if tail.isdigit():
                 idx = int(tail)
                 if 0 <= idx < len(base_specs):
@@ -238,9 +233,7 @@ def strategy_for(name: str) -> Strategy:
     cls = _STRATEGIES.get(name)
     if cls is None:
         available = ", ".join(sorted(_STRATEGIES.keys()))
-        raise ValueError(
-            f"Unknown refine strategy {name!r}. Available: {available}"
-        )
+        raise ValueError(f"Unknown refine strategy {name!r}. Available: {available}")
     return cls()
 
 

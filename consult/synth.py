@@ -121,8 +121,18 @@ def _resolve_rubric(rubric: str | None) -> str:
 # the shipped tiers go past 14 (`deep`), and a P-prefix word-boundary
 # matches are uncollidable with English prose.
 _BLIND_LABELS: tuple[str, ...] = (
-    "Alpha", "Beta", "Gamma", "Delta", "Epsilon", "Zeta",
-    "Eta", "Theta", "Iota", "Kappa", "Lambda", "Mu",
+    "Alpha",
+    "Beta",
+    "Gamma",
+    "Delta",
+    "Epsilon",
+    "Zeta",
+    "Eta",
+    "Theta",
+    "Iota",
+    "Kappa",
+    "Lambda",
+    "Mu",
 )
 
 
@@ -145,9 +155,7 @@ def _deblind(text: str, label_to_slug: dict[str, str]) -> str:
     if not label_to_slug:
         return text
     sorted_labels = sorted(label_to_slug, key=len, reverse=True)
-    pattern = re.compile(
-        r"\b(?:" + "|".join(re.escape(lbl) for lbl in sorted_labels) + r")\b"
-    )
+    pattern = re.compile(r"\b(?:" + "|".join(re.escape(lbl) for lbl in sorted_labels) + r")\b")
     return pattern.sub(lambda m: label_to_slug[m.group(0)], text)
 
 
@@ -185,9 +193,7 @@ def _build_input(
         persona = entry.get("persona") or "neutral"
         conf = entry.get("confidence")
         status = entry["status"]
-        label_str = (
-            f"[{label} | persona={persona} | confidence={conf} | status={status}]"
-        )
+        label_str = f"[{label} | persona={persona} | confidence={conf} | status={status}]"
         body = bodies.get(slug, "")
         blocks.append(f"{label_str}\n{body.strip()}")
     parts: list[str] = []
@@ -201,8 +207,7 @@ def _build_input(
     # tokens, so it's worth nudging the synth to use them in prose.
     parts.append(
         "\n\n---\nRESPONSES (panellists are referred to as Alpha, Beta, etc.; "
-        "use these exact labels in your synthesis):\n\n"
-        + "\n\n".join(blocks)
+        "use these exact labels in your synthesis):\n\n" + "\n\n".join(blocks)
     )
     return "".join(parts), label_to_slug
 
@@ -243,16 +248,12 @@ async def synthesise(
     # have no context.json; in that case the prompt is simply omitted
     # and the synthesis proceeds with bodies only (pre-Phase-1 behaviour).
     bundle = context.load_or_none(paths)
-    original_prompt = (
-        bundle.prompt_for_downstream(anonymised=anonymised) if bundle else None
-    )
+    original_prompt = bundle.prompt_for_downstream(anonymised=anonymised) if bundle else None
     # Apply the per-stage input budget — trims the longest bodies first,
     # then the original prompt as a last resort. Silently passing 1MB+
     # of source material to a model with a 200K context would either
     # fail at the API or drop the response, neither of which we want.
-    original_prompt, bodies = context.trim_synth_input(
-        original_prompt=original_prompt, bodies=bodies
-    )
+    original_prompt, bodies = context.trim_synth_input(original_prompt=original_prompt, bodies=bodies)
     synth_input, label_to_slug = _build_input(
         manifest,
         bodies,
@@ -267,9 +268,7 @@ async def synthesise(
     # corresponded to on this call. Cheap on disk and uncomplicates
     # debugging if a de-anonymised synthesis looks wrong.
     if label_to_slug:
-        (paths.root / "blind_map.json").write_text(
-            json.dumps(label_to_slug, indent=2, sort_keys=True)
-        )
+        (paths.root / "blind_map.json").write_text(json.dumps(label_to_slug, indent=2, sort_keys=True))
 
     synth_alias = by_model or registry.default_synthesiser()
     entry = registry.resolve_model(synth_alias)
@@ -302,7 +301,10 @@ async def synthesise(
         # No completion was returned, so there's nothing reliable to price.
         # cost_known=False mirrors the partial-cost convention elsewhere.
         return SynthResult(
-            text=text, cost_usd=0.0, cost_known=False, status=SynthStatus.FAILED,
+            text=text,
+            cost_usd=0.0,
+            cost_known=False,
+            status=SynthStatus.FAILED,
         )
 
     # Look up cost even on the empty-content path: provider billed for the
@@ -334,7 +336,9 @@ async def synthesise(
         )
         (paths.root / "synthesis.md").write_text(text)
         return SynthResult(
-            text=text, cost_usd=cost_value, cost_known=cost_known,
+            text=text,
+            cost_usd=cost_value,
+            cost_known=cost_known,
             status=SynthStatus.FAILED,
         )
     if not content or not content.strip():
@@ -351,7 +355,9 @@ async def synthesise(
         )
         (paths.root / "synthesis.md").write_text(text)
         return SynthResult(
-            text=text, cost_usd=cost_value, cost_known=cost_known,
+            text=text,
+            cost_usd=cost_value,
+            cost_known=cost_known,
             status=SynthStatus.EMPTY,
         )
 
@@ -379,6 +385,8 @@ async def synthesise(
     except Exception as e:  # noqa: BLE001 — augment is best-effort, never load-bearing
         logger.debug("augment_manifest skipped on direct synth: %s", e)
     return SynthResult(
-        text=text, cost_usd=cost_value, cost_known=cost_known,
+        text=text,
+        cost_usd=cost_value,
+        cost_known=cost_known,
         status=SynthStatus.OK,
     )

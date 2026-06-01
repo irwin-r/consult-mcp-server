@@ -89,7 +89,8 @@ once. Do NOT invent labels.
 
 
 def _blocks_for_ranker(
-    others: list[ManifestEntry], bodies: dict[str, str],
+    others: list[ManifestEntry],
+    bodies: dict[str, str],
 ) -> tuple[str, dict[str, str]]:
     """Render the body blocks for a single ranker's view.
 
@@ -133,7 +134,9 @@ async def _ask_one_ranker(
 
     blocks, label_to_slug = _blocks_for_ranker(others, bodies)
     prompt = _PEER_RANK_PROMPT.format(
-        n=len(others), question=question, blocks=blocks,
+        n=len(others),
+        question=question,
+        blocks=blocks,
     )
 
     # Resolve the ranker's model. Prefer model_id (litellm-resolvable)
@@ -144,8 +147,7 @@ async def _ask_one_ranker(
             litellm_id = registry.resolve_model(ranker.slug)["litellm_id"]
         except KeyError:
             logger.warning(
-                "peer_rank: ranker %s has no model_id and slug isn't an "
-                "alias — skipping",
+                "peer_rank: ranker %s has no model_id and slug isn't an alias — skipping",
                 ranker.slug,
             )
             return [], 0.0, True
@@ -161,7 +163,9 @@ async def _ask_one_ranker(
         )
     except Exception as e:  # noqa: BLE001
         logger.warning(
-            "peer_rank: %s rank call failed (%s)", ranker.slug, e,
+            "peer_rank: %s rank call failed (%s)",
+            ranker.slug,
+            e,
         )
         return [], 0.0, False
 
@@ -182,7 +186,8 @@ async def _ask_one_ranker(
     if not isinstance(data, dict):
         logger.warning(
             "peer_rank: %s returned non-JSON ranking; sample=%r",
-            ranker.slug, content[:120].replace("\n", " "),
+            ranker.slug,
+            content[:120].replace("\n", " "),
         )
         return [], cost_value, cost_known
 
@@ -200,12 +205,15 @@ async def _ask_one_ranker(
         if not isinstance(label, str) or label not in label_to_slug:
             logger.warning(
                 "peer_rank: %s emitted unknown/non-string label %r",
-                ranker.slug, label,
+                ranker.slug,
+                label,
             )
             return [], cost_value, cost_known
         if label in seen:
             logger.warning(
-                "peer_rank: %s emitted duplicate label %s", ranker.slug, label,
+                "peer_rank: %s emitted duplicate label %s",
+                ranker.slug,
+                label,
             )
             return [], cost_value, cost_known
         seen.add(label)
@@ -214,7 +222,9 @@ async def _ask_one_ranker(
         # Dropped labels — incomplete ranking
         logger.warning(
             "peer_rank: %s ranked only %d/%d labels",
-            ranker.slug, len(seen), len(label_to_slug),
+            ranker.slug,
+            len(seen),
+            len(label_to_slug),
         )
         return [], cost_value, cost_known
 
@@ -243,9 +253,7 @@ async def peer_rank_run(
     Cost is the sum of all ranker calls; `cost_known=False` if any
     ranker call's price was unknown.
     """
-    usable = [
-        m for m in manifest if m.status in (Status.OK, Status.TRUNCATED)
-    ]
+    usable = [m for m in manifest if m.status in (Status.OK, Status.TRUNCATED)]
     if len(usable) < 2:
         return PeerRanking(ranks=[], per_ranker=[])
 
@@ -254,12 +262,13 @@ async def peer_rank_run(
     async def _one(ranker: ManifestEntry):
         others = [m for m in usable if m.slug != ranker.slug]
         return await _ask_one_ranker(
-            ranker=ranker, others=others, bodies=bodies, question=question,
+            ranker=ranker,
+            others=others,
+            bodies=bodies,
+            question=question,
         )
 
-    results = await asyncio.gather(
-        *(_one(r) for r in usable), return_exceptions=True
-    )
+    results = await asyncio.gather(*(_one(r) for r in usable), return_exceptions=True)
 
     # Borda count: rank-1 ⇒ (N-1) pts, rank-(N-1) ⇒ 0 pts.
     n = len(usable)
@@ -281,7 +290,7 @@ async def peer_rank_run(
         for position, slug in pairs:
             # rank-1 worth most; rank-(N-1) worth 0 (N-1 others ranked, so
             # max points = N-2 for the best, min = 0 for the worst)
-            points[slug] += (n - 1 - position)
+            points[slug] += n - 1 - position
 
     # Sort: highest points first, then lex by slug for stability
     ranked = sorted(points.items(), key=lambda kv: (-kv[1], kv[0]))

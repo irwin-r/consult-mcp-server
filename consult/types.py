@@ -21,6 +21,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+
 # Slug regex shared between ModelSpec input validation and artifacts.py
 # path construction. Module-level so it doesn't collide with Pydantic's
 # private-attribute treatment of class-level underscore names. The leading
@@ -48,9 +49,7 @@ class ModelSpec(StrictModel):
 
     model: str = Field(..., description="Registry alias (e.g. 'gpt-pro') or LiteLLM ID")
     stance: str | None = Field(None, description="Stance key from stances.json or a custom prompt")
-    slug: str | None = Field(
-        None, description="Override slug. Otherwise derived from model + index."
-    )
+    slug: str | None = Field(None, description="Override slug. Otherwise derived from model + index.")
 
     # Slug is interpolated into filesystem paths (`responses/<slug>.txt`)
     # and resource URIs. Reject anything that could escape the artifact
@@ -64,8 +63,7 @@ class ModelSpec(StrictModel):
             return v
         if not _SLUG_RE.fullmatch(v):
             raise ValueError(
-                f"slug {v!r} must match {_SLUG_RE.pattern} "
-                "(no path separators or special characters)"
+                f"slug {v!r} must match {_SLUG_RE.pattern} (no path separators or special characters)"
             )
         return v
 
@@ -86,9 +84,7 @@ class Capsule(StrictModel):
     position: str = Field("", description="One-line summary of stance/conclusion")
     recommendation: str = Field("", description="What the panellist recommends")
     key_points: list[str] = Field(default_factory=list)
-    unique_claims: list[str] = Field(
-        default_factory=list, description="Claims only this panellist made"
-    )
+    unique_claims: list[str] = Field(default_factory=list, description="Claims only this panellist made")
     caveats: list[str] = Field(default_factory=list)
     agrees_with: list[str] = Field(default_factory=list, description="Slugs this agrees with")
     disagrees_with: list[str] = Field(default_factory=list, description="Slugs this disagrees with")
@@ -104,9 +100,7 @@ class Finding(StrictModel):
         None,
         description="(start, end) line range, if known. Use start=end for a single line.",
     )
-    category: Literal[
-        "security", "performance", "correctness", "style", "maintainability", "tests", "docs"
-    ]
+    category: Literal["security", "performance", "correctness", "style", "maintainability", "tests", "docs"]
     summary: str = Field(..., description="≤30 words summarising the finding.")
     suggestion: str = Field("", description="≤30 words on the specific change.")
 
@@ -164,9 +158,7 @@ class ManifestEntry(StrictModel):
     """
 
     slug: str
-    model_id: str | None = Field(
-        None, description="Real model ID. None when blinded, available after audit."
-    )
+    model_id: str | None = Field(None, description="Real model ID. None when blinded, available after audit.")
     persona: str | None = None
     status: Status
     finish_reason: str | None = None
@@ -204,9 +196,7 @@ class ManifestEntry(StrictModel):
     @model_validator(mode="after")
     def _validate_status_payload(self) -> ManifestEntry:
         if self.status in (Status.ERROR, Status.TIMEOUT) and not self.error:
-            raise ValueError(
-                f"ManifestEntry with status={self.status.value} must carry an error message"
-            )
+            raise ValueError(f"ManifestEntry with status={self.status.value} must carry an error message")
         # Cost invariant: cost_usd=None must imply cost_known=False. The
         # opposite (a known cost we couldn't look up) is nonsensical and
         # would silently understate ledger totals — a future code path
@@ -214,9 +204,7 @@ class ManifestEntry(StrictModel):
         # a free call. Catching it at construction prevents the silent
         # misreport from ever landing on disk.
         if self.cost_usd is None and self.cost_known:
-            raise ValueError(
-                "ManifestEntry with cost_usd=None must have cost_known=False"
-            )
+            raise ValueError("ManifestEntry with cost_usd=None must have cost_known=False")
         return self
 
 
@@ -255,9 +243,7 @@ class RunHandle(StrictModel):
         # the unknown in ledger totals. Mirrors `ManifestEntry`'s own cost
         # invariant so the cap-enforcement story is uniform top-down.
         if self.cost_known and any(not m.cost_known for m in self.manifest):
-            raise ValueError(
-                "RunHandle.cost_known=True but a manifest entry has cost_known=False"
-            )
+            raise ValueError("RunHandle.cost_known=True but a manifest entry has cost_known=False")
         return self
 
     def status_counts(self) -> dict[str, int]:
@@ -288,9 +274,7 @@ class RunHandle(StrictModel):
         if self.blinded:
             return True
         # provider extracted from model_id prefix (litellm format) when available
-        providers = {
-            (m.model_id or "").split("/")[0] for m in ok_entries if m.model_id
-        }
+        providers = {(m.model_id or "").split("/")[0] for m in ok_entries if m.model_id}
         providers.discard("")
         return len(providers) >= min_providers
 
@@ -338,9 +322,7 @@ class RunResult(StrictModel):
         # ManifestEntry already enforces cost_usd=None ⇒ cost_known=False;
         # this validator stops the outer result from undoing that.
         if self.cost_known and any(not m.cost_known for m in self.manifest):
-            raise ValueError(
-                "RunResult.cost_known=True but a manifest entry has cost_known=False"
-            )
+            raise ValueError("RunResult.cost_known=True but a manifest entry has cost_known=False")
         return self
 
 
@@ -396,26 +378,20 @@ class ArbiterVerdict(StrictModel):
         # invariant so cost roll-ups in refine don't silently treat
         # arbiter-cost-unknown as zero.
         if self.cost_usd is None and self.cost_known:
-            raise ValueError(
-                "ArbiterVerdict with cost_usd=None must have cost_known=False"
-            )
+            raise ValueError("ArbiterVerdict with cost_usd=None must have cost_known=False")
         # `parsed_ok=False` ⇒ `error is not None`: refine.py drops gaps and
         # aborts the loop on parse failure, but only if an error string
         # carries the reason. Silent parsed_ok=False with no error makes
         # the caller's debugging path much harder.
         if not self.parsed_ok and not self.error:
-            raise ValueError(
-                "ArbiterVerdict.parsed_ok=False requires an error message"
-            )
+            raise ValueError("ArbiterVerdict.parsed_ok=False requires an error message")
         # Per-dimension scores must obey the same [0,1] bounds as the
         # overall score. The arbiter's 1-5 input is rescaled in
         # `_ask_arbiter` before construction, so any out-of-range value
         # here is a constructor bug, not arbiter noise.
         for dim, val in self.dimensions.items():
             if not 0.0 <= val <= 1.0:
-                raise ValueError(
-                    f"ArbiterVerdict.dimensions[{dim!r}]={val} is outside [0,1]"
-                )
+                raise ValueError(f"ArbiterVerdict.dimensions[{dim!r}]={val} is outside [0,1]")
         return self
 
 
@@ -460,7 +436,5 @@ class RefineResult(StrictModel):
             # cost_known=False (price-table miss or call failure), the run
             # total cannot be validated against the cap either.
             if any(not v.cost_known for v in self.verdicts):
-                raise ValueError(
-                    "RefineResult.cost_known=True but an arbiter verdict has cost_known=False"
-                )
+                raise ValueError("RefineResult.cost_known=True but an arbiter verdict has cost_known=False")
         return self

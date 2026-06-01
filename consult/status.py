@@ -98,9 +98,7 @@ def classify(
     # LiteLLM normalises to OpenAI shape. Try the common path first.
     try:
         choice = response.choices[0]
-        finish = getattr(choice, "finish_reason", None) or getattr(
-            choice.message, "finish_reason", None
-        )
+        finish = getattr(choice, "finish_reason", None) or getattr(choice.message, "finish_reason", None)
         body = (choice.message.content or "") if choice.message else ""
     except (AttributeError, IndexError, KeyError):
         return Status.MALFORMED, None, ""

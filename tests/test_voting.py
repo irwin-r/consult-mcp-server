@@ -13,7 +13,11 @@ from consult.voting import manifest_after_medoid, medoid_slugs, panel_disagreeme
 
 
 def _ok_entry(
-    slug: str, model_id: str, position: str, *, key_points: list[str] | None = None,
+    slug: str,
+    model_id: str,
+    position: str,
+    *,
+    key_points: list[str] | None = None,
 ) -> ManifestEntry:
     return ManifestEntry(
         slug=slug,
@@ -117,14 +121,22 @@ def test_manifest_after_medoid_drops_non_medoid_entries_but_keeps_failed_groups(
         _ok_entry("a-2", "anthropic/x", "totally different approach Y"),
         _ok_entry("b-0", "openai/y", "do Z"),
         ManifestEntry(
-            slug="c-0", model_id="google/z", status=Status.ERROR,
-            resource_uri="consult://x/c-0", body_path="/x/c-0",
-            error="auth", capsule=None,
+            slug="c-0",
+            model_id="google/z",
+            status=Status.ERROR,
+            resource_uri="consult://x/c-0",
+            body_path="/x/c-0",
+            error="auth",
+            capsule=None,
         ),
         ManifestEntry(
-            slug="c-1", model_id="google/z", status=Status.TIMEOUT,
-            resource_uri="consult://x/c-1", body_path="/x/c-1",
-            error="timeout", capsule=None,
+            slug="c-1",
+            model_id="google/z",
+            status=Status.TIMEOUT,
+            resource_uri="consult://x/c-1",
+            body_path="/x/c-1",
+            error="timeout",
+            capsule=None,
         ),
     ]
     out = manifest_after_medoid(manifest)
@@ -187,9 +199,17 @@ def test_panel_disagreement_returns_none_for_zero_or_one_usable():
     # Zero usable
     from consult.types import ManifestEntry as M
     from consult.types import Status as S
+
     empty = [
-        M(slug="x-0", model_id="x/a", status=S.ERROR,
-          resource_uri="x", body_path="/x", error="boom", capsule=None),
+        M(
+            slug="x-0",
+            model_id="x/a",
+            status=S.ERROR,
+            resource_uri="x",
+            body_path="/x",
+            error="boom",
+            capsule=None,
+        ),
     ]
     assert panel_disagreement(empty) is None
     # One usable
@@ -224,7 +244,8 @@ def test_medoid_handles_review_capsules():
                 overall_verdict="changes_requested",
                 findings=[
                     Finding(
-                        severity="blocker", category="security",
+                        severity="blocker",
+                        category="security",
                         summary="SQL injection in login",
                         suggestion="use parameterised query",
                     ),
@@ -241,7 +262,8 @@ def test_medoid_handles_review_capsules():
                 overall_verdict="changes_requested",
                 findings=[
                     Finding(
-                        severity="blocker", category="security",
+                        severity="blocker",
+                        category="security",
                         summary="SQL injection in login",
                         suggestion="parameterise the query",
                     ),

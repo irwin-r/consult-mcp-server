@@ -135,8 +135,11 @@ def test_elimination_falls_back_when_panel_has_no_usable_capsules():
     specs = [ModelSpec(model="a"), ModelSpec(model="b"), ModelSpec(model="c")]
     failed_prior = [
         ManifestEntry(
-            slug=f"{m}-{i}.r1", model_id=f"x/{m}", status=Status.ERROR,
-            resource_uri=f"consult://x/{m}", body_path=f"/x/{m}",
+            slug=f"{m}-{i}.r1",
+            model_id=f"x/{m}",
+            status=Status.ERROR,
+            resource_uri=f"consult://x/{m}",
+            body_path=f"/x/{m}",
             error="boom",
         )
         for i, m in enumerate(("a", "b", "c"))

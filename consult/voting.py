@@ -74,9 +74,7 @@ def _feature_string(entry: ManifestEntry) -> str:
         # `severity|category|summary` so two reviews flagging the same
         # issue score high regardless of suggestion phrasing.
         parts = [cap.overall_verdict]
-        parts.extend(
-            f"{f.severity}|{f.category}|{f.summary}" for f in cap.findings
-        )
+        parts.extend(f"{f.severity}|{f.category}|{f.summary}" for f in cap.findings)
     elif isinstance(cap, ResearchCapsule):
         parts = [*cap.claims, *cap.evidence, *cap.uncertainties]
     else:  # pragma: no cover — discriminated union exhausted above
@@ -88,9 +86,7 @@ def _cumulative_similarity(target: str, others: list[str]) -> float:
     """Σ ratio(target, o) for o in others. Empty target ⇒ 0 (always loses)."""
     if not target:
         return 0.0
-    return sum(
-        SequenceMatcher(None, target, o).ratio() for o in others if o
-    )
+    return sum(SequenceMatcher(None, target, o).ratio() for o in others if o)
 
 
 def medoid_slugs(manifest: list[ManifestEntry]) -> dict[tuple[int, str], str]:
@@ -135,7 +131,7 @@ def medoid_slugs(manifest: list[ManifestEntry]) -> dict[tuple[int, str], str]:
         best_slug = ""
         best_score = -1.0
         for i, entry in enumerate(usable):
-            others = features[:i] + features[i + 1:]
+            others = features[:i] + features[i + 1 :]
             score = _cumulative_similarity(features[i], others)
             # Lex-sort by slug as tiebreaker for stability across runs.
             if score > best_score or (score == best_score and entry.slug < best_slug):
@@ -144,7 +140,10 @@ def medoid_slugs(manifest: list[ManifestEntry]) -> dict[tuple[int, str], str]:
         out[key] = best_slug
         logger.debug(
             "medoid for %s (%d candidates): %s (score=%.3f)",
-            key, len(usable), best_slug, best_score,
+            key,
+            len(usable),
+            best_slug,
+            best_score,
         )
     return out
 
@@ -170,17 +169,13 @@ def panel_disagreement(manifest: list[ManifestEntry]) -> float | None:
     ⇒ flagship synth earns its cost. The metric is also exposed on
     `RunResult.disagreement` so callers can route on it themselves.
     """
-    features = [
-        _feature_string(e) for e in manifest if _feature_string(e)
-    ]
+    features = [_feature_string(e) for e in manifest if _feature_string(e)]
     if len(features) < 2:
         return None
     sims: list[float] = []
     for i in range(len(features)):
         for j in range(i + 1, len(features)):
-            sims.append(
-                SequenceMatcher(None, features[i], features[j]).ratio()
-            )
+            sims.append(SequenceMatcher(None, features[i], features[j]).ratio())
     mean_sim = sum(sims) / len(sims)
     # Clamp into [0, 1] to absorb floating-point drift on near-identical
     # capsules where mean_sim could end up at 1.0000000002 or similar.

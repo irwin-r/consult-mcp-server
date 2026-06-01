@@ -25,9 +25,7 @@ logger = logging.getLogger(__name__)
 ProgressCallback = Callable[[ProgressEvent], Awaitable[None]]
 
 
-async def _safe_emit(
-    cb: ProgressCallback | None, event: ProgressEvent
-) -> None:
+async def _safe_emit(cb: ProgressCallback | None, event: ProgressEvent) -> None:
     """Emit a progress event, swallowing any callback exception.
 
     Progress is best-effort: a notification failure (closed transport,
@@ -140,13 +138,8 @@ async def consult(
     `partial_reason` set — same shape as the success path so callers
     can branch on the flag rather than the envelope.
     """
-    if gate_synth_at_agreement is not None and not (
-        0.0 <= gate_synth_at_agreement <= 1.0
-    ):
-        raise ValueError(
-            f"gate_synth_at_agreement must be in [0,1] or None; got "
-            f"{gate_synth_at_agreement!r}"
-        )
+    if gate_synth_at_agreement is not None and not (0.0 <= gate_synth_at_agreement <= 1.0):
+        raise ValueError(f"gate_synth_at_agreement must be in [0,1] or None; got {gate_synth_at_agreement!r}")
     tier_models = registry.resolve_tier(tier)
     roles = roles or {}
     synth_alias = synthesiser or registry.default_synthesiser()
@@ -193,9 +186,7 @@ async def consult(
             cost_known=handle.cost_known,
             wall_ms=handle.wall_ms,
             partial=True,
-            partial_reason=(
-                handle.partial_reason or "no panellists returned usable responses"
-            ),
+            partial_reason=(handle.partial_reason or "no panellists returned usable responses"),
             synthesiser=synth_alias,
         )
 
@@ -229,9 +220,7 @@ async def consult(
         paths = artifacts.load_run(handle.run_id)
         synth_text = _deterministic_aggregate(handle.manifest, disagreement or 0.0)
         (paths.root / "synthesis.md").write_text(synth_text)
-        await _safe_emit(
-            on_progress, SynthCompleted(done=overall_total, total=overall_total)
-        )
+        await _safe_emit(on_progress, SynthCompleted(done=overall_total, total=overall_total))
         total_cost = handle.cost_usd
         total_cost_known = handle.cost_known
         await artifacts.aaugment_manifest(
@@ -255,18 +244,14 @@ async def consult(
 
     # The outer total was sized for fanout + capsules + synth, so synth's
     # `done` starts at the synth offset regardless of whether capsules ran.
-    await _safe_emit(
-        on_progress, SynthStarted(done=synth_offset, total=overall_total)
-    )
+    await _safe_emit(on_progress, SynthStarted(done=synth_offset, total=overall_total))
     synth_result = await synth.synthesise(
         handle.run_id,
         by_model=synth_alias,
         anonymised=blinded,
         rubric=rubric,
     )
-    await _safe_emit(
-        on_progress, SynthCompleted(done=overall_total, total=overall_total)
-    )
+    await _safe_emit(on_progress, SynthCompleted(done=overall_total, total=overall_total))
 
     # Roll synth spend into the run total. The synthesiser is often the most
     # expensive call (flagship + big context), so omitting it silently

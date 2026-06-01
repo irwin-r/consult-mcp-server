@@ -64,11 +64,14 @@ async def test_call_cli_returns_litellm_shape_on_success(monkeypatch):
 
     monkeypatch.setattr(_FakeProc, "communicate", patched_communicate)
     monkeypatch.setattr(
-        "consult.cli_executor.asyncio.create_subprocess_exec", fake_exec,
+        "consult.cli_executor.asyncio.create_subprocess_exec",
+        fake_exec,
     )
 
     resp = await cli_executor.call_cli(
-        ["gemini", "--yolo"], "please summarise X", timeout=30.0,
+        ["gemini", "--yolo"],
+        "please summarise X",
+        timeout=30.0,
     )
     # argv must be the registry-configured command, no shell interpolation
     assert captured_argv["argv"] == ["gemini", "--yolo"]
@@ -87,7 +90,8 @@ async def test_call_cli_nonzero_exit_raises_with_stderr(monkeypatch):
         return _FakeProc(stdout=b"", stderr=b"auth required", returncode=2)
 
     monkeypatch.setattr(
-        "consult.cli_executor.asyncio.create_subprocess_exec", fake_exec,
+        "consult.cli_executor.asyncio.create_subprocess_exec",
+        fake_exec,
     )
 
     with pytest.raises(RuntimeError, match="exited 2"):
@@ -103,6 +107,7 @@ async def test_call_cli_timeout_kills_the_child(monkeypatch):
     timed_out_proc = _FakeProc(
         raise_communicate=None,  # we won't reach the body
     )
+
     # Patch communicate to actually hang forever
     async def hang(self, input=None):
         await asyncio.sleep(10)
@@ -113,7 +118,8 @@ async def test_call_cli_timeout_kills_the_child(monkeypatch):
         return timed_out_proc
 
     monkeypatch.setattr(
-        "consult.cli_executor.asyncio.create_subprocess_exec", fake_exec,
+        "consult.cli_executor.asyncio.create_subprocess_exec",
+        fake_exec,
     )
 
     with pytest.raises(asyncio.TimeoutError):
@@ -159,10 +165,12 @@ async def test_runner_dispatches_cli_provider(monkeypatch, tmp_path):
         captured_argv["argv"] = cli_command
         captured_argv["prompt"] = prompt
         return SimpleNamespace(
-            choices=[SimpleNamespace(
-                message=SimpleNamespace(content="cli body output"),
-                finish_reason="stop",
-            )],
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content="cli body output"),
+                    finish_reason="stop",
+                )
+            ],
             usage=SimpleNamespace(prompt_tokens=None, completion_tokens=None),
         )
 

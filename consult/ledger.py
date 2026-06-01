@@ -110,9 +110,7 @@ def _parse_arg(arg: str | None) -> date:
     try:
         return datetime.strptime(arg, "%Y-%m-%d").date()
     except ValueError as e:
-        raise SystemExit(
-            f"consult-ledger: bad date {arg!r}; expected YYYY-MM-DD or 'today'"
-        ) from e
+        raise SystemExit(f"consult-ledger: bad date {arg!r}; expected YYYY-MM-DD or 'today'") from e
 
 
 def cli() -> None:
@@ -121,9 +119,7 @@ def cli() -> None:
         prog="consult-ledger",
         description="Aggregate consult runs for a given day into a JSON ledger.",
     )
-    parser.add_argument(
-        "--version", action="version", version=f"consult-ledger {__version__}"
-    )
+    parser.add_argument("--version", action="version", version=f"consult-ledger {__version__}")
     parser.add_argument(
         "date",
         nargs="?",

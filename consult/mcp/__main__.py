@@ -38,9 +38,7 @@ def cli() -> None:
         prog="consult-mcp",
         description="Multi-model panel consultation MCP server (stdio transport).",
     )
-    parser.add_argument(
-        "--version", action="version", version=f"consult-mcp {__version__}"
-    )
+    parser.add_argument("--version", action="version", version=f"consult-mcp {__version__}")
     parser.add_argument(
         "--check",
         action="store_true",
@@ -52,6 +50,7 @@ def cli() -> None:
 
     if args.check:
         from ..doctor import quick_check
+
         sys.exit(quick_check())
 
     configure_litellm()

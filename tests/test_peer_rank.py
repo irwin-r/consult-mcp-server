@@ -26,6 +26,7 @@ def _entry(slug: str, model_id: str) -> ManifestEntry:
 
 def _fake_response(payload: dict):
     """Synthesise a litellm completion-like object."""
+
     class _Choice:
         def __init__(self, text):
             self.message = type("M", (), {"content": text})()
@@ -59,16 +60,11 @@ async def test_peer_rank_borda_aggregates_per_ranker_contributions(monkeypatch):
     # label they'd see (per-ranker shuffle), so we capture the label_to_slug
     # mapping by mocking `_blocks_for_ranker` to a deterministic order.
     monkeypatch.setattr(
-        peer_rank_mod, "_blocks_for_ranker",
+        peer_rank_mod,
+        "_blocks_for_ranker",
         lambda others, bodies: (
-            "\n\n".join(
-                f"[{['Alpha', 'Beta', 'Gamma'][i]}]\n{bodies[e.slug]}"
-                for i, e in enumerate(others)
-            ),
-            {
-                label: entry.slug
-                for label, entry in zip(["Alpha", "Beta", "Gamma"], others, strict=False)
-            },
+            "\n\n".join(f"[{['Alpha', 'Beta', 'Gamma'][i]}]\n{bodies[e.slug]}" for i, e in enumerate(others)),
+            {label: entry.slug for label, entry in zip(["Alpha", "Beta", "Gamma"], others, strict=False)},
         ),
     )
 
@@ -81,7 +77,8 @@ async def test_peer_rank_borda_aggregates_per_ranker_contributions(monkeypatch):
         return _fake_response({"ranking": ["Alpha", "Beta"]})
 
     monkeypatch.setattr(
-        "consult.peer_rank.litellm.acompletion", fake_acompletion,
+        "consult.peer_rank.litellm.acompletion",
+        fake_acompletion,
     )
     monkeypatch.setattr(
         "consult.peer_rank.litellm.completion_cost",
@@ -112,16 +109,11 @@ async def test_peer_rank_skips_failed_rankers(monkeypatch):
     bodies = {"a": "A", "b": "B", "c": "C"}
 
     monkeypatch.setattr(
-        peer_rank_mod, "_blocks_for_ranker",
+        peer_rank_mod,
+        "_blocks_for_ranker",
         lambda others, bodies: (
-            "\n\n".join(
-                f"[{['Alpha', 'Beta', 'Gamma'][i]}]\n{bodies[e.slug]}"
-                for i, e in enumerate(others)
-            ),
-            {
-                label: entry.slug
-                for label, entry in zip(["Alpha", "Beta", "Gamma"], others, strict=False)
-            },
+            "\n\n".join(f"[{['Alpha', 'Beta', 'Gamma'][i]}]\n{bodies[e.slug]}" for i, e in enumerate(others)),
+            {label: entry.slug for label, entry in zip(["Alpha", "Beta", "Gamma"], others, strict=False)},
         ),
     )
 
@@ -157,16 +149,11 @@ async def test_peer_rank_rejects_incomplete_ranking(monkeypatch):
     bodies = {"a": "A", "b": "B", "c": "C"}
 
     monkeypatch.setattr(
-        peer_rank_mod, "_blocks_for_ranker",
+        peer_rank_mod,
+        "_blocks_for_ranker",
         lambda others, bodies: (
-            "\n\n".join(
-                f"[{['Alpha', 'Beta', 'Gamma'][i]}]\n{bodies[e.slug]}"
-                for i, e in enumerate(others)
-            ),
-            {
-                label: entry.slug
-                for label, entry in zip(["Alpha", "Beta", "Gamma"], others, strict=False)
-            },
+            "\n\n".join(f"[{['Alpha', 'Beta', 'Gamma'][i]}]\n{bodies[e.slug]}" for i, e in enumerate(others)),
+            {label: entry.slug for label, entry in zip(["Alpha", "Beta", "Gamma"], others, strict=False)},
         ),
     )
 
@@ -204,24 +191,22 @@ async def test_peer_rank_filters_failed_panellists(monkeypatch):
         _entry("a", "x/a"),
         _entry("b", "x/b"),
         ManifestEntry(
-            slug="c", model_id="x/c", status=Status.ERROR,
-            resource_uri="x", body_path="/x/c",
+            slug="c",
+            model_id="x/c",
+            status=Status.ERROR,
+            resource_uri="x",
+            body_path="/x/c",
             error="boom",
         ),
     ]
     bodies = {"a": "A", "b": "B"}
 
     monkeypatch.setattr(
-        peer_rank_mod, "_blocks_for_ranker",
+        peer_rank_mod,
+        "_blocks_for_ranker",
         lambda others, bodies: (
-            "\n\n".join(
-                f"[{['Alpha', 'Beta'][i]}]\n{bodies[e.slug]}"
-                for i, e in enumerate(others)
-            ),
-            {
-                label: entry.slug
-                for label, entry in zip(["Alpha", "Beta"], others, strict=False)
-            },
+            "\n\n".join(f"[{['Alpha', 'Beta'][i]}]\n{bodies[e.slug]}" for i, e in enumerate(others)),
+            {label: entry.slug for label, entry in zip(["Alpha", "Beta"], others, strict=False)},
         ),
     )
 

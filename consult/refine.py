@@ -137,6 +137,7 @@ Now give your refined answer to the original question, addressing the \
 weakest dimensions and the gaps. Be concrete; don't simply restate the \
 prior position."""
 
+
 def _capsule_summary(cap: Capsule | ReviewCapsule | ResearchCapsule) -> str:
     """One-line summary of any capsule kind. Used in arbiter prompts where
     a position-like signal is needed regardless of `capsule_kind`."""
@@ -187,10 +188,7 @@ def _capsule_detail(cap: Capsule | ReviewCapsule | ResearchCapsule) -> str:
         return "\n".join(parts) or "  (no claims extracted)"
     # Decision capsule
     bullets = "; ".join(cap.key_points[:3]) if cap.key_points else "(no key points)"
-    return (
-        f"  recommendation: {cap.recommendation}\n"
-        f"  key_points: {bullets}"
-    )
+    return f"  recommendation: {cap.recommendation}\n  key_points: {bullets}"
 
 
 def _shuffled(manifest: list[ManifestEntry]) -> list[ManifestEntry]:
@@ -220,9 +218,7 @@ def _format_capsules(manifest: list[ManifestEntry]) -> str:
             lines.append(f"- {m.slug}: (no capsule extracted)")
             continue
         conf = f" conf={c.confidence:.2f}" if c.confidence is not None else ""
-        lines.append(
-            f"- {m.slug}{conf}: {_capsule_summary(c)}\n{_capsule_detail(c)}"
-        )
+        lines.append(f"- {m.slug}{conf}: {_capsule_summary(c)}\n{_capsule_detail(c)}")
     return "\n".join(lines)
 
 
@@ -259,9 +255,7 @@ def _format_position_diff(
 
     def _by_base(manifest: list[ManifestEntry]) -> dict[str, ManifestEntry]:
         return {
-            _base_slug(m.slug): m
-            for m in manifest
-            if m.capsule and m.status in (Status.OK, Status.TRUNCATED)
+            _base_slug(m.slug): m for m in manifest if m.capsule and m.status in (Status.OK, Status.TRUNCATED)
         }
 
     prior_by_base = _by_base(prior)
@@ -277,11 +271,7 @@ def _format_position_diff(
             if old_summary == cur_summary:
                 lines.append(f"- {base}: unchanged — {cur_summary}")
             else:
-                lines.append(
-                    f"- {base}:\n"
-                    f"    before: {old_summary}\n"
-                    f"    after:  {cur_summary}"
-                )
+                lines.append(f"- {base}:\n    before: {old_summary}\n    after:  {cur_summary}")
         else:
             lines.append(f"- {base} (new this round): {cur_summary}")
     # Surface panellists that dropped out this round — their disappearance
@@ -289,9 +279,7 @@ def _format_position_diff(
     # are missing this round so consensus is weaker than it looks").
     for base, old in prior_by_base.items():
         if base not in current_by_base and old.capsule:
-            lines.append(
-                f"- {base} (dropped this round, last position): {_capsule_summary(old.capsule)}"
-            )
+            lines.append(f"- {base} (dropped this round, last position): {_capsule_summary(old.capsule)}")
     return "\n".join(lines) or "(no comparable positions)"
 
 
@@ -399,9 +387,7 @@ async def _ask_arbiter(
     # exception string; the next round's prompt would silently include it)
     data = extract_json(text)
     if data is None:
-        logger.warning(
-            "arbiter returned non-JSON; sample=%r", text[:120].replace("\n", " ")
-        )
+        logger.warning("arbiter returned non-JSON; sample=%r", text[:120].replace("\n", " "))
         return ArbiterVerdict(
             round=round_num,
             score=0.0,
@@ -436,9 +422,7 @@ async def _ask_arbiter(
     dimension_notes_raw = data.get("dimension_notes")
     dimension_notes: dict[str, str] = {}
     if isinstance(dimension_notes_raw, dict):
-        dimension_notes = {
-            str(k): str(v) for k, v in dimension_notes_raw.items() if v
-        }
+        dimension_notes = {str(k): str(v) for k, v in dimension_notes_raw.items() if v}
 
     if dimensions_normalised:
         score = sum(dimensions_normalised.values()) / len(dimensions_normalised)
@@ -489,15 +473,11 @@ def _suffix_specs(specs: list[ModelSpec], round_num: int) -> list[ModelSpec]:
         # the `:` straight into the slug and trip ModelSpec's safe-id
         # field validator. User-supplied slugs are already constrained.
         base = s.slug or runner.sanitise_derived_slug(s.model.split("/")[-1].lower())
-        out.append(
-            ModelSpec(model=s.model, stance=s.stance, slug=f"{base}-{i}.r{round_num}")
-        )
+        out.append(ModelSpec(model=s.model, stance=s.stance, slug=f"{base}-{i}.r{round_num}"))
     return out
 
 
-def _apply_continuation(
-    prompt: str, continuation_id: str | None
-) -> tuple[str, list[dict[str, Any]] | None]:
+def _apply_continuation(prompt: str, continuation_id: str | None) -> tuple[str, list[dict[str, Any]] | None]:
     """Resolve the continuation and split it from the follow-up prompt.
 
     Returns `(prompt_for_storage, prior_turns)`:
@@ -746,16 +726,18 @@ async def refine(
         # clobber the prior round's manifest because we share `paths`.
         fanout_cost_input = round_prompt
         if prior_turns:
-            fanout_cost_input = (
-                runner.concat_turn_text(prior_turns) + "\n" + round_prompt
-            )
+            fanout_cost_input = runner.concat_turn_text(prior_turns) + "\n" + round_prompt
         fanout_est, fanout_known = await runner.aestimate_cost(
-            round_base_specs, fanout_cost_input, capsule_kind=resolved_kind,
+            round_base_specs,
+            fanout_cost_input,
+            capsule_kind=resolved_kind,
         )
         # Arbiter call has its own hardcoded max_completion_tokens=2000 (see _ask_arbiter);
         # "decision" matches that budget so the estimate is honest.
         arbiter_est, arbiter_known = await runner.aestimate_cost(
-            [arbiter_spec], round_prompt, capsule_kind="decision",
+            [arbiter_spec],
+            round_prompt,
+            capsule_kind="decision",
         )
         estimate = fanout_est + arbiter_est
         est_known = fanout_known and arbiter_known
@@ -807,7 +789,10 @@ async def refine(
             max_run_usd=cap - cumulative_cost,
             existing_paths=paths,
             on_progress=progress_mod.make_phase_cb(
-                emit if on_progress else None, round_base, progress_total, progress_done,
+                emit if on_progress else None,
+                round_base,
+                progress_total,
+                progress_done,
             ),
             # Round 1 uses the global continuation; round 2+ uses the
             # per-slug accumulated history.
@@ -829,9 +814,7 @@ async def refine(
             cumulative_cost += handle.cost_usd
             if not handle.cost_known:
                 cost_all_known = False
-            partial_reason = (
-                f"round {round_num} fanout partial: {handle.partial_reason}"
-            )
+            partial_reason = f"round {round_num} fanout partial: {handle.partial_reason}"
             break
         final_manifest = handle.manifest
 
@@ -887,10 +870,14 @@ async def refine(
             arbiter_question, round_num, handle.manifest, arbiter_alias, prior_manifest
         )
         progress_done[0] = round_base + panel_n * 2 + 1
-        await emit(progress_mod.ArbiterScored(
-            done=progress_done[0], total=progress_total,
-            round=round_num, score=verdict.score,
-        ))
+        await emit(
+            progress_mod.ArbiterScored(
+                done=progress_done[0],
+                total=progress_total,
+                round=round_num,
+                score=verdict.score,
+            )
+        )
         verdicts.append(verdict)
         # `is not None` rather than truthy: a successful arbiter call that
         # returned a $0.00 cost is semantically different from no-cost-known.
@@ -927,9 +914,7 @@ async def refine(
             # in `prior_turns`, not in this user turn — duplicating it
             # would dilute the model's attention on the actual question.
             base_q = followup_only if prior_turns else prompt
-            round_prompt = _build_refinement_prompt(
-                base_q, round_num + 1, handle.manifest, verdict
-            )
+            round_prompt = _build_refinement_prompt(base_q, round_num + 1, handle.manifest, verdict)
         # Snapshot for the next round's arbiter position-diff. Updated
         # after the verdict so an aborted round (parse failure above)
         # leaves prior_manifest pointing at the last fully-scored round.

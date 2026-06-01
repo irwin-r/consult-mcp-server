@@ -87,12 +87,14 @@ def _summarise_manifest(manifest: list[dict[str, Any]]) -> dict[str, Any]:
             reason = "extractor returned no findings"
         else:
             reason = status
-        no_value.append({
-            "slug": e.get("slug"),
-            "status": status,
-            "finish_reason": finish,
-            "reason": reason[:200],
-        })
+        no_value.append(
+            {
+                "slug": e.get("slug"),
+                "status": status,
+                "finish_reason": finish,
+                "reason": reason[:200],
+            }
+        )
     return {
         "panellists": len(manifest),
         "status_counts": dict(status_counts),
@@ -131,9 +133,7 @@ def _augment_result(result: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-async def panel(
-    args: dict[str, Any], *, on_progress: ProgressCallback | None = None
-) -> dict[str, Any]:
+async def panel(args: dict[str, Any], *, on_progress: ProgressCallback | None = None) -> dict[str, Any]:
     prompt = attachments.inline_attachments(args["prompt"], args.get("attachments"))
     specs = _specs_from_args(args["models"])
     kind = args.get("capsule_kind", "decision")
@@ -153,9 +153,7 @@ async def panel(
     return result if args.get("dry_run", False) else _augment_result(result)
 
 
-async def synthesise(
-    args: dict[str, Any], *, on_progress: ProgressCallback | None = None
-) -> str:
+async def synthesise(args: dict[str, Any], *, on_progress: ProgressCallback | None = None) -> str:
     # Synth's output is a markdown blob. The MCP server wraps the returned
     # string in `TextContent` so clients render it directly; the handler
     # itself stays MCP-free. `on_progress` is accepted for signature
@@ -180,9 +178,7 @@ async def synthesise(
     return text
 
 
-async def consult(
-    args: dict[str, Any], *, on_progress: ProgressCallback | None = None
-) -> dict[str, Any]:
+async def consult(args: dict[str, Any], *, on_progress: ProgressCallback | None = None) -> dict[str, Any]:
     # Attachments are forwarded raw to `orchestrate.consult`, which inlines
     # them itself. Two reasons not to pre-inline here: (1) library consumers
     # get the same convenience without re-importing `attachments`, and (2)
@@ -205,9 +201,7 @@ async def consult(
     return _augment_result(result.model_dump())
 
 
-async def sequence(
-    args: dict[str, Any], *, on_progress: ProgressCallback | None = None
-) -> dict[str, Any]:
+async def sequence(args: dict[str, Any], *, on_progress: ProgressCallback | None = None) -> dict[str, Any]:
     # Each step gets its own inlined-attachments prompt. The top-level
     # `attachments` is the default for every step; a step that's an object
     # can supply its own `attachments` to override (per-step source material
@@ -236,9 +230,7 @@ async def sequence(
     return _augment_result(result.model_dump())
 
 
-async def refine(
-    args: dict[str, Any], *, on_progress: ProgressCallback | None = None
-) -> dict[str, Any]:
+async def refine(args: dict[str, Any], *, on_progress: ProgressCallback | None = None) -> dict[str, Any]:
     prompt = attachments.inline_attachments(args["prompt"], args.get("attachments"))
     specs = _specs_from_args(args["models"])
     result = await refine_mod.refine(

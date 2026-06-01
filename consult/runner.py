@@ -78,6 +78,7 @@ def configure_litellm() -> None:
     logging.getLogger("LiteLLM").propagate = False
     _LITELLM_CONFIGURED = True
 
+
 # CONTRACT: capsule.py:_CONFIDENCE and the capsule extractor prompt depend on
 # these exact line prefixes (`CONFIDENCE:` and `KEY_REASON:`). Don't rename
 # either without updating both.
@@ -143,9 +144,7 @@ def expand_specs(specs: list[ModelSpec]) -> list[ModelSpec]:
         base, count_str = m.group(1), m.group(2)
         count = int(count_str)
         if count < 1:
-            raise ValueError(
-                f"model:count must be ≥1 (got {spec.model!r})"
-            )
+            raise ValueError(f"model:count must be ≥1 (got {spec.model!r})")
         # When an explicit slug is set and count > 1, suffix each copy with
         # its index. Without this all N copies share the same slug, race to
         # write to the same `responses/<slug>.txt`, and N-1 responses are
@@ -164,6 +163,7 @@ def _rate_limit_class() -> type[BaseException]:
     """
     try:
         from litellm import exceptions as lex
+
         cls = getattr(lex, "RateLimitError", None)
         if cls is not None:
             return cls
@@ -235,9 +235,9 @@ _RETRY_BASE_DELAY_S = 2.0
 # entry as soon as the loop is garbage-collected.
 import weakref  # noqa: E402
 
-_provider_sems_by_loop: weakref.WeakKeyDictionary[
-    asyncio.AbstractEventLoop, dict[str, asyncio.Semaphore]
-] = weakref.WeakKeyDictionary()
+_provider_sems_by_loop: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, dict[str, asyncio.Semaphore]] = (
+    weakref.WeakKeyDictionary()
+)
 
 
 def _get_provider_sems() -> dict[str, asyncio.Semaphore]:
@@ -282,26 +282,18 @@ async def _acompletion_with_retry(*, timeout: float, **kwargs: Any) -> Any:
     transient_classes = _transient_error_classes()
     bare_api_cls = _bare_api_error_class()
     retriable: tuple[type[BaseException], ...] = (rate_cls, *transient_classes)
-    max_attempts = max(
-        1, int(os.environ.get("CONSULT_RETRY_MAX_ATTEMPTS", _RETRY_MAX_ATTEMPTS))
-    )
-    base_delay = float(
-        os.environ.get("CONSULT_RETRY_BASE_DELAY", _RETRY_BASE_DELAY_S)
-    )
+    max_attempts = max(1, int(os.environ.get("CONSULT_RETRY_MAX_ATTEMPTS", _RETRY_MAX_ATTEMPTS)))
+    base_delay = float(os.environ.get("CONSULT_RETRY_BASE_DELAY", _RETRY_BASE_DELAY_S))
     model_label = kwargs.get("model", "?")
 
     start = time.monotonic()
     for attempt in range(max_attempts):
         remaining = timeout - (time.monotonic() - start)
         if remaining <= 0:
-            raise TimeoutError(
-                f"retry budget exhausted before attempt {attempt + 1}"
-            )
+            raise TimeoutError(f"retry budget exhausted before attempt {attempt + 1}")
         last_exc: BaseException
         try:
-            return await asyncio.wait_for(
-                litellm.acompletion(**kwargs), timeout=remaining
-            )
+            return await asyncio.wait_for(litellm.acompletion(**kwargs), timeout=remaining)
         except retriable as e:
             # Rate-limit or known transient subclass.
             last_exc = e
@@ -314,7 +306,7 @@ async def _acompletion_with_retry(*, timeout: float, **kwargs: Any) -> Any:
             last_exc = e
         if attempt == max_attempts - 1:
             raise last_exc
-        delay = base_delay * (2 ** attempt) * (0.5 + random.random())
+        delay = base_delay * (2**attempt) * (0.5 + random.random())
         remaining_after = timeout - (time.monotonic() - start)
         # Leave a 0.5s margin so the next attempt has time to start.
         sleep_for = min(delay, remaining_after - 0.5)
@@ -323,8 +315,12 @@ async def _acompletion_with_retry(*, timeout: float, **kwargs: Any) -> Any:
         kind = "rate-limited" if isinstance(last_exc, rate_cls) else "transient API error"
         logger.warning(
             "%s on %s attempt %d/%d (%s); retry in %.2fs",
-            kind, model_label, attempt + 1, max_attempts,
-            type(last_exc).__name__, sleep_for,
+            kind,
+            model_label,
+            attempt + 1,
+            max_attempts,
+            type(last_exc).__name__,
+            sleep_for,
         )
         await asyncio.sleep(sleep_for)
     # Unreachable — the loop either returns or raises above.
@@ -447,12 +443,12 @@ def build_messages(
     """
     turns: list[dict[str, Any]] = list(prior_turns) if prior_turns else []
     if provider == "anthropic":
-        turns.append({
-            "role": "user",
-            "content": [
-                {"type": "text", "text": prompt, "cache_control": {"type": "ephemeral"}}
-            ],
-        })
+        turns.append(
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": prompt, "cache_control": {"type": "ephemeral"}}],
+            }
+        )
     else:
         turns.append({"role": "user", "content": prompt})
     return turns
@@ -528,11 +524,7 @@ _STREAM_PARTIAL_INTERVAL_S_DEFAULT = 1.0
 
 def _stream_partial_interval_s() -> float:
     """Read at call time so test monkeypatching of the env var works."""
-    return float(
-        os.environ.get(
-            "CONSULT_STREAM_PARTIAL_INTERVAL_S", _STREAM_PARTIAL_INTERVAL_S_DEFAULT
-        )
-    )
+    return float(os.environ.get("CONSULT_STREAM_PARTIAL_INTERVAL_S", _STREAM_PARTIAL_INTERVAL_S_DEFAULT))
 
 
 def _max_input_tokens(litellm_id: str, entry: dict[str, Any]) -> int | None:
@@ -559,7 +551,8 @@ def _max_input_tokens(litellm_id: str, entry: dict[str, Any]) -> int | None:
         except (TypeError, ValueError):
             logger.warning(
                 "registry max_input_tokens for %s is not an int: %r",
-                litellm_id, override,
+                litellm_id,
+                override,
             )
     try:
         info = litellm.get_model_info(litellm_id)
@@ -627,7 +620,7 @@ def _replace_attachments_with_stubs(
         if stub_len >= block_len:
             continue  # would grow the prompt
         dropped.add(idx)
-        current_chars -= (block_len - stub_len)
+        current_chars -= block_len - stub_len
 
     if not dropped:
         return prompt
@@ -635,13 +628,16 @@ def _replace_attachments_with_stubs(
     parts: list[str] = []
     last_end = 0
     for i, (block, name) in enumerate(named):
-        parts.append(prompt[last_end:block.start])
-        parts.append(_stub(block, name) if i in dropped else prompt[block.start:block.end])
+        parts.append(prompt[last_end : block.start])
+        parts.append(_stub(block, name) if i in dropped else prompt[block.start : block.end])
         last_end = block.end
     parts.append(prompt[last_end:])
     logger.info(
         "attachment-aware trim: dropped %d/%d blocks (%d chars → ~%d chars)",
-        len(dropped), len(named), len(prompt), current_chars,
+        len(dropped),
+        len(named),
+        len(prompt),
+        current_chars,
     )
     return "".join(parts)
 
@@ -690,9 +686,13 @@ async def _fit_prompt_to_context(
         # token_counter is sync + CPU-bound; offload so we don't block the
         # event loop during the pre-flight check.
         try:
-            return int(await asyncio.to_thread(
-                litellm.token_counter, model=litellm_id, text=text,
-            ))
+            return int(
+                await asyncio.to_thread(
+                    litellm.token_counter,
+                    model=litellm_id,
+                    text=text,
+                )
+            )
         except Exception:  # noqa: BLE001
             return -1  # unknown — caller treats as "skip the check"
 
@@ -707,7 +707,8 @@ async def _fit_prompt_to_context(
         logger.warning(
             "fit_prompt: prior_turns alone (%d tokens) exceed available input "
             "budget (%d). Returning prompt untrimmed; provider will reject.",
-            prior_tokens, target_input,
+            prior_tokens,
+            target_input,
         )
         return per_slug_prompt, 0
 
@@ -727,7 +728,9 @@ async def _fit_prompt_to_context(
     if paths is not None:
         avail_chars = available_for_prompt * 4
         shrunk = _replace_attachments_with_stubs(
-            per_slug_prompt, paths, avail_chars,
+            per_slug_prompt,
+            paths,
+            avail_chars,
         )
         if shrunk is not per_slug_prompt:
             per_slug_prompt = shrunk
@@ -751,7 +754,9 @@ async def _fit_prompt_to_context(
             # we have and let the provider reject (or accept) the call.
             break
         trimmed = context.trim_text(
-            trimmed, target_chars, label="panellist prompt",
+            trimmed,
+            target_chars,
+            label="panellist prompt",
         )
         prompt_tokens = await _count(trimmed)
         if prompt_tokens < 0 or prompt_tokens <= available_for_prompt:
@@ -820,8 +825,7 @@ async def _stream_acompletion(
         return litellm.stream_chunk_builder(chunks, messages=kwargs.get("messages"))
     except Exception as e:
         raise RuntimeError(
-            f"stream_chunk_builder failed after {len(chunks)} chunks: "
-            f"{type(e).__name__}: {e}"
+            f"stream_chunk_builder failed after {len(chunks)} chunks: {type(e).__name__}: {e}"
         ) from e
 
 
@@ -972,11 +976,11 @@ async def _call_one(
                     # covers usage); per-provider semaphore still applies
                     # if the registry configures one for "cli".
                     from . import cli_executor
+
                     cli_command = entry.get("cli_command") or []
                     if not cli_command:
                         raise ValueError(
-                            f"CLI provider for {spec.model!r} has no "
-                            "cli_command in the registry entry"
+                            f"CLI provider for {spec.model!r} has no cli_command in the registry entry"
                         )
                     resp = await cli_executor.call_cli(
                         cli_command,
@@ -1008,9 +1012,7 @@ async def _call_one(
                 raw = resp.model_dump()  # type: ignore[attr-defined]
             except AttributeError:
                 raw = dict(resp) if hasattr(resp, "__iter__") else {"_repr": repr(resp)}
-            await _write_text_async(
-                paths.response_raw(slug), json.dumps(raw, indent=2, default=str)
-            )
+            await _write_text_async(paths.response_raw(slug), json.dumps(raw, indent=2, default=str))
 
             status, finish, body = classify(resp)
             usage = getattr(resp, "usage", None)
@@ -1301,6 +1303,7 @@ async def fanout(
         cost_input = concat_turn_text(prior_turns) + "\n" + prompt
     estimate, all_known = await aestimate_cost(specs, cost_input, capsule_kind=capsule_kind)
     cap = max_run_usd if max_run_usd is not None else registry.default_max_run_usd()
+
     # Don't clobber an existing manifest with the empty-manifest early-return
     # payload. Refine drives multiple rounds through the same `paths`; an
     # over-cap or dry-run rejection on round N+1 would otherwise wipe out
@@ -1325,9 +1328,7 @@ async def fanout(
             cost_known=all_known,
             wall_ms=0,
             partial=True,
-            partial_reason=(
-                f"estimated cost ${estimate:.2f}{suffix} exceeds cap ${cap:.2f}"
-            ),
+            partial_reason=(f"estimated cost ${estimate:.2f}{suffix} exceeds cap ${cap:.2f}"),
             blinded=blinded,
         )
         _persist_partial_handle(handle)
@@ -1364,9 +1365,7 @@ async def fanout(
             f"duplicate panel slugs would race the artifact dir: {dupes}. "
             "Disambiguate by giving each spec a distinct `slug` (or omitting it)."
         )
-    per_prompts = [
-        _build_per_slug_prompt(prompt, registry.resolve_stance(s.stance)) for s in specs
-    ]
+    per_prompts = [_build_per_slug_prompt(prompt, registry.resolve_stance(s.stance)) for s in specs]
 
     # Process-level provider semaphores (shared across concurrent fanouts
     # in the same event loop). See `_get_provider_sems` for the rationale.
@@ -1387,9 +1386,7 @@ async def fanout(
                     "CONSULT_MAX_CONCURRENCY=%r is not a positive int; ignoring",
                     env_cap,
                 )
-    fanout_sem: asyncio.Semaphore | None = (
-        asyncio.Semaphore(max_concurrency) if max_concurrency else None
-    )
+    fanout_sem: asyncio.Semaphore | None = asyncio.Semaphore(max_concurrency) if max_concurrency else None
 
     start = time.time()
     total = len(specs)
@@ -1425,6 +1422,7 @@ async def fanout(
     hb_interval = float(os.environ.get("CONSULT_HEARTBEAT_INTERVAL_S", 5.0))
     heartbeat_task: asyncio.Task[None] | None = None
     if hb_interval > 0:
+
         async def _heartbeat_loop() -> None:
             while True:
                 await asyncio.sleep(hb_interval)
@@ -1443,6 +1441,7 @@ async def fanout(
                 )
                 append_progress_log(paths.root, event)
                 await _safe_notify(event)
+
         heartbeat_task = asyncio.create_task(_heartbeat_loop())
 
     async def _run_one(spec: ModelSpec, slug: str, per_prompt: str) -> ManifestEntry:
@@ -1457,7 +1456,10 @@ async def fanout(
             # sees which slugs are in flight, not just which have completed.
             started += 1
             started_event = PanellistStarted(
-                done=done, total=total, slug=slug, started_count=started,
+                done=done,
+                total=total,
+                slug=slug,
+                started_count=started,
             )
             append_progress_log(paths.root, started_event)
             await _safe_notify(started_event)
@@ -1468,11 +1470,18 @@ async def fanout(
             # channel doesn't drown in micro-updates.
             on_partial: Callable[[int, int], Awaitable[None]] | None = None
             if stream and on_progress is not None:
+
                 async def _emit_partial(chars: int, elapsed_ms: int) -> None:
-                    await _safe_notify(PanellistPartial(
-                        done=done, total=total, slug=slug,
-                        chars_so_far=chars, elapsed_ms=elapsed_ms,
-                    ))
+                    await _safe_notify(
+                        PanellistPartial(
+                            done=done,
+                            total=total,
+                            slug=slug,
+                            chars_so_far=chars,
+                            elapsed_ms=elapsed_ms,
+                        )
+                    )
+
                 on_partial = _emit_partial
             # Per-slug history takes precedence when set (refine round-2+
             # passes each panellist its own conversation). Falls back to
@@ -1482,21 +1491,28 @@ async def fanout(
             if pt is None:
                 pt = prior_turns
             entry = await _call_one(
-                spec, slug, per_prompt, paths, provider_sems,
-                stream=stream, on_partial=on_partial,
+                spec,
+                slug,
+                per_prompt,
+                paths,
+                provider_sems,
+                stream=stream,
+                on_partial=on_partial,
                 prior_turns=pt,
                 capsule_kind=capsule_kind,
             )
             done += 1
             completed_entries.append(entry)
             pending_slugs_set.discard(slug)
-            await _safe_notify(PanellistCompleted(
-                done=done,
-                total=total,
-                slug=slug,
-                status=entry.status.value,
-                latency_ms=entry.latency_ms,
-            ))
+            await _safe_notify(
+                PanellistCompleted(
+                    done=done,
+                    total=total,
+                    slug=slug,
+                    status=entry.status.value,
+                    latency_ms=entry.latency_ms,
+                )
+            )
             return entry
 
     # Slow-tail dropout: once most of the panel has returned, cancel the
@@ -1536,15 +1552,16 @@ async def fanout(
             trigger = max(1, total - k)
 
             while len(completed_tasks) < trigger and pending:
-                done_set, pending = await asyncio.wait(
-                    pending, return_when=asyncio.FIRST_COMPLETED
-                )
+                done_set, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
                 completed_tasks.update(done_set)
 
             if pending:
                 logger.info(
                     "slow-tail dropout: %d/%d complete, waiting up to %.1fs for %d stragglers",
-                    len(completed_tasks), total, tail_dropout_s, len(pending),
+                    len(completed_tasks),
+                    total,
+                    tail_dropout_s,
+                    len(pending),
                 )
                 done_set, pending = await asyncio.wait(pending, timeout=tail_dropout_s)
                 completed_tasks.update(done_set)
@@ -1592,14 +1609,25 @@ async def fanout(
                 done += 1
                 completed_entries.append(entry)
                 pending_slugs_set.discard(slug)
-                await _safe_notify(PanellistCompleted(
-                    done=done, total=total, slug=slug,
-                    status=Status.TIMEOUT.value, latency_ms=latency_ms,
-                ))
-                append_progress_log(paths.root, PanellistCompleted(
-                    done=0, total=0, slug=slug,
-                    status=Status.TIMEOUT.value, latency_ms=latency_ms,
-                ))
+                await _safe_notify(
+                    PanellistCompleted(
+                        done=done,
+                        total=total,
+                        slug=slug,
+                        status=Status.TIMEOUT.value,
+                        latency_ms=latency_ms,
+                    )
+                )
+                append_progress_log(
+                    paths.root,
+                    PanellistCompleted(
+                        done=0,
+                        total=0,
+                        slug=slug,
+                        status=Status.TIMEOUT.value,
+                        latency_ms=latency_ms,
+                    ),
+                )
 
             manifest = []
             for t in task_list:

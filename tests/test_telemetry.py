@@ -18,6 +18,7 @@ def _reset_telemetry_module():
     """The telemetry module caches its tracer resolution. Reload it
     before each test so monkeypatching the env var works."""
     import consult.telemetry as telemetry
+
     importlib.reload(telemetry)
     yield
     importlib.reload(telemetry)
@@ -38,6 +39,7 @@ def test_set_attribute_is_noop_on_none_span(monkeypatch):
     invoke it after `with` yields."""
     monkeypatch.delenv("OTEL_EXPORTER_OTLP_ENDPOINT", raising=False)
     import consult.telemetry as telemetry
+
     # Multiple set_attribute calls on None — should be silent no-ops
     telemetry.set_attribute(None, "anything", 42)
     telemetry.set_attribute(None, "complex", {"unserialisable": object()})
@@ -47,6 +49,7 @@ def test_set_attribute_is_noop_on_none_span(monkeypatch):
 def test_record_exception_is_noop_on_none_span(monkeypatch):
     monkeypatch.delenv("OTEL_EXPORTER_OTLP_ENDPOINT", raising=False)
     import consult.telemetry as telemetry
+
     telemetry.record_exception(None, RuntimeError("boom"))
 
 
@@ -66,6 +69,7 @@ def test_set_attribute_falls_back_to_str_on_unserialisable_value(monkeypatch):
                 raise TypeError("dict not supported")
 
     import consult.telemetry as telemetry
+
     span = _FakeSpan()
     telemetry.set_attribute(span, "k", {"nested": "dict"})
     # First attempt with original value, second with str()
@@ -80,11 +84,13 @@ def test_span_no_error_when_opentelemetry_not_installed(monkeypatch):
 
     # Simulate the import failing
     import sys
+
     real = sys.modules.pop("opentelemetry", None)
     real_trace = sys.modules.pop("opentelemetry.trace", None)
     sys.modules["opentelemetry"] = None  # forces ImportError on `from opentelemetry import trace`
     try:
         import consult.telemetry as telemetry
+
         importlib.reload(telemetry)
         with telemetry.span("test.op") as sp:
             assert sp is None

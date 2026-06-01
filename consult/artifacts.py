@@ -112,6 +112,7 @@ def runs_root() -> Path:
     # foreign-owned dir, etc. — over-permissive is a worse user experience
     # than the server refusing to start.
     import contextlib
+
     with contextlib.suppress(OSError):
         base.chmod(0o700)
     return base
@@ -140,9 +141,7 @@ def _validate_id(value: str, kind: str) -> str:
     along with separator/special characters.
     """
     if not isinstance(value, str) or not value or not _SAFE_ID_RE.fullmatch(value):
-        raise ValueError(
-            f"invalid {kind} {value!r}: must match {_SAFE_ID_RE.pattern}"
-        )
+        raise ValueError(f"invalid {kind} {value!r}: must match {_SAFE_ID_RE.pattern}")
     return value
 
 
@@ -289,6 +288,7 @@ async def aaugment_manifest(paths: RunPaths, **fields: object) -> None:
     currently bound there, so test setup is unchanged.
     """
     import asyncio
+
     await asyncio.to_thread(augment_manifest, paths, **fields)
 
 

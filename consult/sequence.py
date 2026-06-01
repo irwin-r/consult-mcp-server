@@ -61,9 +61,7 @@ class SequenceResult(StrictModel):
         # the ManifestEntry/RunResult invariant so the cap-enforcement story
         # is uniform across tools.
         if self.cost_known and any(not s.cost_known for s in self.steps):
-            raise ValueError(
-                "SequenceResult.cost_known=True but a step has cost_known=False"
-            )
+            raise ValueError("SequenceResult.cost_known=True but a step has cost_known=False")
         return self
 
 
@@ -135,7 +133,9 @@ async def sequence(
         full_prompt = _step_prompt(i, total, prior_synth, body)
 
         estimate, est_known = await runner.aestimate_cost(
-            specs, full_prompt, capsule_kind=capsule_kind,
+            specs,
+            full_prompt,
+            capsule_kind=capsule_kind,
         )
         if cumulative_cost + estimate > cap:
             partial_reason = (
@@ -153,16 +153,23 @@ async def sequence(
         if not est_known:
             cost_all_known = False
 
-        await emit(progress_mod.SequenceStepStarted(
-            done=step_base, total=progress_total, step=i,
-        ))
+        await emit(
+            progress_mod.SequenceStepStarted(
+                done=step_base,
+                total=progress_total,
+                step=i,
+            )
+        )
         handle = await runner.fanout(
             full_prompt,
             specs,
             blinded=blinded,
             max_run_usd=cap - cumulative_cost,
             on_progress=progress_mod.make_phase_cb(
-                emit if on_progress else None, step_base, progress_total, progress_done,
+                emit if on_progress else None,
+                step_base,
+                progress_total,
+                progress_done,
             ),
             capsule_kind=capsule_kind,
         )
@@ -174,9 +181,7 @@ async def sequence(
             cumulative_cost += handle.cost_usd
             if not handle.cost_known:
                 cost_all_known = False
-            partial_reason = (
-                f"step {i} fanout returned partial: {handle.partial_reason}"
-            )
+            partial_reason = f"step {i} fanout returned partial: {handle.partial_reason}"
             break
 
         handle = await capsule.annotate(
@@ -244,9 +249,13 @@ async def sequence(
             break
 
         progress_done[0] = step_base + panel_n * 2 + 1
-        await emit(progress_mod.SequenceStepCompleted(
-            done=progress_done[0], total=progress_total, step=i,
-        ))
+        await emit(
+            progress_mod.SequenceStepCompleted(
+                done=progress_done[0],
+                total=progress_total,
+                step=i,
+            )
+        )
         prior_synth = synth_result.text
 
     wall_ms = int((time.time() - start) * 1000)

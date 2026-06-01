@@ -110,18 +110,14 @@ async def test_call_synthesise_with_missing_run_returns_run_not_found(mcp_sessio
     can distinguish it from INVALID_INPUT (e.g. malformed schema).
     """
     async with mcp_session_factory() as client:
-        result = await client.call_tool(
-            "synthesise", {"run_id": "does-not-exist-anywhere"}
-        )
+        result = await client.call_tool("synthesise", {"run_id": "does-not-exist-anywhere"})
     assert result.structuredContent is not None
     assert result.structuredContent.get("ok") is False
     assert result.structuredContent["error"]["code"] == "run_not_found"
 
 
 @pytest.mark.asyncio
-async def test_list_resources_includes_recent_runs(
-    mcp_session_factory, tmp_path, monkeypatch
-):
+async def test_list_resources_includes_recent_runs(mcp_session_factory, tmp_path, monkeypatch):
     """list_resources walks `runs_dir` and surfaces per-panellist response
     URIs. Drives a synthetic run dir on a tmpfs to keep the test offline."""
     from consult import artifacts
@@ -218,7 +214,8 @@ async def _poll_until_terminal(client, task_id: str, timeout_s: float = 2.0):
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         result = await client.send_request(
-            _get_task_request(task_id), GetTaskResult,
+            _get_task_request(task_id),
+            GetTaskResult,
         )
         if result.status != "working":
             return result
@@ -238,7 +235,9 @@ def _clean_task_store():
 
 @pytest.mark.asyncio
 async def test_task_mode_returns_create_task_then_completes(
-    mcp_session_factory, monkeypatch, _clean_task_store,
+    mcp_session_factory,
+    monkeypatch,
+    _clean_task_store,
 ):
     """Happy path: tools/call with task.ttl returns a CreateTaskResult
     synchronously, the background handler runs, and a follow-up tasks/get
@@ -266,7 +265,9 @@ async def test_task_mode_returns_create_task_then_completes(
         #    send_request directly with the right result_type.
         create = await client.send_request(
             _task_call_request(
-                "consult", {"prompt": "x", "tier": "quick"}, ttl_ms=60_000,
+                "consult",
+                {"prompt": "x", "tier": "quick"},
+                ttl_ms=60_000,
             ),
             CreateTaskResult,
         )
@@ -297,7 +298,9 @@ async def test_task_mode_returns_create_task_then_completes(
 
 @pytest.mark.asyncio
 async def test_task_mode_handler_exception_marks_failed(
-    mcp_session_factory, monkeypatch, _clean_task_store,
+    mcp_session_factory,
+    monkeypatch,
+    _clean_task_store,
 ):
     """A handler raising mid-flight must transition the task to `failed`
     with a status_message rather than leaving it stuck in `working`. The
@@ -317,7 +320,9 @@ async def test_task_mode_handler_exception_marks_failed(
     async with mcp_session_factory() as client:
         create = await client.send_request(
             _task_call_request(
-                "consult", {"prompt": "x", "tier": "quick"}, ttl_ms=60_000,
+                "consult",
+                {"prompt": "x", "tier": "quick"},
+                ttl_ms=60_000,
             ),
             CreateTaskResult,
         )
@@ -342,7 +347,8 @@ async def test_task_mode_handler_exception_marks_failed(
 
 @pytest.mark.asyncio
 async def test_tasks_get_unknown_task_raises_invalid_params(
-    mcp_session_factory, _clean_task_store,
+    mcp_session_factory,
+    _clean_task_store,
 ):
     """Polling a taskId the server has never seen raises an McpError with
     INVALID_PARAMS. The SDK's `GetTaskResult` shape requires `taskId`

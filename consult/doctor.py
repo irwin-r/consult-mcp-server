@@ -68,10 +68,12 @@ def _check_paths() -> tuple[list[str], int]:
         if mode == 0o700:
             lines.append(_ok(f"runs root mode: 0o{mode:o}"))
         else:
-            lines.append(_warn(
-                f"runs root mode: 0o{mode:o} (expected 0o700 — per-run prompts may be "
-                "world-readable; chmod 700 ~/.consult/runs)"
-            ))
+            lines.append(
+                _warn(
+                    f"runs root mode: 0o{mode:o} (expected 0o700 — per-run prompts may be "
+                    "world-readable; chmod 700 ~/.consult/runs)"
+                )
+            )
     except OSError as e:
         lines.append(_warn(f"could not stat runs root: {e}"))
     return lines, fails
@@ -128,15 +130,15 @@ def _check_trusted_roots() -> tuple[list[str], int]:
         lines.append(_ok(f"CONSULT_TRUSTED_REPO_ROOTS: {roots}"))
         for r in roots:
             if not Path(r).expanduser().exists():
-                lines.append(_warn(
-                    f"  trusted root {r!r} does not exist — paths under it will be rejected"
-                ))
+                lines.append(_warn(f"  trusted root {r!r} does not exist — paths under it will be rejected"))
     else:
-        lines.append(_warn(
-            "CONSULT_TRUSTED_REPO_ROOTS unset — file attachments and git_diff "
-            f"restricted to CWD ({Path.cwd()}) only. Set this env var to a "
-            "colon-separated list of directories to allow attachments from elsewhere."
-        ))
+        lines.append(
+            _warn(
+                "CONSULT_TRUSTED_REPO_ROOTS unset — file attachments and git_diff "
+                f"restricted to CWD ({Path.cwd()}) only. Set this env var to a "
+                "colon-separated list of directories to allow attachments from elsewhere."
+            )
+        )
     return lines, 0
 
 
@@ -160,6 +162,7 @@ async def _ping_provider(env_var: str, alias: str) -> tuple[bool, str]:
         return False, "key not set"
     try:
         import litellm
+
         info = registry.resolve_model(alias)
         litellm_id = info["litellm_id"]
         await litellm.acompletion(
@@ -172,6 +175,7 @@ async def _ping_provider(env_var: str, alias: str) -> tuple[bool, str]:
     except Exception as e:  # noqa: BLE001
         # Redact secrets before surfacing — same risk as runner.py.
         from .runner import _redact_secrets
+
         msg = _redact_secrets(f"{type(e).__name__}: {e}")
         return False, msg[:200]
 
@@ -256,9 +260,7 @@ def cli() -> None:
         prog="consult-doctor",
         description="Diagnose a consult-mcp-server install.",
     )
-    parser.add_argument(
-        "--version", action="version", version=f"consult-doctor {__version__}"
-    )
+    parser.add_argument("--version", action="version", version=f"consult-doctor {__version__}")
     parser.add_argument(
         "--ping",
         action="store_true",

@@ -345,9 +345,7 @@ _PROVIDER_SVG_PATHS = {
         "m9.9544 9.6916V18.43l5.9603 4.9588zm0-3.3252V8.0007l6.8244 5.9774z"
         "m6.8205-13.4627v6.0987L13.391 7.0896z"
     ),
-    "xiaomi": (
-        "M22 22V2H2v20h4.61V6.65h10.78V22H22zm-9.42 0V10.55H7.97V22h4.61z"
-    ),
+    "xiaomi": ("M22 22V2H2v20h4.61V6.65h10.78V22H22zm-9.42 0V10.55H7.97V22h4.61z"),
 }
 
 
@@ -470,7 +468,7 @@ def _brand_symbol_body(provider: str) -> str:
         f'<text x="12" y="17" text-anchor="middle" '
         f'font-family="-apple-system,BlinkMacSystemFont,Roboto,sans-serif" '
         f'font-size="{size}" font-weight="700" fill="currentColor">'
-        f'{html.escape(glyph)}</text>'
+        f"{html.escape(glyph)}</text>"
     )
 
 
@@ -481,8 +479,7 @@ def _brand_sprite_html() -> str:
     """
     providers = sorted(set(_PROVIDER_INFO) | set(_PROVIDER_SVG_PATHS))
     symbols = "".join(
-        f'<symbol id="brand-{p}" viewBox="0 0 24 24">{_brand_symbol_body(p)}</symbol>'
-        for p in providers
+        f'<symbol id="brand-{p}" viewBox="0 0 24 24">{_brand_symbol_body(p)}</symbol>' for p in providers
     )
     return (
         '<svg xmlns="http://www.w3.org/2000/svg" '
@@ -500,9 +497,18 @@ def _brand_glyph_html(provider: str) -> str:
 
 
 _GREEK_LETTERS: dict[str, str] = {
-    "alpha": "α", "beta": "β", "gamma": "γ", "delta": "δ",
-    "epsilon": "ε", "zeta": "ζ", "eta": "η", "theta": "θ",
-    "iota": "ι", "kappa": "κ", "lambda": "λ", "mu": "μ",
+    "alpha": "α",
+    "beta": "β",
+    "gamma": "γ",
+    "delta": "δ",
+    "epsilon": "ε",
+    "zeta": "ζ",
+    "eta": "η",
+    "theta": "θ",
+    "iota": "ι",
+    "kappa": "κ",
+    "lambda": "λ",
+    "mu": "μ",
 }
 
 # Slug shape produced by runner._make_slug under blinded=True. The optional
@@ -530,7 +536,7 @@ def _blinded_inline_glyph(letter: str) -> str:
         f'<text x="12" y="17" text-anchor="middle" '
         f'font-family="-apple-system,BlinkMacSystemFont,Roboto,sans-serif" '
         f'font-size="15" font-weight="700" fill="currentColor">'
-        f'{html.escape(letter)}</text></svg>'
+        f"{html.escape(letter)}</text></svg>"
     )
 
 
@@ -547,7 +553,7 @@ def _model_badge_html(model_id: str | None, slug: str | None = None) -> str:
             f'<span class="model-tag" title="{title}">'
             f'<span class="brand brand-other">{_blinded_inline_glyph(greek)}</span>'
             f'<span class="model-name">Panellist {html.escape(greek)}</span>'
-            f'</span>'
+            f"</span>"
         )
     provider, model_part = _provider_of(model_id)
     _, brand_name = _PROVIDER_INFO[provider]
@@ -558,7 +564,7 @@ def _model_badge_html(model_id: str | None, slug: str | None = None) -> str:
         f'<span class="model-tag" title="{brand_attr}{title}">'
         f'<span class="brand brand-{provider}">{_brand_glyph_html(provider)}</span>'
         f'<span class="model-name">{html.escape(display)}</span>'
-        f'</span>'
+        f"</span>"
     )
 
 
@@ -588,10 +594,7 @@ def _cite_pill(
     # Round chip reflects the resolved target, not the bare citation text,
     # so `[claude-haiku-2]` → `claude-haiku-2.r3` still shows `r3`.
     round_num = _round_of(anchor_slug)
-    round_chip = (
-        f' <span class="cite-round">r{round_num}</span>'
-        if round_num is not None else ""
-    )
+    round_chip = f' <span class="cite-round">r{round_num}</span>' if round_num is not None else ""
     # Anchor to the matching panellist card so citations are click-to-jump.
     # Slugs are `[a-zA-Z0-9._-]+` by registry convention, so html.escape is
     # sufficient — no URL-encoding edge cases.
@@ -603,8 +606,8 @@ def _cite_pill(
             f'<a href="{href}" class="cite cite-other" title="{title}">'
             f'<span class="brand brand-other">{_blinded_inline_glyph(greek)}</span>'
             f'<span class="cite-name">Panellist {html.escape(greek)}</span>'
-            f'{round_chip}'
-            f'</a>'
+            f"{round_chip}"
+            f"</a>"
         )
     provider, model_part = _provider_of(model_id)
     _, brand_name = _PROVIDER_INFO[provider]
@@ -626,8 +629,8 @@ def _cite_pill(
         f'<a href="{href}" class="cite cite-{provider}" title="{title}">'
         f'<span class="brand brand-{provider}">{_brand_glyph_html(provider)}</span>'
         f'<span class="cite-name">{html.escape(display)}</span>'
-        f'{round_chip}'
-        f'</a>'
+        f"{round_chip}"
+        f"</a>"
     )
 
 
@@ -661,7 +664,8 @@ def _decorate_citations(
             return match.group(0)
         out_tokens = [
             _cite_pill(t, slug_to_model.get(t), bare_resolution.get(t))
-            if t in slug_to_model else html.escape(t)
+            if t in slug_to_model
+            else html.escape(t)
             for t in tokens
         ]
         return ", ".join(out_tokens)
@@ -843,24 +847,26 @@ def _augment_with_earlier_rounds(
                     model_id = e.get("model_id")
                     break
 
-        extras.append({
-            "slug": slug,
-            "model_id": model_id,
-            "persona": None,
-            "status": status,
-            "finish_reason": finish_reason,
-            "capsule": capsule_data,
-            "confidence": (capsule_data or {}).get("confidence"),
-            "resource_uri": paths.resource_uri(slug),
-            "body_path": str(paths.responses / f"{slug}.txt"),
-            "latency_ms": latency_ms,
-            "tokens_in": tokens_in,
-            "tokens_out": tokens_out,
-            "cost_usd": None,
-            "cost_known": False,
-            "error": None,
-            "_reconstructed": True,
-        })
+        extras.append(
+            {
+                "slug": slug,
+                "model_id": model_id,
+                "persona": None,
+                "status": status,
+                "finish_reason": finish_reason,
+                "capsule": capsule_data,
+                "confidence": (capsule_data or {}).get("confidence"),
+                "resource_uri": paths.resource_uri(slug),
+                "body_path": str(paths.responses / f"{slug}.txt"),
+                "latency_ms": latency_ms,
+                "tokens_in": tokens_in,
+                "tokens_out": tokens_out,
+                "cost_usd": None,
+                "cost_known": False,
+                "error": None,
+                "_reconstructed": True,
+            }
+        )
 
     return list(manifest_entries) + extras
 
@@ -1286,8 +1292,7 @@ def _header(run_id: str, kind: str, manifest: dict, cancelled: bool) -> str:
     entries = manifest.get("manifest", [])
     counts = Counter(e.get("status", "UNKNOWN") for e in entries)
     counts_html = "".join(
-        _pill(f"{n} {status}", _status_tone(status))
-        for status, n in sorted(counts.items())
+        _pill(f"{n} {status}", _status_tone(status)) for status, n in sorted(counts.items())
     )
     cost = manifest.get("cost_usd")
     cost_known = manifest.get("cost_known", True)
@@ -1305,17 +1310,13 @@ def _header(run_id: str, kind: str, manifest: dict, cancelled: bool) -> str:
     if blinded:
         stats_pieces.append('<span class="stat-chip"><b>blinded</b></span>')
     if synth_model:
-        stats_pieces.append(
-            f'<span class="stat-chip">synth {_model_badge_html(synth_model)}</span>'
-        )
+        stats_pieces.append(f'<span class="stat-chip">synth {_model_badge_html(synth_model)}</span>')
 
     banner = ""
     if cancelled:
         banner += '<div class="cancelled-banner">This run was cancelled before completion.</div>'
     if partial and partial_reason:
-        banner += (
-            f'<div class="partial-banner">Partial run: {html.escape(partial_reason)}</div>'
-        )
+        banner += f'<div class="partial-banner">Partial run: {html.escape(partial_reason)}</div>'
 
     return f"""
     <header>
@@ -1384,28 +1385,20 @@ def _fold_synth_sections(rendered: str) -> str:
         # Everything between the previous heading's end and this heading's
         # start belongs to the previous section's body.
         if cursor < m.start():
-            out.append(rendered[cursor:m.start()])
+            out.append(rendered[cursor : m.start()])
         # Determine where this section's body ends — at the next heading's
         # start, or at end-of-string.
         body_end = headings[i + 1].start() if i + 1 < len(headings) else len(rendered)
         heading_html = m.group(0)
-        body_html = rendered[m.end():body_end]
+        body_html = rendered[m.end() : body_end]
         heading_text = _HTML_TAG_RE.sub("", m.group(2)).strip().lower()
-        is_fold = (
-            i > 0
-            and any(kw in heading_text for kw in _SYNTH_FOLD_KEYWORDS)
-        )
+        is_fold = i > 0 and any(kw in heading_text for kw in _SYNTH_FOLD_KEYWORDS)
         if is_fold:
             # Keep the original heading tag inside `<summary>` so its
             # styling carries over; the global `.synth-fold > summary` CSS
             # neutralises the summary's own padding so the heading sits
             # flush.
-            out.append(
-                f'<details class="synth-fold">'
-                f'<summary>{heading_html}</summary>'
-                f'{body_html}'
-                f'</details>'
-            )
+            out.append(f'<details class="synth-fold"><summary>{heading_html}</summary>{body_html}</details>')
         else:
             out.append(heading_html)
             out.append(body_html)
@@ -1453,8 +1446,10 @@ def _section_arbiters(
         score_tone = "ok" if score >= 0.85 else ("warn" if score >= 0.6 else "err")
         gaps = v.get("gaps") or []
         gaps_html = (
-            "<ul>" + "".join(f"<li>{_cite(g)}</li>" for g in gaps) + "</ul>"
-        ) if gaps else "<p class=\"meta\">No gaps recorded.</p>"
+            ("<ul>" + "".join(f"<li>{_cite(g)}</li>" for g in gaps) + "</ul>")
+            if gaps
+            else '<p class="meta">No gaps recorded.</p>'
+        )
         focus = v.get("next_round_focus") or ""
         reasoning = v.get("reasoning") or ""
         cost = v.get("cost_usd")
@@ -1469,15 +1464,15 @@ def _section_arbiters(
         cards.append(f"""
         <div class="arbiter-card score-{score_tone}">
           <div class="arbiter-head">
-            <span class="round-num">Round {int(v.get('round', 0))}</span>
+            <span class="round-num">Round {int(v.get("round", 0))}</span>
             {_pill(f"score {score:.2f}", score_tone)}
             <span class="score-bar"><i style="width: {bar_pct}%"></i></span>
             <span class="card-stats">{"".join(meta_bits)}</span>
           </div>
           <div class="capsule-row"><span class="label">Gaps</span>{gaps_html}</div>
-          {f'<div class="capsule-row"><span class="label">Next focus</span>{_cite(focus)}</div>' if focus else ''}
-          {f'<div class="capsule-row"><span class="label">Reasoning</span>{_cite(reasoning)}</div>' if reasoning else ''}
-          {f'<div class="error-msg">{html.escape(err)}</div>' if err else ''}
+          {f'<div class="capsule-row"><span class="label">Next focus</span>{_cite(focus)}</div>' if focus else ""}
+          {f'<div class="capsule-row"><span class="label">Reasoning</span>{_cite(reasoning)}</div>' if reasoning else ""}
+          {f'<div class="error-msg">{html.escape(err)}</div>' if err else ""}
         </div>
         """)
     return f"""
@@ -1518,7 +1513,7 @@ def _capsule_block(
             '<div class="cap-rec">'
             '<span class="cap-rec-label">Recommendation</span>'
             f'<span class="cap-rec-body">{html.escape(recommendation)}</span>'
-            '</div>'
+            "</div>"
         )
 
     def _list_section(label: str, items: list[str], variant: str = "") -> str:
@@ -1531,8 +1526,8 @@ def _capsule_block(
         return (
             f'<details class="{cls}">'
             f'<summary class="cap-list-label">{html.escape(label)} ({len(items)})</summary>'
-            f'<ul>{lis}</ul>'
-            f'</details>'
+            f"<ul>{lis}</ul>"
+            f"</details>"
         )
 
     parts.append(_list_section("Key points", capsule.get("key_points") or []))
@@ -1544,15 +1539,12 @@ def _capsule_block(
     def _cite_row(label: str, slugs: list[str], variant: str) -> str:
         if not slugs:
             return ""
-        pills = " ".join(
-            _cite_pill(s, slug_to_model.get(s), resolution.get(s))
-            for s in slugs
-        )
+        pills = " ".join(_cite_pill(s, slug_to_model.get(s), resolution.get(s)) for s in slugs)
         return (
             f'<div class="cap-cites cap-cites-{variant}">'
             f'<span class="cap-list-label">{html.escape(label)}</span>'
-            f'{pills}'
-            f'</div>'
+            f"{pills}"
+            f"</div>"
         )
 
     parts.append(_cite_row("Agrees with", capsule.get("agrees_with") or [], "agree"))
@@ -1604,8 +1596,9 @@ def _panellist_card(
     cap_block = _capsule_block(capsule, slug_to_model, bare_resolution)
     recon_tag = (
         '<span class="recon-badge" title="Reconstructed from on-disk artifacts '
-        '(refine\'s manifest.json only carries the final round)">reconstructed</span>'
-        if reconstructed else ""
+        "(refine's manifest.json only carries the final round)\">reconstructed</span>"
+        if reconstructed
+        else ""
     )
 
     if body:
@@ -1658,8 +1651,7 @@ def _section_panellists(
             label = f"Round {key}" if key is not None else "Initial"
             parts.append(f'<div class="round-header">{html.escape(label)}</div>')
         cards = [
-            _panellist_card(e, bodies.get(e["slug"], ""), slug_to_model, bare_resolution)
-            for e in groups[key]
+            _panellist_card(e, bodies.get(e["slug"], ""), slug_to_model, bare_resolution) for e in groups[key]
         ]
         parts.append(f'<div class="panel-grid">{"".join(cards)}</div>')
     parts.append("</section>")
@@ -1718,7 +1710,7 @@ def _section_timeline(events: list[dict[str, Any]]) -> str:
 
         rows.append(f"""
         <li>
-          <span class="t" title="{html.escape(e.get('ts','') or '')}">{html.escape(t_disp)}</span>
+          <span class="t" title="{html.escape(e.get("ts", "") or "")}">{html.escape(t_disp)}</span>
           <span class="k">{html.escape(kind)}</span>
           <span class="slug">{html.escape(slug)}</span>
           <span class="pills">{"".join(detail_bits)}</span>
@@ -1768,12 +1760,12 @@ def _build_html(paths: artifacts.RunPaths, data: dict[str, Any]) -> str:
 <body>
 {_brand_sprite_html()}
 <main>
-{_header(paths.run_id, kind, manifest, data['cancelled'])}
-{_section_synth(data['synth'], slug_to_model, bare_resolution)}
-{_section_prompt(data['prompt'])}
-{_section_arbiters(data['arbiters'], slug_to_model, bare_resolution)}
-{_section_panellists(entries, data['bodies'], slug_to_model, bare_resolution)}
-{_section_timeline(data['events'])}
+{_header(paths.run_id, kind, manifest, data["cancelled"])}
+{_section_synth(data["synth"], slug_to_model, bare_resolution)}
+{_section_prompt(data["prompt"])}
+{_section_arbiters(data["arbiters"], slug_to_model, bare_resolution)}
+{_section_panellists(entries, data["bodies"], slug_to_model, bare_resolution)}
+{_section_timeline(data["events"])}
 {_section_footer(paths)}
 </main>
 </body>
@@ -1805,13 +1797,12 @@ def cli() -> None:
       consult-view <run_id> --open   also open it in the default browser
     """
     from . import __version__
+
     parser = argparse.ArgumentParser(
         prog="consult-view",
         description="Render a consult run as a self-contained HTML page.",
     )
-    parser.add_argument(
-        "--version", action="version", version=f"consult-view {__version__}"
-    )
+    parser.add_argument("--version", action="version", version=f"consult-view {__version__}")
     parser.add_argument("run_id", help="A run_id under ~/.consult/runs/")
     parser.add_argument(
         "--open",

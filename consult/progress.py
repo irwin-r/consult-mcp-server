@@ -162,7 +162,17 @@ class Heartbeat(_BaseProgressEvent):
 
 
 ProgressEvent = Annotated[
-    PanellistStarted | PanellistCompleted | PanellistPartial | CapsuleExtracted | ArbiterScored | SynthStarted | SynthCompleted | SequenceStepStarted | SequenceStepCompleted | PhaseStarted | Heartbeat,
+    PanellistStarted
+    | PanellistCompleted
+    | PanellistPartial
+    | CapsuleExtracted
+    | ArbiterScored
+    | SynthStarted
+    | SynthCompleted
+    | SequenceStepStarted
+    | SequenceStepCompleted
+    | PhaseStarted
+    | Heartbeat,
     Field(discriminator="kind"),
 ]
 

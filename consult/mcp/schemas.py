@@ -31,7 +31,7 @@ from ..attachments import ATTACHMENT_SCHEMA_ITEMS
 
 _ATTACHMENTS_FIELD_DESC = (
     "Each entry is either an absolute file path (string), a labelled "
-    'file `{path, label?, kind?}`, or a server-resolved source '
+    "file `{path, label?, kind?}`, or a server-resolved source "
     '`{source: "git_diff", base, head, repo_path?, label?}`.'
 )
 
@@ -83,10 +83,7 @@ PANEL_SCHEMA = {
         "blinded": {
             "type": "boolean",
             "default": False,
-            "description": (
-                "Anonymise slugs to panelist-alpha/beta/... and strip model_id "
-                "from manifest."
-            ),
+            "description": ("Anonymise slugs to panelist-alpha/beta/... and strip model_id from manifest."),
         },
         "attachments": {
             "type": "array",
@@ -262,7 +259,7 @@ SEQUENCE_SCHEMA = {
             "items": ATTACHMENT_SCHEMA_ITEMS,
             "description": (
                 "Default attachments for every step. Each entry is a string path, "
-                'a labelled file `{path, label?, kind?}`, or a git_diff source '
+                "a labelled file `{path, label?, kind?}`, or a git_diff source "
                 '`{source: "git_diff", base, head, repo_path?, label?}`. '
                 "Steps with object form may override these per-step."
             ),
@@ -281,10 +278,7 @@ SEQUENCE_SCHEMA = {
         },
         "capsule_kind": {
             **_CAPSULE_KIND_FIELD,
-            "description": (
-                "Capsule shape for every step. 'decision' (default), 'review', "
-                "or 'research'."
-            ),
+            "description": ("Capsule shape for every step. 'decision' (default), 'review', or 'research'."),
         },
     },
 }
@@ -306,11 +300,7 @@ def consult_schema() -> dict[str, Any]:
     as a function (rather than a constant) for that reason.
     """
     tier_names = _tier_names()
-    default_tier = (
-        "standard"
-        if "standard" in tier_names
-        else (tier_names[0] if tier_names else "standard")
-    )
+    default_tier = "standard" if "standard" in tier_names else (tier_names[0] if tier_names else "standard")
     return {
         "type": "object",
         "required": ["prompt"],

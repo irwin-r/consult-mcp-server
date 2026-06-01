@@ -58,7 +58,9 @@ def test_expand_specs_multi_instance_and_passthrough():
     expanded = expand_specs(raw)
     assert len(expanded) == 5  # 3 + 1 + 1
     assert [s.model for s in expanded] == [
-        "claude-haiku", "claude-haiku", "claude-haiku",
+        "claude-haiku",
+        "claude-haiku",
+        "claude-haiku",
         "gpt-pro",
         "openrouter/foo/bar",
     ]
@@ -109,15 +111,16 @@ def test_status_classifier_handles_exceptions():
 def test_run_handle_usable_parametric():
     entries = [
         ManifestEntry(
-            slug=f"m{i}", model_id=f"openrouter/x{i}/y", status=Status.OK,
-            resource_uri="consult://x", body_path="/tmp/x",
+            slug=f"m{i}",
+            model_id=f"openrouter/x{i}/y",
+            status=Status.OK,
+            resource_uri="consult://x",
+            body_path="/tmp/x",
         )
         for i in range(4)
     ]
     entries[3].model_id = "openai/gpt-5"
-    handle = RunHandle(
-        run_id="t", artifacts_dir="/tmp/t", manifest=entries, cost_usd=0, wall_ms=0
-    )
+    handle = RunHandle(run_id="t", artifacts_dir="/tmp/t", manifest=entries, cost_usd=0, wall_ms=0)
     assert handle.usable() is True
     # Set all-OR — only one provider
     for e in entries:
@@ -136,6 +139,7 @@ def test_artifacts_create_and_uri():
     assert name == "alpha"
     # cleanup
     import shutil
+
     shutil.rmtree(paths.root)
 
 
@@ -163,9 +167,7 @@ def test_refinement_prompt_includes_gaps_and_focus():
             capsule=Capsule(position="A says X", recommendation="do X"),
         )
     ]
-    verdict = ArbiterVerdict(
-        round=1, score=0.4, gaps=["cost not discussed"], next_round_focus="address cost"
-    )
+    verdict = ArbiterVerdict(round=1, score=0.4, gaps=["cost not discussed"], next_round_focus="address cost")
     out = refine_mod._build_refinement_prompt("Should we ship X?", 2, manifest, verdict)
     assert "Should we ship X?" in out
     assert "cost not discussed" in out
@@ -188,9 +190,7 @@ async def test_refine_continuation_prepends_prior_synthesis(tmp_path, monkeypatc
     prior.prompt_txt.write_text("Polars vs DuckDB for 10GB Parquet?")
     (prior.root / "synthesis.md").write_text("ANSWER: pick DuckDB.")
 
-    combined, prior_turns = _apply_continuation(
-        "Now what about Polars for ETL?", prior.run_id
-    )
+    combined, prior_turns = _apply_continuation("Now what about Polars for ETL?", prior.run_id)
     # Storage form keeps the markdown sections so disk artifacts stay self-describing.
     assert "Prior consultation — original question" in combined
     assert "Polars vs DuckDB for 10GB Parquet?" in combined
@@ -198,9 +198,7 @@ async def test_refine_continuation_prepends_prior_synthesis(tmp_path, monkeypatc
     assert "ANSWER: pick DuckDB." in combined
     assert "Follow-up question" in combined
     assert "Now what about Polars for ETL?" in combined
-    assert combined.index("ANSWER: pick DuckDB.") < combined.index(
-        "Now what about Polars for ETL?"
-    )
+    assert combined.index("ANSWER: pick DuckDB.") < combined.index("Now what about Polars for ETL?")
     # prior_turns is what the LLM actually sees — proper user/assistant pair.
     assert prior_turns is not None
     assert len(prior_turns) == 2
@@ -330,21 +328,23 @@ def test_refine_arbiter_v2_dimensions_normalised_to_overall_score(monkeypatch):
 
     from consult.refine import _ask_arbiter
 
-    arbiter_text = json.dumps({
-        "dimensions": {
-            "coverage": 5,
-            "agreement": 5,
-            "depth": 3,
-            "calibration": 5,
-            "actionability": 5,
-        },
-        "dimension_notes": {
-            "depth": "Beta hand-waved on the cost argument.",
-        },
-        "gaps": ["cost magnitude unclear"],
-        "next_round_focus": "quantify cost",
-        "reasoning": "Strong consensus; depth lags.",
-    })
+    arbiter_text = json.dumps(
+        {
+            "dimensions": {
+                "coverage": 5,
+                "agreement": 5,
+                "depth": 3,
+                "calibration": 5,
+                "actionability": 5,
+            },
+            "dimension_notes": {
+                "depth": "Beta hand-waved on the cost argument.",
+            },
+            "gaps": ["cost magnitude unclear"],
+            "next_round_focus": "quantify cost",
+            "reasoning": "Strong consensus; depth lags.",
+        }
+    )
 
     class _Choice:
         def __init__(self, text):
@@ -362,9 +362,14 @@ def test_refine_arbiter_v2_dimensions_normalised_to_overall_score(monkeypatch):
         lambda completion_response=None: 0.001,
     )
 
-    verdict = asyncio.run(_ask_arbiter(
-        "Q?", round_num=1, manifest=[], arbiter_alias="claude-haiku",
-    ))
+    verdict = asyncio.run(
+        _ask_arbiter(
+            "Q?",
+            round_num=1,
+            manifest=[],
+            arbiter_alias="claude-haiku",
+        )
+    )
     assert verdict.parsed_ok is True
     # 5→1.0, 3→0.5 normalised; avg of [1.0, 1.0, 0.5, 1.0, 1.0] = 0.9
     assert verdict.score == pytest.approx(0.9, abs=1e-9)
@@ -384,12 +389,14 @@ def test_refine_arbiter_v1_score_field_still_accepted(monkeypatch):
 
     from consult.refine import _ask_arbiter
 
-    arbiter_text = json.dumps({
-        "score": 0.65,
-        "gaps": ["legacy"],
-        "next_round_focus": "f",
-        "reasoning": "r",
-    })
+    arbiter_text = json.dumps(
+        {
+            "score": 0.65,
+            "gaps": ["legacy"],
+            "next_round_focus": "f",
+            "reasoning": "r",
+        }
+    )
 
     class _Choice:
         def __init__(self, text):
@@ -407,9 +414,14 @@ def test_refine_arbiter_v1_score_field_still_accepted(monkeypatch):
         lambda completion_response=None: 0.001,
     )
 
-    verdict = asyncio.run(_ask_arbiter(
-        "Q?", round_num=1, manifest=[], arbiter_alias="claude-haiku",
-    ))
+    verdict = asyncio.run(
+        _ask_arbiter(
+            "Q?",
+            round_num=1,
+            manifest=[],
+            arbiter_alias="claude-haiku",
+        )
+    )
     assert verdict.parsed_ok is True
     assert verdict.score == pytest.approx(0.65, abs=1e-9)
     assert verdict.dimensions == {}
@@ -467,7 +479,10 @@ def test_refine_build_refinement_prompt_handles_legacy_verdict():
     from consult.types import ArbiterVerdict
 
     legacy = ArbiterVerdict(
-        round=1, score=0.4, gaps=["legacy-gap"], next_round_focus="f",
+        round=1,
+        score=0.4,
+        gaps=["legacy-gap"],
+        next_round_focus="f",
     )
     out = _build_refinement_prompt("Q?", 2, [], legacy)
     assert "legacy-gap" in out
@@ -567,9 +582,16 @@ def test_append_progress_log_writes_jsonl(tmp_path):
     """
     from consult.progress import CapsuleExtracted, PanellistCompleted, append_progress_log
 
-    append_progress_log(tmp_path, PanellistCompleted(
-        done=1, total=2, slug="haiku", status="OK", latency_ms=42,
-    ))
+    append_progress_log(
+        tmp_path,
+        PanellistCompleted(
+            done=1,
+            total=2,
+            slug="haiku",
+            status="OK",
+            latency_ms=42,
+        ),
+    )
     append_progress_log(tmp_path, CapsuleExtracted(done=1, total=2, slug="haiku"))
 
     lines = (tmp_path / "_progress.log").read_text().splitlines()
@@ -603,43 +625,71 @@ def test_progress_event_message_for_every_kind():
         event_message,
     )
 
-    assert "OK" in event_message(PanellistCompleted(
-        done=1, total=2, slug="x", status="OK", latency_ms=1,
-    ))
+    assert "OK" in event_message(
+        PanellistCompleted(
+            done=1,
+            total=2,
+            slug="x",
+            status="OK",
+            latency_ms=1,
+        )
+    )
     assert "capsule" in event_message(CapsuleExtracted(done=1, total=2, slug="x"))
-    assert "r2 arbiter" in event_message(ArbiterScored(
-        done=1, total=2, round=2, score=0.5,
-    ))
+    assert "r2 arbiter" in event_message(
+        ArbiterScored(
+            done=1,
+            total=2,
+            round=2,
+            score=0.5,
+        )
+    )
     assert event_message(SynthStarted(done=1, total=2)) == "synthesising"
     assert event_message(SynthCompleted(done=2, total=2)) == "synthesis complete"
     assert "step 3" in event_message(SequenceStepStarted(done=1, total=5, step=3))
     assert "step 3" in event_message(SequenceStepCompleted(done=2, total=5, step=3))
 
-    started_msg = event_message(PanellistStarted(
-        done=0, total=3, slug="alpha", started_count=1,
-    ))
+    started_msg = event_message(
+        PanellistStarted(
+            done=0,
+            total=3,
+            slug="alpha",
+            started_count=1,
+        )
+    )
     assert "alpha" in started_msg
     assert "1/3" in started_msg
 
     assert event_message(PhaseStarted(done=0, total=3, phase="fanout")) == "phase: fanout"
     assert event_message(PhaseStarted(done=3, total=6, phase="capsules")) == "phase: capsules"
 
-    hb_msg = event_message(Heartbeat(
-        done=1, total=3, elapsed_ms=12_500,
-        cost_so_far_usd=0.0234, cost_known=True,
-        pending_count=2, pending_slugs=["gpt-pro", "claude-opus"],
-    ))
+    hb_msg = event_message(
+        Heartbeat(
+            done=1,
+            total=3,
+            elapsed_ms=12_500,
+            cost_so_far_usd=0.0234,
+            cost_known=True,
+            pending_count=2,
+            pending_slugs=["gpt-pro", "claude-opus"],
+        )
+    )
     assert "12s" in hb_msg or "13s" in hb_msg
     assert "$0.0234" in hb_msg
     assert "2 pending" in hb_msg
     assert "gpt-pro" in hb_msg
 
     # Cost-unknown variant uses ≥ prefix to mark the total as a lower bound.
-    hb_unknown = event_message(Heartbeat(
-        done=1, total=3, elapsed_ms=1000,
-        cost_so_far_usd=0.5, cost_known=False,
-        pending_count=0, pending_slugs=[],
-    ))
+    hb_unknown = event_message(
+        Heartbeat(
+            done=1,
+            total=3,
+            elapsed_ms=1000,
+            cost_so_far_usd=0.5,
+            cost_known=False,
+            pending_count=0,
+            pending_slugs=[],
+        )
+    )
     assert "≥$0.5000" in hb_unknown
 
 
@@ -844,9 +894,7 @@ async def test_handle_read_resource_returns_body_text(tmp_path, monkeypatch):
     paths = artifacts.create_run()
     paths.response_text("alpha").write_text("the body")
 
-    body = await server_mod.handle_read_resource(
-        f"consult://runs/{paths.run_id}/responses/alpha"
-    )
+    body = await server_mod.handle_read_resource(f"consult://runs/{paths.run_id}/responses/alpha")
     assert body == "the body"
 
 
@@ -861,9 +909,7 @@ async def test_handle_read_resource_missing_body_raises(tmp_path, monkeypatch):
     paths = artifacts.create_run()
 
     with pytest.raises(FileNotFoundError):
-        await server_mod.handle_read_resource(
-            f"consult://runs/{paths.run_id}/responses/missing"
-        )
+        await server_mod.handle_read_resource(f"consult://runs/{paths.run_id}/responses/missing")
 
 
 @pytest.mark.asyncio
@@ -922,9 +968,13 @@ def test_progress_event_round_trips_through_json():
     assert parsed.phase == "capsules"
 
     hb = Heartbeat(
-        done=1, total=3, elapsed_ms=2500,
-        cost_so_far_usd=0.01, cost_known=True,
-        pending_count=2, pending_slugs=["a", "b"],
+        done=1,
+        total=3,
+        elapsed_ms=2500,
+        cost_so_far_usd=0.01,
+        cost_known=True,
+        pending_count=2,
+        pending_slugs=["a", "b"],
     )
     parsed = adapter.validate_json(hb.model_dump_json())
     assert isinstance(parsed, Heartbeat)
@@ -994,10 +1044,16 @@ async def test_fanout_emits_heartbeat_while_panellists_in_flight(tmp_path, monke
         await _asyncio.sleep(0.2)
         paths.response_text(slug).write_text("body")
         return ManifestEntry(
-            slug=slug, model_id="x/y", persona=None, status=Status.OK,
-            finish_reason="stop", resource_uri=paths.resource_uri(slug),
+            slug=slug,
+            model_id="x/y",
+            persona=None,
+            status=Status.OK,
+            finish_reason="stop",
+            resource_uri=paths.resource_uri(slug),
             body_path=str(paths.response_text(slug)),
-            latency_ms=200, cost_usd=0.01, cost_known=True,
+            latency_ms=200,
+            cost_usd=0.01,
+            cost_known=True,
         )
 
     monkeypatch.setattr(runner, "_call_one", fake_call)
@@ -1008,7 +1064,8 @@ async def test_fanout_emits_heartbeat_while_panellists_in_flight(tmp_path, monke
         events.append(event)
 
     handle = await fanout(
-        "p", [ModelSpec(model="claude-haiku", slug="alpha")],
+        "p",
+        [ModelSpec(model="claude-haiku", slug="alpha")],
         on_progress=on_progress,
     )
     assert handle.partial is False
@@ -1042,10 +1099,16 @@ async def test_fanout_heartbeat_disabled_when_interval_zero(tmp_path, monkeypatc
         await _asyncio.sleep(0.1)
         paths.response_text(slug).write_text("body")
         return ManifestEntry(
-            slug=slug, model_id="x/y", persona=None, status=Status.OK,
-            finish_reason="stop", resource_uri=paths.resource_uri(slug),
+            slug=slug,
+            model_id="x/y",
+            persona=None,
+            status=Status.OK,
+            finish_reason="stop",
+            resource_uri=paths.resource_uri(slug),
             body_path=str(paths.response_text(slug)),
-            latency_ms=100, cost_usd=0.0, cost_known=True,
+            latency_ms=100,
+            cost_usd=0.0,
+            cost_known=True,
         )
 
     monkeypatch.setattr(runner, "_call_one", fake_call)
@@ -1056,7 +1119,8 @@ async def test_fanout_heartbeat_disabled_when_interval_zero(tmp_path, monkeypatc
         events.append(event)
 
     await fanout(
-        "p", [ModelSpec(model="claude-haiku")],
+        "p",
+        [ModelSpec(model="claude-haiku")],
         on_progress=on_progress,
     )
     assert not any(isinstance(e, Heartbeat) for e in events)
@@ -1077,17 +1141,28 @@ async def test_capsule_annotate_emits_phase_started(tmp_path, monkeypatch):
     paths.prompt_txt.write_text("hello")
 
     entry = ManifestEntry(
-        slug="alpha", model_id="x/y", persona=None, status=Status.OK,
-        finish_reason="stop", resource_uri=paths.resource_uri("alpha"),
-        body_path=str(paths.response_text("alpha")), latency_ms=10,
-        cost_usd=0.0, cost_known=True,
+        slug="alpha",
+        model_id="x/y",
+        persona=None,
+        status=Status.OK,
+        finish_reason="stop",
+        resource_uri=paths.resource_uri("alpha"),
+        body_path=str(paths.response_text("alpha")),
+        latency_ms=10,
+        cost_usd=0.0,
+        cost_known=True,
     )
     paths.response_text("alpha").write_text("body content")
 
     handle = RunHandle(
-        run_id=paths.run_id, artifacts_dir=str(paths.root),
-        manifest=[entry], cost_usd=0.0, cost_known=True,
-        wall_ms=10, partial=False, blinded=False,
+        run_id=paths.run_id,
+        artifacts_dir=str(paths.root),
+        manifest=[entry],
+        cost_usd=0.0,
+        cost_known=True,
+        wall_ms=10,
+        partial=False,
+        blinded=False,
     )
 
     async def fake_extract_one(body, ext_id, timeout, original_question, *, kind="decision"):
@@ -1130,10 +1205,16 @@ async def test_fanout_slow_tail_dropout_cancels_stragglers(tmp_path, monkeypatch
             await _asyncio.sleep(5.0)
         paths.response_text(slug).write_text("ok")
         return ManifestEntry(
-            slug=slug, model_id="x/y", persona=None, status=Status.OK,
-            finish_reason="stop", resource_uri=paths.resource_uri(slug),
-            body_path=str(paths.response_text(slug)), latency_ms=1,
-            cost_usd=0.0, cost_known=True,
+            slug=slug,
+            model_id="x/y",
+            persona=None,
+            status=Status.OK,
+            finish_reason="stop",
+            resource_uri=paths.resource_uri(slug),
+            body_path=str(paths.response_text(slug)),
+            latency_ms=1,
+            cost_usd=0.0,
+            cost_known=True,
         )
 
     monkeypatch.setattr(runner, "_call_one", fake_call)
@@ -1174,10 +1255,16 @@ async def test_fanout_no_dropout_below_threshold_panel_size(tmp_path, monkeypatc
             await _asyncio.sleep(0.3)
         paths.response_text(slug).write_text("ok")
         return ManifestEntry(
-            slug=slug, model_id="x/y", persona=None, status=Status.OK,
-            finish_reason="stop", resource_uri=paths.resource_uri(slug),
-            body_path=str(paths.response_text(slug)), latency_ms=1,
-            cost_usd=0.0, cost_known=True,
+            slug=slug,
+            model_id="x/y",
+            persona=None,
+            status=Status.OK,
+            finish_reason="stop",
+            resource_uri=paths.resource_uri(slug),
+            body_path=str(paths.response_text(slug)),
+            latency_ms=1,
+            cost_usd=0.0,
+            cost_known=True,
         )
 
     monkeypatch.setattr(runner, "_call_one", fake_call)
@@ -1314,9 +1401,12 @@ async def test_acompletion_with_retry_recovers_from_bare_api_error(monkeypatch):
             class _Choice:
                 class _Msg:
                     content = "ok"
+
                 message = _Msg()
                 finish_reason = "stop"
+
             choices = [_Choice()]
+
         return _Resp()
 
     monkeypatch.setattr(runner.litellm, "acompletion", fake_acompletion)
@@ -1337,9 +1427,11 @@ async def test_acompletion_with_retry_does_not_retry_api_error_subclass(monkeypa
     monkeypatch.setenv("CONSULT_RETRY_BASE_DELAY", "0.01")
 
     from litellm import exceptions as lex
+
     auth_cls = getattr(lex, "AuthenticationError", None)
     if auth_cls is None:
         import pytest as _pytest
+
         _pytest.skip("litellm.AuthenticationError not available")
 
     attempts = 0
@@ -1348,7 +1440,9 @@ async def test_acompletion_with_retry_does_not_retry_api_error_subclass(monkeypa
         nonlocal attempts
         attempts += 1
         raise auth_cls(
-            message="bad key", llm_provider="openai", model=kwargs.get("model", "m"),
+            message="bad key",
+            llm_provider="openai",
+            model=kwargs.get("model", "m"),
         )
 
     monkeypatch.setattr(runner.litellm, "acompletion", fake_acompletion)
@@ -1387,17 +1481,23 @@ async def test_fanout_caps_per_provider_concurrency(tmp_path, monkeypatch):
             await _asyncio.sleep(0.05)
         finally:
             inflight -= 1
+
         # Build a minimal LiteLLM-like response object
         class _Msg:
             content = "ok\n\nCONFIDENCE: 0.7\nKEY_REASON: x"
             tool_calls = None
+
         class _Choice:
             message = _Msg()
             finish_reason = "stop"
+
         class _Resp:
             choices = [_Choice()]
             usage = None
-            def model_dump(self): return {"_stub": True}
+
+            def model_dump(self):
+                return {"_stub": True}
+
         return _Resp()
 
     monkeypatch.setattr(runner.litellm, "acompletion", fake_acompletion)
@@ -1580,9 +1680,7 @@ async def test_sequence_continues_through_partial_pricing(tmp_path, monkeypatch)
 
     monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
     # Return est_known=False to simulate the openrouter unknown-pricing case.
-    monkeypatch.setattr(
-        runner_mod, "estimate_cost", lambda *a, **kw: (0.0, False)
-    )
+    monkeypatch.setattr(runner_mod, "estimate_cost", lambda *a, **kw: (0.0, False))
 
     async def fake_fanout(prompt, specs, **kwargs):
         paths = artifacts.create_run()
@@ -1591,14 +1689,21 @@ async def test_sequence_continues_through_partial_pricing(tmp_path, monkeypatch)
             artifacts_dir=str(paths.root),
             manifest=[
                 ManifestEntry(
-                    slug="alpha", model_id="x/y", status=Status.OK,
+                    slug="alpha",
+                    model_id="x/y",
+                    status=Status.OK,
                     finish_reason="stop",
                     resource_uri=paths.resource_uri("alpha"),
                     body_path=str(paths.response_text("alpha")),
-                    latency_ms=1, cost_usd=0.01, cost_known=False,
+                    latency_ms=1,
+                    cost_usd=0.01,
+                    cost_known=False,
                 )
             ],
-            cost_usd=0.01, cost_known=False, wall_ms=1, partial=False,
+            cost_usd=0.01,
+            cost_known=False,
+            wall_ms=1,
+            partial=False,
         )
 
     async def fake_annotate(handle, **kwargs):
@@ -1662,18 +1767,21 @@ async def test_capsule_extractor_omits_temperature_for_gemini(monkeypatch):
 
     async def fake_completion(**kwargs):
         captured.append(kwargs)
+
         # Return a shape capsule._extract_one can parse cleanly
         class _Resp:
             def __init__(self):
-                self.choices = [type("Msg", (), {"message": type("M", (), {"content": '{"position": "x"}'})()})()]
+                self.choices = [
+                    type("Msg", (), {"message": type("M", (), {"content": '{"position": "x"}'})()})()
+                ]
+
             def model_dump(self):
                 return {}
+
         return _Resp()
 
     monkeypatch.setattr(litellm, "acompletion", fake_completion)
-    monkeypatch.setattr(
-        litellm, "completion_cost", lambda completion_response: 0.0
-    )
+    monkeypatch.setattr(litellm, "completion_cost", lambda completion_response: 0.0)
 
     # Gemini direct
     await capsule_mod._extract_one("hello body", "gemini/gemini-3.1-pro", 30)
@@ -1733,11 +1841,7 @@ def test_status_classifier_normal_responses():
 
     def make_resp(content, finish):
         return SimpleNamespace(
-            choices=[
-                SimpleNamespace(
-                    message=SimpleNamespace(content=content), finish_reason=finish
-                )
-            ]
+            choices=[SimpleNamespace(message=SimpleNamespace(content=content), finish_reason=finish)]
         )
 
     s, _, body = classify(make_resp("real content", "stop"))
@@ -1834,9 +1938,7 @@ def test_manifest_entry_validates_error_requirement():
     """Constructing an ERROR/TIMEOUT entry without an error string must fail."""
     import pydantic
 
-    base = dict(
-        slug="x", status=Status.ERROR, resource_uri="consult://x", body_path="/tmp/x"
-    )
+    base = dict(slug="x", status=Status.ERROR, resource_uri="consult://x", body_path="/tmp/x")
     with pytest.raises(pydantic.ValidationError):
         ManifestEntry(**base)
     # With error, it succeeds
@@ -1973,40 +2075,95 @@ def test_internal_models_forbid_unknown_fields():
     cases: list[tuple[type, dict]] = [
         (ModelSpec, {"model": "x"}),
         (Capsule, {}),
-        (ManifestEntry, {
-            "slug": "s", "status": "OK", "resource_uri": "consult://x",
-            "body_path": "/tmp/x",
-        }),
-        (RunHandle, {
-            "run_id": "r", "artifacts_dir": "/tmp", "manifest": [],
-            "cost_usd": 0.0, "wall_ms": 0,
-        }),
-        (RunResult, {
-            "run_id": "r", "synthesis": "", "manifest": [],
-            "cost_usd": 0.0, "wall_ms": 0,
-        }),
+        (
+            ManifestEntry,
+            {
+                "slug": "s",
+                "status": "OK",
+                "resource_uri": "consult://x",
+                "body_path": "/tmp/x",
+            },
+        ),
+        (
+            RunHandle,
+            {
+                "run_id": "r",
+                "artifacts_dir": "/tmp",
+                "manifest": [],
+                "cost_usd": 0.0,
+                "wall_ms": 0,
+            },
+        ),
+        (
+            RunResult,
+            {
+                "run_id": "r",
+                "synthesis": "",
+                "manifest": [],
+                "cost_usd": 0.0,
+                "wall_ms": 0,
+            },
+        ),
         (ArbiterVerdict, {"round": 1, "score": 0.5}),
-        (RefineResult, {
-            "run_id": "r", "rounds_completed": 0, "final_manifest": [],
-            "verdicts": [], "synthesis": "", "converged": False,
-            "threshold": 0.85, "cost_usd": 0.0, "wall_ms": 0,
-        }),
-        (SequenceStep, {
-            "step": 1, "run_id": "r", "synthesis": "", "cost_usd": 0.0,
-            "panel_size": 0,
-        }),
-        (SequenceResult, {
-            "final_synthesis": "", "cost_usd": 0.0, "wall_ms": 0,
-        }),
-        (LedgerRunEntry, {
-            "run_id": "r", "cost_usd": 0.0, "cost_known": True, "panel_size": 0,
-        }),
-        (DailyLedger, {
-            "date": "2026-01-01", "total_usd": 0.0, "total_known": True,
-        }),
-        (PanellistCompleted, {
-            "done": 0, "total": 0, "slug": "s", "status": "OK", "latency_ms": 0,
-        }),
+        (
+            RefineResult,
+            {
+                "run_id": "r",
+                "rounds_completed": 0,
+                "final_manifest": [],
+                "verdicts": [],
+                "synthesis": "",
+                "converged": False,
+                "threshold": 0.85,
+                "cost_usd": 0.0,
+                "wall_ms": 0,
+            },
+        ),
+        (
+            SequenceStep,
+            {
+                "step": 1,
+                "run_id": "r",
+                "synthesis": "",
+                "cost_usd": 0.0,
+                "panel_size": 0,
+            },
+        ),
+        (
+            SequenceResult,
+            {
+                "final_synthesis": "",
+                "cost_usd": 0.0,
+                "wall_ms": 0,
+            },
+        ),
+        (
+            LedgerRunEntry,
+            {
+                "run_id": "r",
+                "cost_usd": 0.0,
+                "cost_known": True,
+                "panel_size": 0,
+            },
+        ),
+        (
+            DailyLedger,
+            {
+                "date": "2026-01-01",
+                "total_usd": 0.0,
+                "total_known": True,
+            },
+        ),
+        (
+            PanellistCompleted,
+            {
+                "done": 0,
+                "total": 0,
+                "slug": "s",
+                "status": "OK",
+                "latency_ms": 0,
+            },
+        ),
     ]
     for cls, kwargs in cases:
         # Sanity: the baseline kwargs construct successfully
@@ -2145,9 +2302,7 @@ def _make_run_dir(
     for v in arbiters or []:
         (root / "arbiters" / f"round-{v['round']}.json").write_text(json.dumps(v))
     if progress_lines:
-        (root / "_progress.log").write_text(
-            "\n".join(json.dumps(p) for p in progress_lines) + "\n"
-        )
+        (root / "_progress.log").write_text("\n".join(json.dumps(p) for p in progress_lines) + "\n")
     return root
 
 
@@ -2162,22 +2317,24 @@ def test_viewer_render_run_panel_includes_core_sections(tmp_path, monkeypatch):
     _make_run_dir(
         tmp_path,
         rid,
-        entries=[{
-            "slug": "alpha",
-            "model_id": "anthropic/claude-opus-4-7",
-            "status": "OK",
-            "capsule": {
-                "position": "supports A",
-                "recommendation": "ship A",
-                "key_points": ["fast", "cheap"],
-            },
-            "resource_uri": f"consult://runs/{rid}/responses/alpha",
-            "body_path": "/x",
-            "latency_ms": 4200,
-            "cost_usd": 0.012,
-            "cost_known": True,
-            "confidence": 0.8,
-        }],
+        entries=[
+            {
+                "slug": "alpha",
+                "model_id": "anthropic/claude-opus-4-7",
+                "status": "OK",
+                "capsule": {
+                    "position": "supports A",
+                    "recommendation": "ship A",
+                    "key_points": ["fast", "cheap"],
+                },
+                "resource_uri": f"consult://runs/{rid}/responses/alpha",
+                "body_path": "/x",
+                "latency_ms": 4200,
+                "cost_usd": 0.012,
+                "cost_known": True,
+                "confidence": 0.8,
+            }
+        ],
         bodies={"alpha": "alpha body text"},
     )
     out = viewer.render_run(rid)
@@ -2210,12 +2367,18 @@ def test_viewer_render_run_consult_renders_synthesis_markdown(tmp_path, monkeypa
     _make_run_dir(
         tmp_path,
         rid,
-        entries=[{
-            "slug": "alpha", "model_id": "x/y", "status": "OK",
-            "resource_uri": f"consult://runs/{rid}/responses/alpha",
-            "body_path": "/x", "latency_ms": 1, "cost_usd": 0.0,
-            "cost_known": True,
-        }],
+        entries=[
+            {
+                "slug": "alpha",
+                "model_id": "x/y",
+                "status": "OK",
+                "resource_uri": f"consult://runs/{rid}/responses/alpha",
+                "body_path": "/x",
+                "latency_ms": 1,
+                "cost_usd": 0.0,
+                "cost_known": True,
+            }
+        ],
         synth="# Consensus\n\n- point one\n- point two",
         extras={"synthesiser": "gemini-pro"},
     )
@@ -2241,21 +2404,35 @@ def test_viewer_render_run_refine_shows_arbiter_rounds_and_groups_panellists(tmp
         rid,
         entries=[
             {
-                "slug": "alpha.r1", "model_id": "x/y", "status": "OK",
+                "slug": "alpha.r1",
+                "model_id": "x/y",
+                "status": "OK",
                 "resource_uri": f"consult://runs/{rid}/responses/alpha.r1",
-                "body_path": "/x", "latency_ms": 1, "cost_usd": 0.0,
+                "body_path": "/x",
+                "latency_ms": 1,
+                "cost_usd": 0.0,
                 "cost_known": True,
             },
             {
-                "slug": "alpha.r2", "model_id": "x/y", "status": "OK",
+                "slug": "alpha.r2",
+                "model_id": "x/y",
+                "status": "OK",
                 "resource_uri": f"consult://runs/{rid}/responses/alpha.r2",
-                "body_path": "/x", "latency_ms": 1, "cost_usd": 0.0,
+                "body_path": "/x",
+                "latency_ms": 1,
+                "cost_usd": 0.0,
                 "cost_known": True,
             },
         ],
         synth="final synth",
         arbiters=[
-            {"round": 1, "score": 0.5, "gaps": ["missing X"], "next_round_focus": "address X", "reasoning": "r1"},
+            {
+                "round": 1,
+                "score": 0.5,
+                "gaps": ["missing X"],
+                "next_round_focus": "address X",
+                "reasoning": "r1",
+            },
             {"round": 2, "score": 0.9, "gaps": [], "next_round_focus": "", "reasoning": "r2"},
         ],
     )
@@ -2285,12 +2462,18 @@ def test_viewer_render_run_escapes_panellist_bodies(tmp_path, monkeypatch):
     _make_run_dir(
         tmp_path,
         rid,
-        entries=[{
-            "slug": "alpha", "model_id": "x/y", "status": "OK",
-            "resource_uri": f"consult://runs/{rid}/responses/alpha",
-            "body_path": "/x", "latency_ms": 1, "cost_usd": 0.0,
-            "cost_known": True,
-        }],
+        entries=[
+            {
+                "slug": "alpha",
+                "model_id": "x/y",
+                "status": "OK",
+                "resource_uri": f"consult://runs/{rid}/responses/alpha",
+                "body_path": "/x",
+                "latency_ms": 1,
+                "cost_usd": 0.0,
+                "cost_known": True,
+            }
+        ],
         bodies={"alpha": "<script>alert(1)</script>"},
     )
     out = viewer.render_run(rid)
@@ -2310,17 +2493,35 @@ def test_viewer_render_run_renders_progress_timeline(tmp_path, monkeypatch):
     _make_run_dir(
         tmp_path,
         rid,
-        entries=[{
-            "slug": "alpha", "model_id": "x/y", "status": "OK",
-            "resource_uri": f"consult://runs/{rid}/responses/alpha",
-            "body_path": "/x", "latency_ms": 1, "cost_usd": 0.0,
-            "cost_known": True,
-        }],
+        entries=[
+            {
+                "slug": "alpha",
+                "model_id": "x/y",
+                "status": "OK",
+                "resource_uri": f"consult://runs/{rid}/responses/alpha",
+                "body_path": "/x",
+                "latency_ms": 1,
+                "cost_usd": 0.0,
+                "cost_known": True,
+            }
+        ],
         progress_lines=[
-            {"ts": "2026-05-20T10:18:09.000000+00:00", "done": 0, "total": 0,
-             "kind": "panellist_completed", "slug": "alpha", "status": "OK", "latency_ms": 1234},
-            {"ts": "2026-05-20T10:18:13.500000+00:00", "done": 1, "total": 1,
-             "kind": "capsule_extracted", "slug": "alpha"},
+            {
+                "ts": "2026-05-20T10:18:09.000000+00:00",
+                "done": 0,
+                "total": 0,
+                "kind": "panellist_completed",
+                "slug": "alpha",
+                "status": "OK",
+                "latency_ms": 1234,
+            },
+            {
+                "ts": "2026-05-20T10:18:13.500000+00:00",
+                "done": 1,
+                "total": 1,
+                "kind": "capsule_extracted",
+                "slug": "alpha",
+            },
         ],
     )
     out = viewer.render_run(rid)
@@ -2345,14 +2546,18 @@ def test_viewer_render_run_handles_missing_optional_artifacts(tmp_path, monkeypa
     root = tmp_path / rid
     (root / "responses").mkdir(parents=True)
     # Bare-minimum manifest, no other artifacts at all
-    (root / "manifest.json").write_text(json.dumps({
-        "run_id": rid,
-        "artifacts_dir": str(root),
-        "manifest": [],
-        "cost_usd": 0.0,
-        "wall_ms": 0,
-        "partial": False,
-    }))
+    (root / "manifest.json").write_text(
+        json.dumps(
+            {
+                "run_id": rid,
+                "artifacts_dir": str(root),
+                "manifest": [],
+                "cost_usd": 0.0,
+                "wall_ms": 0,
+                "partial": False,
+            }
+        )
+    )
     out = viewer.render_run(rid)
     text = out.read_text()
     assert rid in text
@@ -2416,12 +2621,18 @@ def test_viewer_cli_writes_path_to_stdout(tmp_path, monkeypatch, capsys):
     _make_run_dir(
         tmp_path,
         rid,
-        entries=[{
-            "slug": "alpha", "model_id": "x/y", "status": "OK",
-            "resource_uri": f"consult://runs/{rid}/responses/alpha",
-            "body_path": "/x", "latency_ms": 1, "cost_usd": 0.0,
-            "cost_known": True,
-        }],
+        entries=[
+            {
+                "slug": "alpha",
+                "model_id": "x/y",
+                "status": "OK",
+                "resource_uri": f"consult://runs/{rid}/responses/alpha",
+                "body_path": "/x",
+                "latency_ms": 1,
+                "cost_usd": 0.0,
+                "cost_known": True,
+            }
+        ],
     )
 
     opened: list[str] = []
@@ -2444,12 +2655,18 @@ def test_viewer_cli_open_flag_launches_browser(tmp_path, monkeypatch, capsys):
     _make_run_dir(
         tmp_path,
         rid,
-        entries=[{
-            "slug": "alpha", "model_id": "x/y", "status": "OK",
-            "resource_uri": f"consult://runs/{rid}/responses/alpha",
-            "body_path": "/x", "latency_ms": 1, "cost_usd": 0.0,
-            "cost_known": True,
-        }],
+        entries=[
+            {
+                "slug": "alpha",
+                "model_id": "x/y",
+                "status": "OK",
+                "resource_uri": f"consult://runs/{rid}/responses/alpha",
+                "body_path": "/x",
+                "latency_ms": 1,
+                "cost_usd": 0.0,
+                "cost_known": True,
+            }
+        ],
     )
 
     opened: list[str] = []
@@ -2599,9 +2816,9 @@ def test_context_trim_synth_input_trims_largest_body_first():
         original_prompt="prompt", bodies=bodies, overall_budget=15_000
     )
     assert len(new_bodies["small"]) == 1_000  # untouched
-    assert len(new_bodies["big"]) < 50_000     # trimmed
+    assert len(new_bodies["big"]) < 50_000  # trimmed
     assert "TRIMMED" in new_bodies["big"]
-    assert new_prompt == "prompt"               # prompt is the last resort
+    assert new_prompt == "prompt"  # prompt is the last resort
 
 
 def test_context_trim_synth_input_passes_through_when_under_budget():
@@ -2649,46 +2866,56 @@ async def test_synth_writes_synth_input_with_original_prompt(tmp_path, monkeypat
     # Synthetic 2-panellist manifest + bodies on disk
     manifest = [
         ManifestEntry(
-            slug="alpha", model_id="anthropic/claude-opus-4-7", status=Status.OK,
+            slug="alpha",
+            model_id="anthropic/claude-opus-4-7",
+            status=Status.OK,
             resource_uri=paths.resource_uri("alpha"),
             body_path=str(paths.response_text("alpha")),
-            latency_ms=100, cost_known=True,
+            latency_ms=100,
+            cost_known=True,
         ),
         ManifestEntry(
-            slug="beta", model_id="openai/gpt-5.5-pro", status=Status.OK,
+            slug="beta",
+            model_id="openai/gpt-5.5-pro",
+            status=Status.OK,
             resource_uri=paths.resource_uri("beta"),
             body_path=str(paths.response_text("beta")),
-            latency_ms=120, cost_known=True,
+            latency_ms=120,
+            cost_known=True,
         ),
     ]
     paths.response_text("alpha").write_text("Found a race condition at line 42.")
     paths.response_text("beta").write_text("Found a SQL injection at line 117.")
-    artifacts.write_manifest(paths, {
-        "run_id": paths.run_id,
-        "artifacts_dir": str(paths.root),
-        "manifest": [m.model_dump(mode="json") for m in manifest],
-        "cost_usd": 0.0,
-        "cost_known": True,
-        "wall_ms": 0,
-        "partial": False,
-        "blinded": False,
-    })
+    artifacts.write_manifest(
+        paths,
+        {
+            "run_id": paths.run_id,
+            "artifacts_dir": str(paths.root),
+            "manifest": [m.model_dump(mode="json") for m in manifest],
+            "cost_usd": 0.0,
+            "cost_known": True,
+            "wall_ms": 0,
+            "partial": False,
+            "blinded": False,
+        },
+    )
 
     # Stub out the actual LiteLLM call — we only care about what gets written
     # to synth_input.txt.
     async def fake_acompletion(**kwargs):
         from types import SimpleNamespace
+
         return SimpleNamespace(
-            choices=[SimpleNamespace(
-                message=SimpleNamespace(content="STUBBED SYNTHESIS"),
-                finish_reason="stop",
-            )]
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content="STUBBED SYNTHESIS"),
+                    finish_reason="stop",
+                )
+            ]
         )
 
     monkeypatch.setattr("consult.synth.litellm.acompletion", fake_acompletion)
-    monkeypatch.setattr(
-        "consult.synth.litellm.completion_cost", lambda completion_response: 0.0
-    )
+    monkeypatch.setattr("consult.synth.litellm.completion_cost", lambda completion_response: 0.0)
 
     await synth_mod.synthesise(paths.run_id)
 
@@ -2705,12 +2932,13 @@ def test_synth_build_input_prepends_original_prompt_section():
     from consult.synth import _build_input
 
     manifest = [
-        {"slug": "alpha", "model_id": "x", "persona": None, "confidence": None,
-         "status": "OK"},
+        {"slug": "alpha", "model_id": "x", "persona": None, "confidence": None, "status": "OK"},
     ]
     bodies = {"alpha": "BODY-TEXT"}
     out, _label_map = _build_input(
-        manifest, bodies, rubric="rubric for {n} responses",
+        manifest,
+        bodies,
+        rubric="rubric for {n} responses",
         original_prompt="PROMPT-TEXT",
     )
     assert "Original question / source" in out
@@ -2725,12 +2953,13 @@ def test_synth_build_input_without_original_prompt_is_legacy_shape():
     from consult.synth import _build_input
 
     manifest = [
-        {"slug": "alpha", "model_id": "x", "persona": None, "confidence": None,
-         "status": "OK"},
+        {"slug": "alpha", "model_id": "x", "persona": None, "confidence": None, "status": "OK"},
     ]
     bodies = {"alpha": "BODY-TEXT"}
     out, _label_map = _build_input(
-        manifest, bodies, rubric="rubric for {n} responses",
+        manifest,
+        bodies,
+        rubric="rubric for {n} responses",
     )
     assert "Original question / source" not in out
     assert "BODY-TEXT" in out
@@ -2784,7 +3013,8 @@ def test_refine_format_position_diff_shows_changes_and_unchanged():
 
     def entry(slug: str, position: str) -> ManifestEntry:
         return ManifestEntry(
-            slug=slug, status=Status.OK,
+            slug=slug,
+            status=Status.OK,
             resource_uri=f"consult://runs/x/responses/{slug}",
             body_path=f"/x/{slug}",
             capsule=Capsule(position=position),
@@ -2817,15 +3047,18 @@ def test_refine_format_position_diff_handles_review_capsules():
 
     def entry(slug: str, verdict: str, findings: int) -> ManifestEntry:
         return ManifestEntry(
-            slug=slug, status=Status.OK,
+            slug=slug,
+            status=Status.OK,
             resource_uri=f"consult://runs/x/responses/{slug}",
             body_path=f"/x/{slug}",
             capsule=ReviewCapsule(
                 overall_verdict=verdict,
                 findings=[
                     Finding(
-                        severity="blocker", category="security",
-                        summary=f"finding {i}", suggestion="fix it",
+                        severity="blocker",
+                        category="security",
+                        summary=f"finding {i}",
+                        suggestion="fix it",
                     )
                     for i in range(findings)
                 ],
@@ -2849,7 +3082,8 @@ def test_refine_format_position_diff_handles_research_capsules():
 
     def entry(slug: str, n_claims: int) -> ManifestEntry:
         return ManifestEntry(
-            slug=slug, status=Status.OK,
+            slug=slug,
+            status=Status.OK,
             resource_uri=f"consult://runs/x/responses/{slug}",
             body_path=f"/x/{slug}",
             capsule=ResearchCapsule(
@@ -2873,15 +3107,18 @@ def test_refine_format_capsules_handles_review_kind():
     from consult.types import Finding, ManifestEntry, ReviewCapsule, Status
 
     m = ManifestEntry(
-        slug="alpha", status=Status.OK,
+        slug="alpha",
+        status=Status.OK,
         resource_uri="consult://runs/x/responses/alpha",
         body_path="/x/alpha",
         capsule=ReviewCapsule(
             overall_verdict="changes_requested",
             findings=[
                 Finding(
-                    severity="blocker", file="src/auth.py",
-                    line_range=(42, 58), category="security",
+                    severity="blocker",
+                    file="src/auth.py",
+                    line_range=(42, 58),
+                    category="security",
                     summary="SQL injection in login",
                     suggestion="use parameterised query",
                 ),
@@ -2895,7 +3132,8 @@ def test_refine_format_capsules_handles_review_kind():
 
 @pytest.mark.asyncio
 async def test_refine_round_two_passes_per_panellist_conversation(
-    tmp_path, monkeypatch,
+    tmp_path,
+    monkeypatch,
 ):
     """Round 2's fanout must receive `prior_turns_by_slug` populated with
     each panellist's round-1 (user, assistant) pair. Round 1 must NOT —
@@ -2929,12 +3167,14 @@ async def test_refine_round_two_passes_per_panellist_conversation(
         # retroactively change what we observed (refine reuses the same
         # `panel_conversations` dict whose values are the lists we'd be
         # capturing by reference).
-        fanout_calls.append({
-            "prompt": prompt,
-            "specs": [(s.model, s.slug) for s in specs],
-            "prior_turns": copy.deepcopy(kwargs.get("prior_turns")),
-            "prior_turns_by_slug": copy.deepcopy(kwargs.get("prior_turns_by_slug")),
-        })
+        fanout_calls.append(
+            {
+                "prompt": prompt,
+                "specs": [(s.model, s.slug) for s in specs],
+                "prior_turns": copy.deepcopy(kwargs.get("prior_turns")),
+                "prior_turns_by_slug": copy.deepcopy(kwargs.get("prior_turns_by_slug")),
+            }
+        )
         # Use the existing run dir (existing_paths) when refine passes one
         paths = kwargs.get("existing_paths") or artifacts.create_run()
         # Write a body file per slug so refine's post-round bookkeeping
@@ -2945,13 +3185,19 @@ async def test_refine_round_two_passes_per_panellist_conversation(
             body_path = paths.root / "responses" / f"{slug}.txt"
             body_path.parent.mkdir(parents=True, exist_ok=True)
             body_path.write_text(f"{slug} body for round")
-            manifest.append(ManifestEntry(
-                slug=slug, model_id="x/a", status=Status.OK,
-                resource_uri=f"consult://x/{slug}",
-                body_path=str(body_path),
-                latency_ms=10, cost_usd=0.001, cost_known=True,
-                capsule=Capsule(position=f"{slug} position"),
-            ))
+            manifest.append(
+                ManifestEntry(
+                    slug=slug,
+                    model_id="x/a",
+                    status=Status.OK,
+                    resource_uri=f"consult://x/{slug}",
+                    body_path=str(body_path),
+                    latency_ms=10,
+                    cost_usd=0.001,
+                    cost_known=True,
+                    capsule=Capsule(position=f"{slug} position"),
+                )
+            )
         return RunHandle(
             run_id=paths.run_id,
             artifacts_dir=str(paths.root),
@@ -2974,6 +3220,7 @@ async def test_refine_round_two_passes_per_panellist_conversation(
 
     async def fake_synth(*args, **kwargs):
         from consult import synth as _synth_mod
+
         return _synth_mod.SynthResult(text="final synth")
 
     async def fake_aestimate(*a, **kw):
@@ -3041,11 +3288,16 @@ async def test_runner_fanout_dispatches_prior_turns_by_slug(monkeypatch, tmp_pat
     async def fake_call_one(spec, slug, per_slug_prompt, paths, provider_sems, **kw):
         captured[slug] = kw.get("prior_turns") or []
         from consult.types import ManifestEntry, Status
+
         return ManifestEntry(
-            slug=slug, model_id=spec.model, status=Status.OK,
+            slug=slug,
+            model_id=spec.model,
+            status=Status.OK,
             resource_uri=f"consult://x/{slug}",
             body_path=str(paths.response_text(slug)),
-            latency_ms=1, cost_usd=0.0, cost_known=True,
+            latency_ms=1,
+            cost_usd=0.0,
+            cost_known=True,
         )
 
     monkeypatch.setattr(runner, "_call_one", fake_call_one)
@@ -3124,12 +3376,19 @@ async def test_refine_inherits_capsule_kind_from_continuation(tmp_path, monkeypa
         return RunHandle(
             run_id=prior.run_id,
             artifacts_dir=str(prior.root),
-            manifest=[ManifestEntry(
-                slug="alpha.r1", status=Status.OK,
-                resource_uri="consult://runs/x/responses/alpha.r1",
-                body_path="/x", latency_ms=10, cost_known=True,
-            )],
-            cost_usd=0.0, cost_known=True, wall_ms=0,
+            manifest=[
+                ManifestEntry(
+                    slug="alpha.r1",
+                    status=Status.OK,
+                    resource_uri="consult://runs/x/responses/alpha.r1",
+                    body_path="/x",
+                    latency_ms=10,
+                    cost_known=True,
+                )
+            ],
+            cost_usd=0.0,
+            cost_known=True,
+            wall_ms=0,
         )
 
     async def fake_annotate(handle, **kwargs):
@@ -3141,6 +3400,7 @@ async def test_refine_inherits_capsule_kind_from_continuation(tmp_path, monkeypa
 
     async def fake_synth(*args, **kwargs):
         from consult import synth as _synth_mod
+
         return _synth_mod.SynthResult(text="synthesised")
 
     monkeypatch.setattr("consult.refine.runner.fanout", fake_fanout)
@@ -3150,16 +3410,22 @@ async def test_refine_inherits_capsule_kind_from_continuation(tmp_path, monkeypa
 
     # Implicit inheritance — caller doesn't pass capsule_kind
     await refine_mod.refine(
-        "follow-up", [ModelSpec(model="claude-haiku")],
-        threshold=0.5, max_rounds=1, continuation_id=prior.run_id,
+        "follow-up",
+        [ModelSpec(model="claude-haiku")],
+        threshold=0.5,
+        max_rounds=1,
+        continuation_id=prior.run_id,
     )
     assert captured.get("annotate_kind") == "review"
 
     # Explicit override
     captured.clear()
     await refine_mod.refine(
-        "follow-up", [ModelSpec(model="claude-haiku")],
-        threshold=0.5, max_rounds=1, continuation_id=prior.run_id,
+        "follow-up",
+        [ModelSpec(model="claude-haiku")],
+        threshold=0.5,
+        max_rounds=1,
+        continuation_id=prior.run_id,
         capsule_kind="research",
     )
     assert captured.get("annotate_kind") == "research"
@@ -3201,8 +3467,12 @@ async def test_stream_acompletion_raises_on_builder_failure(monkeypatch):
 
     with pytest.raises(RuntimeError, match="stream_chunk_builder failed"):
         await _stream_acompletion(
-            timeout=10.0, on_partial=None, start=0.0,
-            model="x/y", messages=[], max_tokens=100,
+            timeout=10.0,
+            on_partial=None,
+            start=0.0,
+            model="x/y",
+            messages=[],
+            max_tokens=100,
         )
 
 
@@ -3212,16 +3482,14 @@ def test_synth_build_input_rubric_with_literal_braces_does_not_crash():
     example). Switched to `.replace("{n}", ...)`."""
     from consult.synth import _build_input
 
-    rubric_with_braces = (
-        "You have {n} responses.\n\nExpected JSON shape: "
-        "{ \"verdict\": \"ship\" }"
-    )
+    rubric_with_braces = 'You have {n} responses.\n\nExpected JSON shape: { "verdict": "ship" }'
     manifest = [
-        {"slug": "alpha", "model_id": "x", "persona": None,
-         "confidence": None, "status": "OK"},
+        {"slug": "alpha", "model_id": "x", "persona": None, "confidence": None, "status": "OK"},
     ]
     out, _label_map = _build_input(
-        manifest, {"alpha": "body"}, rubric=rubric_with_braces,
+        manifest,
+        {"alpha": "body"},
+        rubric=rubric_with_braces,
     )
     assert "1 responses" in out
     assert '{ "verdict": "ship" }' in out
@@ -3250,7 +3518,9 @@ def test_context_trim_synth_input_proportional_hard_trim_on_large_panel():
     # 100000, still over budget. Hard-trim kicks in.
     bodies = {f"slug-{i}": "X" * 10_000 for i in range(20)}
     new_prompt, new_bodies = ctx.trim_synth_input(
-        original_prompt=None, bodies=bodies, overall_budget=50_000,
+        original_prompt=None,
+        bodies=bodies,
+        overall_budget=50_000,
     )
     total = sum(len(b) for b in new_bodies.values())
     # Allow a small overhead per body for trim markers
@@ -3291,12 +3561,14 @@ def test_runner_writes_context_bundle_at_run_init(tmp_path, monkeypatch):
 
     monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
     # dry_run avoids any API call but still triggers run-init.
-    handle = asyncio.run(fanout(
-        "test prompt with claude reference",
-        [ModelSpec(model="claude-haiku")],
-        dry_run=True,
-        blinded=True,
-    ))
+    handle = asyncio.run(
+        fanout(
+            "test prompt with claude reference",
+            [ModelSpec(model="claude-haiku")],
+            dry_run=True,
+            blinded=True,
+        )
+    )
     paths = artifacts.load_run(handle.run_id)
     bundle = ctx.load_or_none(paths)
     assert bundle is not None
@@ -3317,20 +3589,33 @@ def test_manifest_carries_schema_version():
     from consult.types import RefineResult, RunHandle, RunResult
 
     rh = RunHandle(
-        run_id="x", artifacts_dir="/x", manifest=[],
-        cost_usd=0.0, wall_ms=0,
+        run_id="x",
+        artifacts_dir="/x",
+        manifest=[],
+        cost_usd=0.0,
+        wall_ms=0,
     )
     assert rh.model_dump()["schema_version"] >= 2
 
     rr = RunResult(
-        run_id="x", synthesis="s", manifest=[], cost_usd=0.0, wall_ms=0,
+        run_id="x",
+        synthesis="s",
+        manifest=[],
+        cost_usd=0.0,
+        wall_ms=0,
     )
     assert rr.model_dump()["schema_version"] >= 2
 
     rfr = RefineResult(
-        run_id="x", rounds_completed=0, final_manifest=[], verdicts=[],
-        synthesis="s", converged=False, threshold=0.85,
-        cost_usd=0.0, wall_ms=0,
+        run_id="x",
+        rounds_completed=0,
+        final_manifest=[],
+        verdicts=[],
+        synthesis="s",
+        converged=False,
+        threshold=0.85,
+        cost_usd=0.0,
+        wall_ms=0,
     )
     assert rfr.model_dump()["schema_version"] >= 2
 
@@ -3368,8 +3653,11 @@ def test_review_capsule_round_trips():
     review = ReviewCapsule(
         findings=[
             Finding(
-                severity="blocker", file="src/auth.py", line_range=(42, 58),
-                category="security", summary="SQL injection in login",
+                severity="blocker",
+                file="src/auth.py",
+                line_range=(42, 58),
+                category="security",
+                summary="SQL injection in login",
                 suggestion="use parameterised query",
             ),
         ],
@@ -3377,8 +3665,10 @@ def test_review_capsule_round_trips():
         confidence=0.9,
     )
     entry = ManifestEntry(
-        slug="alpha", status="OK",
-        resource_uri="consult://runs/x/responses/alpha", body_path="/x",
+        slug="alpha",
+        status="OK",
+        resource_uri="consult://runs/x/responses/alpha",
+        body_path="/x",
         capsule=review,
     )
     dumped = entry.model_dump()
@@ -3401,8 +3691,10 @@ def test_research_capsule_round_trips():
         confidence=0.7,
     )
     entry = ManifestEntry(
-        slug="alpha", status="OK",
-        resource_uri="consult://runs/x/responses/alpha", body_path="/x",
+        slug="alpha",
+        status="OK",
+        resource_uri="consult://runs/x/responses/alpha",
+        body_path="/x",
         capsule=research,
     )
     dumped = entry.model_dump()
@@ -3430,9 +3722,7 @@ def test_capsule_kind_picks_correct_prompt_head():
     assert _CAPSULE_PROMPT_HEAD_RESEARCH.split("\n")[0] in research_p
     # Unknown kinds default to decision (so a typo doesn't silently produce
     # zero-data capsules).
-    assert _CAPSULE_PROMPT_HEAD_DECISION.split("\n")[0] in _build_capsule_prompt(
-        body, None, kind="nonsense"
-    )
+    assert _CAPSULE_PROMPT_HEAD_DECISION.split("\n")[0] in _build_capsule_prompt(body, None, kind="nonsense")
 
 
 def test_registry_resolve_rubric_loads_named_packaged_rubrics():
@@ -3466,9 +3756,7 @@ def test_progress_panellist_partial_event_message():
     """The new PanellistPartial event has a stable wire message."""
     from consult.progress import PanellistPartial, event_message
 
-    ev = PanellistPartial(
-        done=2, total=8, slug="alpha", chars_so_far=1500, elapsed_ms=4200
-    )
+    ev = PanellistPartial(done=2, total=8, slug="alpha", chars_so_far=1500, elapsed_ms=4200)
     msg = event_message(ev)
     assert "alpha" in msg
     assert "1500" in msg
@@ -3484,14 +3772,27 @@ async def test_fanout_stream_env_var_enables_streaming(tmp_path, monkeypatch):
 
     captured: dict[str, bool] = {}
 
-    async def fake_call(spec, slug, per_prompt, paths, provider_sems=None, *, stream=False, on_partial=None, prior_turns=None, **_):
+    async def fake_call(
+        spec,
+        slug,
+        per_prompt,
+        paths,
+        provider_sems=None,
+        *,
+        stream=False,
+        on_partial=None,
+        prior_turns=None,
+        **_,
+    ):
         captured["stream"] = stream
         paths.response_text(slug).write_text("body")
         return ManifestEntry(
-            slug=slug, status=Status.OK,
+            slug=slug,
+            status=Status.OK,
             resource_uri=paths.resource_uri(slug),
             body_path=str(paths.response_text(slug)),
-            latency_ms=10, cost_known=True,
+            latency_ms=10,
+            cost_known=True,
         )
 
     monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
@@ -3510,14 +3811,27 @@ async def test_fanout_stream_default_off(tmp_path, monkeypatch):
 
     captured: dict[str, bool] = {}
 
-    async def fake_call(spec, slug, per_prompt, paths, provider_sems=None, *, stream=False, on_partial=None, prior_turns=None, **_):
+    async def fake_call(
+        spec,
+        slug,
+        per_prompt,
+        paths,
+        provider_sems=None,
+        *,
+        stream=False,
+        on_partial=None,
+        prior_turns=None,
+        **_,
+    ):
         captured["stream"] = stream
         paths.response_text(slug).write_text("body")
         return ManifestEntry(
-            slug=slug, status=Status.OK,
+            slug=slug,
+            status=Status.OK,
             resource_uri=paths.resource_uri(slug),
             body_path=str(paths.response_text(slug)),
-            latency_ms=10, cost_known=True,
+            latency_ms=10,
+            cost_known=True,
         )
 
     monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
@@ -3632,9 +3946,7 @@ def test_sources_resolve_git_diff_uses_double_dash_separator(monkeypatch, tmp_pa
 
     def fake_run(cmd, **kwargs):
         captured["cmd"] = cmd
-        return subprocess.CompletedProcess(
-            args=cmd, returncode=0, stdout="diff body", stderr=""
-        )
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="diff body", stderr="")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
     monkeypatch.setenv("CONSULT_TRUSTED_REPO_ROOTS", str(tmp_path))
@@ -3696,12 +4008,8 @@ def test_sources_resolve_git_diff_against_real_repo(tmp_path, monkeypatch):
     monkeypatch.setenv("CONSULT_TRUSTED_REPO_ROOTS", str(tmp_path))
     # Init repo
     subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
-    subprocess.run(
-        ["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True
-    )
-    subprocess.run(
-        ["git", "config", "user.name", "Test"], cwd=tmp_path, check=True
-    )
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp_path, check=True)
     # First commit
     (tmp_path / "hello.py").write_text("print('hi')\n")
     subprocess.run(["git", "add", "hello.py"], cwd=tmp_path, check=True)
@@ -3727,9 +4035,14 @@ async def test_handle_sequence_per_step_attachments(tmp_path, monkeypatch):
 
     async def fake_sequence(prompts, specs, **kwargs):
         from consult.sequence import SequenceResult
+
         captured["prompts"] = list(prompts)
         return SequenceResult(
-            steps=[], final_synthesis="", cost_usd=0.0, cost_known=True, wall_ms=0,
+            steps=[],
+            final_synthesis="",
+            cost_usd=0.0,
+            cost_known=True,
+            wall_ms=0,
         )
 
     monkeypatch.setattr("consult.mcp.handlers.sequence_mod.sequence", fake_sequence)
@@ -3764,9 +4077,7 @@ async def test_handle_sequence_per_step_attachments(tmp_path, monkeypatch):
 # ---- Live tests (gated on API keys) ----------------------------------------
 
 
-HAVE_KEYS = bool(
-    os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("OPENROUTER_API_KEY")
-)
+HAVE_KEYS = bool(os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("OPENROUTER_API_KEY"))
 
 
 # ---- build_messages: prior_turns role boundaries ---------------------------
@@ -3839,10 +4150,16 @@ async def test_fanout_threads_prior_turns_into_call_one(tmp_path, monkeypatch):
     async def fake_call(spec, slug, per_prompt, paths, provider_sems=None, **kwargs):
         seen.append(kwargs.get("prior_turns"))
         return ManifestEntry(
-            slug=slug, model_id="x/y", persona=None, status=Status.OK,
-            finish_reason="stop", resource_uri=paths.resource_uri(slug),
+            slug=slug,
+            model_id="x/y",
+            persona=None,
+            status=Status.OK,
+            finish_reason="stop",
+            resource_uri=paths.resource_uri(slug),
             body_path=str(paths.response_text(slug)),
-            latency_ms=10, cost_usd=0.0, cost_known=True,
+            latency_ms=10,
+            cost_usd=0.0,
+            cost_known=True,
         )
 
     monkeypatch.setattr(runner, "_call_one", fake_call)
@@ -4009,8 +4326,13 @@ async def test_refine_breaks_when_fanout_returns_partial(tmp_path, monkeypatch):
     async def fake_arbiter(*args, **kwargs):
         arbiter_called["n"] += 1
         return ArbiterVerdict(
-            round=1, score=1.0, gaps=[], reasoning="should not be reached",
-            cost_usd=0.0, cost_known=True, parsed_ok=True,
+            round=1,
+            score=1.0,
+            gaps=[],
+            reasoning="should not be reached",
+            cost_usd=0.0,
+            cost_known=True,
+            parsed_ok=True,
         )
 
     monkeypatch.setattr(refine_mod, "_ask_arbiter", fake_arbiter)
@@ -4034,6 +4356,7 @@ async def test_refine_breaks_when_fanout_returns_partial(tmp_path, monkeypatch):
 
     async def fake_synth(run_id, **kwargs):
         from consult import synth as _synth_mod
+
         return _synth_mod.SynthResult(text="(no rounds completed — see partial_reason)")
 
     monkeypatch.setattr(refine_mod.synth, "synthesise", fake_synth)
@@ -4100,18 +4423,30 @@ async def test_slow_tail_dropout_marks_cost_unknown_for_cancelled(tmp_path, monk
         if "haiku" in spec.model:
             await aio.sleep(0.01)
             return ManifestEntry(
-                slug=slug, model_id="x/y", persona=None, status=Status.OK,
-                finish_reason="stop", resource_uri=paths.resource_uri(slug),
+                slug=slug,
+                model_id="x/y",
+                persona=None,
+                status=Status.OK,
+                finish_reason="stop",
+                resource_uri=paths.resource_uri(slug),
                 body_path=str(paths.response_text(slug)),
-                latency_ms=10, cost_usd=0.0, cost_known=True,
+                latency_ms=10,
+                cost_usd=0.0,
+                cost_known=True,
             )
         # Slow panellists — will be cancelled by slow-tail dropout
         await aio.sleep(60)
         return ManifestEntry(
-            slug=slug, model_id="x/y", persona=None, status=Status.OK,
-            finish_reason="stop", resource_uri=paths.resource_uri(slug),
+            slug=slug,
+            model_id="x/y",
+            persona=None,
+            status=Status.OK,
+            finish_reason="stop",
+            resource_uri=paths.resource_uri(slug),
             body_path=str(paths.response_text(slug)),
-            latency_ms=60000, cost_usd=0.0, cost_known=True,
+            latency_ms=60000,
+            cost_usd=0.0,
+            cost_known=True,
         )
 
     monkeypatch.setattr(runner, "_call_one", fake_call)
@@ -4193,9 +4528,7 @@ def test_refineresult_invariant_catches_arbiter_cost_unknown():
     """
     from consult.types import RefineResult
 
-    verdict = ArbiterVerdict(
-        round=1, score=0.5, gaps=[], reasoning="", cost_usd=None, cost_known=False
-    )
+    verdict = ArbiterVerdict(round=1, score=0.5, gaps=[], reasoning="", cost_usd=None, cost_known=False)
     with pytest.raises(Exception) as exc:
         RefineResult(
             run_id="x",
@@ -4220,8 +4553,12 @@ def test_sequenceresult_invariant_propagates_step_cost_known():
     from consult.sequence import SequenceResult, SequenceStep
 
     step = SequenceStep(
-        step=1, run_id="r1", synthesis="x", cost_usd=0.1,
-        cost_known=False, panel_size=2,
+        step=1,
+        run_id="r1",
+        synthesis="x",
+        cost_usd=0.1,
+        cost_known=False,
+        panel_size=2,
     )
     with pytest.raises(Exception) as exc:
         SequenceResult(
@@ -4282,9 +4619,7 @@ async def test_refine_rejects_continuation_with_sentinel_synthesis(tmp_path, mon
     monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
     paths = artifacts.create_run()
     paths.prompt_txt.write_text("prior question")
-    (paths.root / "synthesis.md").write_text(
-        "# Synthesis unavailable\n\nThe synthesiser failed."
-    )
+    (paths.root / "synthesis.md").write_text("# Synthesis unavailable\n\nThe synthesiser failed.")
     # Even with a valid synthesis.md file, the sentinel header makes it unusable.
     with pytest.raises(ValueError) as exc:
         refine_mod._apply_continuation("follow-up", paths.run_id)
@@ -4316,14 +4651,21 @@ async def test_refine_arbiter_sees_followup_only_under_continuation(tmp_path, mo
             artifacts_dir=str(paths_h.root),
             manifest=[
                 ManifestEntry(
-                    slug="x.r1", model_id="m/x", status=Status.OK,
+                    slug="x.r1",
+                    model_id="m/x",
+                    status=Status.OK,
                     resource_uri=paths_h.resource_uri("x.r1"),
                     body_path=str(paths_h.response_text("x.r1")),
-                    latency_ms=0, cost_usd=0.0, cost_known=True,
-                    confidence=None, capsule=None,
+                    latency_ms=0,
+                    cost_usd=0.0,
+                    cost_known=True,
+                    confidence=None,
+                    capsule=None,
                 ),
             ],
-            cost_usd=0.0, cost_known=True, wall_ms=0,
+            cost_usd=0.0,
+            cost_known=True,
+            wall_ms=0,
         )
 
     async def fake_annotate(handle, **kwargs):
@@ -4332,8 +4674,13 @@ async def test_refine_arbiter_sees_followup_only_under_continuation(tmp_path, mo
     async def fake_arbiter(question, round_num, manifest, arbiter_alias, prior_manifest):
         arbiter_questions.append(question)
         return ArbiterVerdict(
-            round=round_num, score=1.0, gaps=[], reasoning="ok",
-            cost_usd=0.0, cost_known=True, parsed_ok=True,
+            round=round_num,
+            score=1.0,
+            gaps=[],
+            reasoning="ok",
+            cost_usd=0.0,
+            cost_known=True,
+            parsed_ok=True,
         )
 
     async def fake_synth(*args, **kwargs):
@@ -4350,7 +4697,9 @@ async def test_refine_arbiter_sees_followup_only_under_continuation(tmp_path, mo
     await refine_mod.refine(
         "FOLLOWUP QUESTION TEXT",
         [ModelSpec(model="claude-haiku")],
-        threshold=0.5, max_rounds=1, continuation_id=prior.run_id,
+        threshold=0.5,
+        max_rounds=1,
+        continuation_id=prior.run_id,
     )
     assert arbiter_questions, "arbiter was never asked"
     asked = arbiter_questions[0]
@@ -4378,14 +4727,21 @@ async def test_consult_handler_accumulates_synth_cost(tmp_path, monkeypatch):
             artifacts_dir=str(paths.root),
             manifest=[
                 ManifestEntry(
-                    slug="x", model_id="m/x", status=Status.OK,
+                    slug="x",
+                    model_id="m/x",
+                    status=Status.OK,
                     resource_uri=paths.resource_uri("x"),
                     body_path=str(paths.response_text("x")),
-                    latency_ms=0, cost_usd=0.10, cost_known=True,
-                    confidence=None, capsule=None,
+                    latency_ms=0,
+                    cost_usd=0.10,
+                    cost_known=True,
+                    confidence=None,
+                    capsule=None,
                 ),
             ],
-            cost_usd=0.10, cost_known=True, wall_ms=0,
+            cost_usd=0.10,
+            cost_known=True,
+            wall_ms=0,
         )
 
     async def fake_annotate(handle, **kwargs):
@@ -4426,14 +4782,21 @@ async def test_consult_handler_propagates_cost_known_from_handle(tmp_path, monke
             artifacts_dir=str(paths.root),
             manifest=[
                 ManifestEntry(
-                    slug="x", model_id="m/x", status=Status.OK,
+                    slug="x",
+                    model_id="m/x",
+                    status=Status.OK,
                     resource_uri=paths.resource_uri("x"),
                     body_path=str(paths.response_text("x")),
-                    latency_ms=0, cost_usd=None, cost_known=False,
-                    confidence=None, capsule=None,
+                    latency_ms=0,
+                    cost_usd=None,
+                    cost_known=False,
+                    confidence=None,
+                    capsule=None,
                 ),
             ],
-            cost_usd=0.0, cost_known=False, wall_ms=0,
+            cost_usd=0.0,
+            cost_known=False,
+            wall_ms=0,
         )
 
     async def fake_annotate(handle, **kwargs):
@@ -4535,7 +4898,8 @@ async def test_sequence_partial_fanout_rolls_cost_into_total(tmp_path, monkeypat
     monkeypatch.setattr(synth_mod, "synthesise", fake_synth)
 
     result = await sequence_mod.sequence(
-        ["q1", "q2"], [ModelSpec(model="claude-haiku")],
+        ["q1", "q2"],
+        [ModelSpec(model="claude-haiku")],
     )
     assert result.partial is True
     # The 0.17 from the partial fanout must show up — not the pre-fix 0.0.
@@ -4561,10 +4925,13 @@ async def test_capsule_extractor_out_of_range_confidence_doesnt_crash(tmp_path, 
             class _Choice:
                 class _Msg:
                     content = '{"kind":"decision","confidence":75.0}'
+
                 message = _Msg()
                 finish_reason = "stop"
+
             choices = [_Choice()]
             usage = None
+
         return Resp()
 
     monkeypatch.setattr(litellm, "acompletion", fake_acompletion)
@@ -4572,7 +4939,9 @@ async def test_capsule_extractor_out_of_range_confidence_doesnt_crash(tmp_path, 
     body = "stuff stuff\n\nCONFIDENCE: 75.0\nKEY_REASON: whatever"
     # Decision kind — confidence is ge=0 le=1 in Capsule.
     cap, cost, cost_known = await capsule_mod._extract_one(
-        body, extractor_id="anthropic/claude-haiku-test", timeout=30,
+        body,
+        extractor_id="anthropic/claude-haiku-test",
+        timeout=30,
         kind="decision",
     )
     # Did not crash. Out-of-range body confidence was discarded.
@@ -4595,16 +4964,25 @@ async def test_capsule_annotate_isolates_per_slug_failure(tmp_path, monkeypatch)
         paths.response_text(slug).write_text(body)
         manifest.append(
             ManifestEntry(
-                slug=slug, model_id="m/x", status=Status.OK,
+                slug=slug,
+                model_id="m/x",
+                status=Status.OK,
                 resource_uri=paths.resource_uri(slug),
                 body_path=str(paths.response_text(slug)),
-                latency_ms=0, cost_usd=0.0, cost_known=True,
-                confidence=None, capsule=None,
+                latency_ms=0,
+                cost_usd=0.0,
+                cost_known=True,
+                confidence=None,
+                capsule=None,
             )
         )
     handle = RunHandle(
-        run_id=paths.run_id, artifacts_dir=str(paths.root),
-        manifest=manifest, cost_usd=0.0, cost_known=True, wall_ms=0,
+        run_id=paths.run_id,
+        artifacts_dir=str(paths.root),
+        manifest=manifest,
+        cost_usd=0.0,
+        cost_known=True,
+        wall_ms=0,
     )
     artifacts.write_manifest(paths, handle.model_dump())
 
@@ -4706,14 +5084,21 @@ async def test_consult_handler_swallows_progress_callback_failure(tmp_path, monk
             artifacts_dir=str(paths.root),
             manifest=[
                 ManifestEntry(
-                    slug="x", model_id="m/x", status=Status.OK,
+                    slug="x",
+                    model_id="m/x",
+                    status=Status.OK,
                     resource_uri=paths.resource_uri("x"),
                     body_path=str(paths.response_text("x")),
-                    latency_ms=0, cost_usd=0.0, cost_known=True,
-                    confidence=None, capsule=None,
+                    latency_ms=0,
+                    cost_usd=0.0,
+                    cost_known=True,
+                    confidence=None,
+                    capsule=None,
                 ),
             ],
-            cost_usd=0.0, cost_known=True, wall_ms=0,
+            cost_usd=0.0,
+            cost_known=True,
+            wall_ms=0,
         )
 
     async def fake_annotate(handle, **kwargs):
@@ -4730,9 +5115,7 @@ async def test_consult_handler_swallows_progress_callback_failure(tmp_path, monk
     monkeypatch.setattr(synth_mod, "synthesise", fake_synth)
 
     # No exception should propagate; tool returns its normal payload.
-    result = await handlers.consult(
-        {"prompt": "p", "tier": "quick"}, on_progress=crashy_cb
-    )
+    result = await handlers.consult({"prompt": "p", "tier": "quick"}, on_progress=crashy_cb)
     assert result["partial"] is False
     assert result["synthesis"] == "ok"
 
@@ -4755,14 +5138,21 @@ async def test_refine_synth_call_passes_anonymised_when_blinded(tmp_path, monkey
             artifacts_dir=str(paths.root),
             manifest=[
                 ManifestEntry(
-                    slug="x.r1", model_id="m/x", status=Status.OK,
+                    slug="x.r1",
+                    model_id="m/x",
+                    status=Status.OK,
                     resource_uri=paths.resource_uri("x.r1"),
                     body_path=str(paths.response_text("x.r1")),
-                    latency_ms=0, cost_usd=0.0, cost_known=True,
-                    confidence=None, capsule=None,
+                    latency_ms=0,
+                    cost_usd=0.0,
+                    cost_known=True,
+                    confidence=None,
+                    capsule=None,
                 ),
             ],
-            cost_usd=0.0, cost_known=True, wall_ms=0,
+            cost_usd=0.0,
+            cost_known=True,
+            wall_ms=0,
         )
 
     async def fake_annotate(handle, **kwargs):
@@ -4770,8 +5160,13 @@ async def test_refine_synth_call_passes_anonymised_when_blinded(tmp_path, monkey
 
     async def fake_arbiter(*args, **kwargs):
         return ArbiterVerdict(
-            round=1, score=1.0, gaps=[], reasoning="ok",
-            cost_usd=0.0, cost_known=True, parsed_ok=True,
+            round=1,
+            score=1.0,
+            gaps=[],
+            reasoning="ok",
+            cost_usd=0.0,
+            cost_known=True,
+            parsed_ok=True,
         )
 
     captured: dict[str, Any] = {}
@@ -4788,8 +5183,11 @@ async def test_refine_synth_call_passes_anonymised_when_blinded(tmp_path, monkey
     monkeypatch.setattr(refine_mod.synth, "synthesise", fake_synth)
 
     await refine_mod.refine(
-        "Q", [ModelSpec(model="claude-haiku")],
-        threshold=0.5, max_rounds=1, blinded=True,
+        "Q",
+        [ModelSpec(model="claude-haiku")],
+        threshold=0.5,
+        max_rounds=1,
+        blinded=True,
     )
     assert captured.get("anonymised") is True
 
@@ -4812,27 +5210,39 @@ def test_blinded_fanout_preserves_model_id_in_manifest(tmp_path, monkeypatch):
 
     monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
     monkeypatch.setattr(
-        "consult.runner.estimate_cost", lambda *a, **kw: (0.0, True),
+        "consult.runner.estimate_cost",
+        lambda *a, **kw: (0.0, True),
     )
 
     async def fake_call(spec, slug, per_prompt, paths, provider_sems=None, **_):
         paths.response_text(slug).write_text("body")
         entry = registry.resolve_model(spec.model)
         return ManifestEntry(
-            slug=slug, model_id=entry["litellm_id"], status=Status.OK,
+            slug=slug,
+            model_id=entry["litellm_id"],
+            status=Status.OK,
             resource_uri=paths.resource_uri(slug),
             body_path=str(paths.response_text(slug)),
-            latency_ms=10, tokens_in=1, tokens_out=1,
-            cost_usd=0.0, cost_known=True, confidence=0.5, capsule=None,
+            latency_ms=10,
+            tokens_in=1,
+            tokens_out=1,
+            cost_usd=0.0,
+            cost_known=True,
+            confidence=0.5,
+            capsule=None,
         )
 
     monkeypatch.setattr("consult.runner._call_one", fake_call)
     monkeypatch.setenv("CONSULT_HEARTBEAT_INTERVAL_S", "0")
     monkeypatch.setenv("CONSULT_TAIL_DROPOUT_S", "0")
 
-    handle = asyncio.run(fanout(
-        "prompt", [ModelSpec(model="claude-haiku")], blinded=True,
-    ))
+    handle = asyncio.run(
+        fanout(
+            "prompt",
+            [ModelSpec(model="claude-haiku")],
+            blinded=True,
+        )
+    )
     assert len(handle.manifest) == 1
     entry = handle.manifest[0]
     # Slug is anonymised (greek letter), but model_id stays real.
@@ -4867,14 +5277,21 @@ async def test_refine_passes_max_run_usd_to_nested_fanout(tmp_path, monkeypatch)
             artifacts_dir=str(paths.root),
             manifest=[
                 ManifestEntry(
-                    slug="x.r1", model_id="m/x", status=Status.OK,
+                    slug="x.r1",
+                    model_id="m/x",
+                    status=Status.OK,
                     resource_uri=paths.resource_uri("x.r1"),
                     body_path=str(paths.response_text("x.r1")),
-                    latency_ms=0, cost_usd=0.0, cost_known=True,
-                    confidence=None, capsule=None,
+                    latency_ms=0,
+                    cost_usd=0.0,
+                    cost_known=True,
+                    confidence=None,
+                    capsule=None,
                 ),
             ],
-            cost_usd=0.0, cost_known=True, wall_ms=0,
+            cost_usd=0.0,
+            cost_known=True,
+            wall_ms=0,
         )
 
     async def fake_annotate(handle, **kwargs):
@@ -4882,8 +5299,13 @@ async def test_refine_passes_max_run_usd_to_nested_fanout(tmp_path, monkeypatch)
 
     async def fake_arbiter(*args, **kwargs):
         return ArbiterVerdict(
-            round=1, score=1.0, gaps=[], reasoning="ok",
-            cost_usd=0.0, cost_known=True, parsed_ok=True,
+            round=1,
+            score=1.0,
+            gaps=[],
+            reasoning="ok",
+            cost_usd=0.0,
+            cost_known=True,
+            parsed_ok=True,
         )
 
     async def fake_synth(*args, **kwargs):
@@ -4897,8 +5319,11 @@ async def test_refine_passes_max_run_usd_to_nested_fanout(tmp_path, monkeypatch)
     monkeypatch.setattr(refine_mod.synth, "synthesise", fake_synth)
 
     await refine_mod.refine(
-        "q", [ModelSpec(model="claude-haiku")],
-        threshold=0.5, max_rounds=1, max_run_usd=20.0,
+        "q",
+        [ModelSpec(model="claude-haiku")],
+        threshold=0.5,
+        max_rounds=1,
+        max_run_usd=20.0,
     )
     assert seen_caps and seen_caps[0] == pytest.approx(20.0)
 
@@ -4918,9 +5343,11 @@ async def test_refine_rejects_typo_synthesiser_before_fanout(tmp_path, monkeypat
     monkeypatch.setattr(refine_mod.runner, "fanout", fake_fanout)
     with pytest.raises(KeyError):
         await refine_mod.refine(
-            "q", [ModelSpec(model="claude-haiku")],
+            "q",
+            [ModelSpec(model="claude-haiku")],
             arbiter="totally-not-a-real-alias",
-            threshold=0.5, max_rounds=1,
+            threshold=0.5,
+            max_rounds=1,
         )
     assert fanout_calls["n"] == 0
 
@@ -4939,10 +5366,13 @@ async def test_consult_rejects_typo_synthesiser_before_fanout(tmp_path, monkeypa
     monkeypatch.setattr(runner_mod, "fanout", fake_fanout)
     monkeypatch.setattr(handlers.runner, "fanout", fake_fanout)
     with pytest.raises(KeyError):
-        await handlers.consult({
-            "prompt": "p", "tier": "quick",
-            "synthesiser": "totally-not-a-real-alias",
-        })
+        await handlers.consult(
+            {
+                "prompt": "p",
+                "tier": "quick",
+                "synthesiser": "totally-not-a-real-alias",
+            }
+        )
     assert fanout_calls["n"] == 0
 
 
@@ -4959,29 +5389,40 @@ async def test_fanout_cap_early_return_preserves_existing_manifest(tmp_path, mon
     paths = artifacts.create_run()
     # Seed a fake "round 1" manifest with a real entry.
     seeded = RunHandle(
-        run_id=paths.run_id, artifacts_dir=str(paths.root),
+        run_id=paths.run_id,
+        artifacts_dir=str(paths.root),
         manifest=[
             ManifestEntry(
-                slug="x.r1", model_id="m/x", status=Status.OK,
+                slug="x.r1",
+                model_id="m/x",
+                status=Status.OK,
                 resource_uri=paths.resource_uri("x.r1"),
                 body_path=str(paths.response_text("x.r1")),
-                latency_ms=10, cost_usd=0.05, cost_known=True,
-                confidence=None, capsule=None,
+                latency_ms=10,
+                cost_usd=0.05,
+                cost_known=True,
+                confidence=None,
+                capsule=None,
             ),
         ],
-        cost_usd=0.05, cost_known=True, wall_ms=10,
+        cost_usd=0.05,
+        cost_known=True,
+        wall_ms=10,
     )
     artifacts.write_manifest(paths, seeded.model_dump())
 
     monkeypatch.setattr(runner_mod, "estimate_cost", lambda *a, **kw: (10.0, True))
     handle = await runner_mod.fanout(
-        "x", [ModelSpec(model="claude-haiku")],
-        max_run_usd=1.0, existing_paths=paths,
+        "x",
+        [ModelSpec(model="claude-haiku")],
+        max_run_usd=1.0,
+        existing_paths=paths,
     )
     assert handle.partial is True
     # Manifest.json on disk must still reflect the seeded round-1 entry,
     # not the empty cap-rejection handle.
     import json as _json
+
     persisted = _json.loads(paths.manifest_json.read_text())
     assert persisted["manifest"] and persisted["manifest"][0]["slug"] == "x.r1"
 
@@ -5026,7 +5467,9 @@ async def test_fanout_writes_manifest_on_dry_run(tmp_path, monkeypatch):
 
     monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
     handle = await runner_mod.fanout(
-        "x", [ModelSpec(model="claude-haiku")], dry_run=True,
+        "x",
+        [ModelSpec(model="claude-haiku")],
+        dry_run=True,
     )
     paths = artifacts.load_run(handle.run_id)
     assert paths.manifest_json.exists()
@@ -5040,7 +5483,9 @@ async def test_fanout_writes_manifest_on_cap_exceeded(tmp_path, monkeypatch):
     monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
     monkeypatch.setattr(runner_mod, "estimate_cost", lambda *a, **kw: (10.0, True))
     handle = await runner_mod.fanout(
-        "x", [ModelSpec(model="claude-haiku")], max_run_usd=1.0,
+        "x",
+        [ModelSpec(model="claude-haiku")],
+        max_run_usd=1.0,
     )
     assert handle.partial is True
     assert "exceeds cap" in (handle.partial_reason or "")
@@ -5085,16 +5530,25 @@ async def test_synth_defensive_extraction_on_unexpected_shape(tmp_path, monkeypa
     paths.response_text("alpha").write_text("body")
     manifest = [
         ManifestEntry(
-            slug="alpha", model_id="m/x", status=Status.OK,
+            slug="alpha",
+            model_id="m/x",
+            status=Status.OK,
             resource_uri=paths.resource_uri("alpha"),
             body_path=str(paths.response_text("alpha")),
-            latency_ms=0, cost_usd=0.0, cost_known=True,
-            confidence=None, capsule=None,
+            latency_ms=0,
+            cost_usd=0.0,
+            cost_known=True,
+            confidence=None,
+            capsule=None,
         ),
     ]
     handle = RunHandle(
-        run_id=paths.run_id, artifacts_dir=str(paths.root),
-        manifest=manifest, cost_usd=0.0, cost_known=True, wall_ms=0,
+        run_id=paths.run_id,
+        artifacts_dir=str(paths.root),
+        manifest=manifest,
+        cost_usd=0.0,
+        cost_known=True,
+        wall_ms=0,
     )
     artifacts.write_manifest(paths, handle.model_dump())
 
@@ -5137,10 +5591,18 @@ def test_engine_modules_do_not_import_mcp_sdk():
 
     # The engine surface actually used (filter out viewer-only deps).
     expected_present = {
-        "consult.runner", "consult.refine", "consult.sequence",
-        "consult.synth", "consult.capsule", "consult.orchestrate",
-        "consult.artifacts", "consult.types", "consult.progress",
-        "consult.context", "consult.registry", "consult.attachments",
+        "consult.runner",
+        "consult.refine",
+        "consult.sequence",
+        "consult.synth",
+        "consult.capsule",
+        "consult.orchestrate",
+        "consult.artifacts",
+        "consult.types",
+        "consult.progress",
+        "consult.context",
+        "consult.registry",
+        "consult.attachments",
     }
     assert expected_present.issubset(set(engine_modules)), (
         f"missing engine modules: {expected_present - set(engine_modules)}"
@@ -5148,7 +5610,7 @@ def test_engine_modules_do_not_import_mcp_sdk():
 
     for mod_name in engine_modules:
         mod = importlib.import_module(mod_name)
-        src = (Path(mod.__file__).read_text() if mod.__file__ else "")
+        src = Path(mod.__file__).read_text() if mod.__file__ else ""
         for line in src.splitlines():
             stripped = line.strip()
             assert not stripped.startswith("import mcp"), (
@@ -5165,9 +5627,7 @@ def test_resource_uri_formatter_override_round_trips(tmp_path, monkeypatch):
     that want their own URI scheme on the manifest.
     """
     monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
-    artifacts.set_resource_uri_formatter(
-        lambda run_id, slug: f"https://example.com/{run_id}/{slug}.txt"
-    )
+    artifacts.set_resource_uri_formatter(lambda run_id, slug: f"https://example.com/{run_id}/{slug}.txt")
     try:
         paths = artifacts.create_run()
         uri = paths.resource_uri("alpha")
@@ -5193,14 +5653,11 @@ async def test_orchestrate_consult_runs_without_mcp_adapter(tmp_path, monkeypatc
     from consult.types import RunResult
 
     monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    monkeypatch.setattr(registry, "resolve_tier", lambda t: ["model-a", "model-b"])
+    monkeypatch.setattr(registry, "default_synthesiser", lambda: "model-synth")
     monkeypatch.setattr(
-        registry, "resolve_tier", lambda t: ["model-a", "model-b"]
-    )
-    monkeypatch.setattr(
-        registry, "default_synthesiser", lambda: "model-synth"
-    )
-    monkeypatch.setattr(
-        registry, "resolve_model",
+        registry,
+        "resolve_model",
         lambda alias: {"litellm_id": alias, "provider": "x"},
     )
 
@@ -5216,13 +5673,19 @@ async def test_orchestrate_consult_runs_without_mcp_adapter(tmp_path, monkeypatc
             artifacts_dir=str(paths.root),
             manifest=[
                 ManifestEntry(
-                    slug="model-a", model_id="model-a", status=Status.OK,
+                    slug="model-a",
+                    model_id="model-a",
+                    status=Status.OK,
                     resource_uri=paths.resource_uri("model-a"),
                     body_path=str(paths.response_text("model-a")),
-                    latency_ms=10, cost_usd=0.01, cost_known=True,
+                    latency_ms=10,
+                    cost_usd=0.01,
+                    cost_known=True,
                 ),
             ],
-            cost_usd=0.01, cost_known=True, wall_ms=10,
+            cost_usd=0.01,
+            cost_known=True,
+            wall_ms=10,
         )
 
     async def fake_annotate(handle, **kwargs):
@@ -5236,7 +5699,9 @@ async def test_orchestrate_consult_runs_without_mcp_adapter(tmp_path, monkeypatc
     monkeypatch.setattr(synth_mod, "synthesise", fake_synth)
 
     result = await orchestrate.consult(
-        "what's the call?", tier="quick", on_progress=cb,
+        "what's the call?",
+        tier="quick",
+        on_progress=cb,
     )
     # Typed RunResult returned, not a dict — non-MCP consumers get the
     # full Pydantic shape with structured access.
@@ -5255,7 +5720,8 @@ async def test_orchestrate_consult_runs_without_mcp_adapter(tmp_path, monkeypatc
 
 @pytest.mark.asyncio
 async def test_orchestrate_consult_gates_synth_on_high_consensus(
-    tmp_path, monkeypatch,
+    tmp_path,
+    monkeypatch,
 ):
     """`gate_synth_at_agreement` short-circuits the flagship synth when the
     panel converges tightly. The synth model must NOT be called; the
@@ -5270,11 +5736,14 @@ async def test_orchestrate_consult_gates_synth_on_high_consensus(
 
     monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
     monkeypatch.setattr(
-        registry, "resolve_tier", lambda t: ["model-a", "model-b", "model-c"],
+        registry,
+        "resolve_tier",
+        lambda t: ["model-a", "model-b", "model-c"],
     )
     monkeypatch.setattr(registry, "default_synthesiser", lambda: "model-synth")
     monkeypatch.setattr(
-        registry, "resolve_model",
+        registry,
+        "resolve_model",
         lambda alias: {"litellm_id": alias, "provider": "x"},
     )
 
@@ -5285,37 +5754,51 @@ async def test_orchestrate_consult_gates_synth_on_high_consensus(
             artifacts_dir=str(paths.root),
             manifest=[
                 ManifestEntry(
-                    slug="m-a", model_id="x/a", status=Status.OK,
+                    slug="m-a",
+                    model_id="x/a",
+                    status=Status.OK,
                     resource_uri=paths.resource_uri("m-a"),
                     body_path=str(paths.response_text("m-a")),
-                    latency_ms=10, cost_usd=0.01, cost_known=True,
+                    latency_ms=10,
+                    cost_usd=0.01,
+                    cost_known=True,
                     capsule=Capsule(
                         position="ship feature X",
                         recommendation="ship feature X with caveat",
                     ),
                 ),
                 ManifestEntry(
-                    slug="m-b", model_id="x/b", status=Status.OK,
+                    slug="m-b",
+                    model_id="x/b",
+                    status=Status.OK,
                     resource_uri=paths.resource_uri("m-b"),
                     body_path=str(paths.response_text("m-b")),
-                    latency_ms=10, cost_usd=0.01, cost_known=True,
+                    latency_ms=10,
+                    cost_usd=0.01,
+                    cost_known=True,
                     capsule=Capsule(
                         position="ship feature X",
                         recommendation="ship feature X with caveat",
                     ),
                 ),
                 ManifestEntry(
-                    slug="m-c", model_id="x/c", status=Status.OK,
+                    slug="m-c",
+                    model_id="x/c",
+                    status=Status.OK,
                     resource_uri=paths.resource_uri("m-c"),
                     body_path=str(paths.response_text("m-c")),
-                    latency_ms=10, cost_usd=0.01, cost_known=True,
+                    latency_ms=10,
+                    cost_usd=0.01,
+                    cost_known=True,
                     capsule=Capsule(
                         position="ship feature X",
                         recommendation="ship feature X with caveat",
                     ),
                 ),
             ],
-            cost_usd=0.03, cost_known=True, wall_ms=10,
+            cost_usd=0.03,
+            cost_known=True,
+            wall_ms=10,
         )
 
     async def fake_annotate(handle, **kwargs):
@@ -5332,7 +5815,9 @@ async def test_orchestrate_consult_gates_synth_on_high_consensus(
     monkeypatch.setattr(synth_mod, "synthesise", fake_synth)
 
     result = await orchestrate.consult(
-        "what's the call?", tier="quick", gate_synth_at_agreement=0.1,
+        "what's the call?",
+        tier="quick",
+        gate_synth_at_agreement=0.1,
     )
     assert isinstance(result, RunResult)
     assert result.synth_gated is True, "gating did not trigger on identical capsules"
@@ -5345,7 +5830,8 @@ async def test_orchestrate_consult_gates_synth_on_high_consensus(
 
 @pytest.mark.asyncio
 async def test_orchestrate_consult_does_not_gate_on_high_disagreement(
-    tmp_path, monkeypatch,
+    tmp_path,
+    monkeypatch,
 ):
     """When the panel diverges, gating must NOT trigger — the flagship
     synth runs as usual."""
@@ -5357,11 +5843,14 @@ async def test_orchestrate_consult_does_not_gate_on_high_disagreement(
 
     monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
     monkeypatch.setattr(
-        registry, "resolve_tier", lambda t: ["model-a", "model-b"],
+        registry,
+        "resolve_tier",
+        lambda t: ["model-a", "model-b"],
     )
     monkeypatch.setattr(registry, "default_synthesiser", lambda: "model-synth")
     monkeypatch.setattr(
-        registry, "resolve_model",
+        registry,
+        "resolve_model",
         lambda alias: {"litellm_id": alias, "provider": "x"},
     )
 
@@ -5372,27 +5861,37 @@ async def test_orchestrate_consult_does_not_gate_on_high_disagreement(
             artifacts_dir=str(paths.root),
             manifest=[
                 ManifestEntry(
-                    slug="m-a", model_id="x/a", status=Status.OK,
+                    slug="m-a",
+                    model_id="x/a",
+                    status=Status.OK,
                     resource_uri=paths.resource_uri("m-a"),
                     body_path=str(paths.response_text("m-a")),
-                    latency_ms=10, cost_usd=0.01, cost_known=True,
+                    latency_ms=10,
+                    cost_usd=0.01,
+                    cost_known=True,
                     capsule=Capsule(
                         position="ship feature X immediately",
                         recommendation="do A",
                     ),
                 ),
                 ManifestEntry(
-                    slug="m-b", model_id="x/b", status=Status.OK,
+                    slug="m-b",
+                    model_id="x/b",
+                    status=Status.OK,
                     resource_uri=paths.resource_uri("m-b"),
                     body_path=str(paths.response_text("m-b")),
-                    latency_ms=10, cost_usd=0.01, cost_known=True,
+                    latency_ms=10,
+                    cost_usd=0.01,
+                    cost_known=True,
                     capsule=Capsule(
                         position="cancel the project entirely",
                         recommendation="form a steering committee",
                     ),
                 ),
             ],
-            cost_usd=0.02, cost_known=True, wall_ms=10,
+            cost_usd=0.02,
+            cost_known=True,
+            wall_ms=10,
         )
 
     async def fake_annotate(handle, **kwargs):
@@ -5409,7 +5908,9 @@ async def test_orchestrate_consult_does_not_gate_on_high_disagreement(
     monkeypatch.setattr(synth_mod, "synthesise", fake_synth)
 
     result = await orchestrate.consult(
-        "what's the call?", tier="quick", gate_synth_at_agreement=0.1,
+        "what's the call?",
+        tier="quick",
+        gate_synth_at_agreement=0.1,
     )
     assert result.synth_gated is False
     assert synth_called["n"] == 1, "flagship synth must run on high disagreement"
@@ -5433,12 +5934,11 @@ def test_attachment_git_diff_size_cap(monkeypatch, tmp_path):
     # large diff. Resolver is stubbed to return an oversized blob.
     monkeypatch.setenv("CONSULT_ATTACHMENT_MAX_BYTES", "100")
     monkeypatch.setattr(
-        attachments.sources, "resolve_git_diff",
+        attachments.sources,
+        "resolve_git_diff",
         lambda base, head, repo_path: "x" * 5000,
     )
-    out = attachments.render_attachment(
-        {"source": "git_diff", "base": "main", "head": "HEAD"}
-    )
+    out = attachments.render_attachment({"source": "git_diff", "base": "main", "head": "HEAD"})
     assert "[ERROR: diff" in out
     assert "CONSULT_ATTACHMENT_MAX_BYTES=100" in out
     # The oversized content itself must NOT appear in the rendered output.
@@ -5451,12 +5951,11 @@ def test_attachment_git_diff_under_cap_renders_normally(monkeypatch):
 
     monkeypatch.setenv("CONSULT_ATTACHMENT_MAX_BYTES", "10000")
     monkeypatch.setattr(
-        attachments.sources, "resolve_git_diff",
+        attachments.sources,
+        "resolve_git_diff",
         lambda base, head, repo_path: "diff --git a/x b/x\n+hello",
     )
-    out = attachments.render_attachment(
-        {"source": "git_diff", "base": "main", "head": "HEAD"}
-    )
+    out = attachments.render_attachment({"source": "git_diff", "base": "main", "head": "HEAD"})
     assert "[ERROR" not in out
     assert "hello" in out
 
@@ -5480,10 +5979,16 @@ async def test_sequence_persists_cost_on_synth_failure(tmp_path, monkeypatch):
     async def fake_call(spec, slug, per_prompt, paths, provider_sems=None, **_):
         await asyncio.to_thread(paths.response_text(slug).write_text, "body")
         return ManifestEntry(
-            slug=slug, model_id="x/y", persona=None, status=Status.OK,
-            finish_reason="stop", resource_uri=paths.resource_uri(slug),
+            slug=slug,
+            model_id="x/y",
+            persona=None,
+            status=Status.OK,
+            finish_reason="stop",
+            resource_uri=paths.resource_uri(slug),
             body_path=str(paths.response_text(slug)),
-            latency_ms=10, cost_usd=0.01, cost_known=True,
+            latency_ms=10,
+            cost_usd=0.01,
+            cost_known=True,
         )
 
     monkeypatch.setattr(runner, "_call_one", fake_call)
@@ -5525,9 +6030,7 @@ async def test_sequence_persists_cost_on_synth_failure(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_refine_preserves_final_manifest_when_late_round_partial(
-    tmp_path, monkeypatch
-):
+async def test_refine_preserves_final_manifest_when_late_round_partial(tmp_path, monkeypatch):
     """A round-N+1 fanout returning partial=True must not overwrite the
     final_manifest from a successful round-N. Previously
     `final_manifest = handle.manifest` was unconditional, so the empty
@@ -5559,9 +6062,7 @@ async def test_refine_preserves_final_manifest_when_late_round_partial(
                 cost_usd=0.01,
                 cost_known=True,
             )
-            await asyncio.to_thread(
-                paths.response_text("m-good").write_text, "good body"
-            )
+            await asyncio.to_thread(paths.response_text("m-good").write_text, "good body")
             return RunHandle(
                 run_id=paths.run_id,
                 artifacts_dir=str(paths.root),
@@ -5593,13 +6094,19 @@ async def test_refine_preserves_final_manifest_when_late_round_partial(
 
     async def fake_arbiter(question, round_num, manifest, *_, **__):
         return ArbiterVerdict(
-            round=round_num, score=0.5, gaps=["needs more"],
-            next_round_focus="dig deeper", reasoning="not converged",
-            cost_usd=0.0, cost_known=True, parsed_ok=True,
+            round=round_num,
+            score=0.5,
+            gaps=["needs more"],
+            next_round_focus="dig deeper",
+            reasoning="not converged",
+            cost_usd=0.0,
+            cost_known=True,
+            parsed_ok=True,
         )
 
     async def fake_synth(run_id, **kwargs):
         from consult import synth as synth_mod
+
         return synth_mod.SynthResult(text="synthesised", cost_usd=0.0)
 
     monkeypatch.setattr(runner, "fanout", fake_fanout)
@@ -5609,7 +6116,10 @@ async def test_refine_preserves_final_manifest_when_late_round_partial(
     monkeypatch.setattr(refine_mod.synth, "synthesise", fake_synth)
 
     result = await refine_mod.refine(
-        "test", [ModelSpec(model="claude-haiku")], max_rounds=3, threshold=0.85,
+        "test",
+        [ModelSpec(model="claude-haiku")],
+        max_rounds=3,
+        threshold=0.85,
     )
     # Partial because round 2 failed.
     assert result.partial is True
@@ -5620,9 +6130,7 @@ async def test_refine_preserves_final_manifest_when_late_round_partial(
     assert result.final_manifest[0].capsule is not None
 
 
-def test_refine_continuation_sentinel_check_handles_leading_whitespace(
-    tmp_path, monkeypatch
-):
+def test_refine_continuation_sentinel_check_handles_leading_whitespace(tmp_path, monkeypatch):
     """The sentinel check now lstrips before startswith, so a synthesis
     file with a leading newline/BOM can't slip a sentinel past the
     guard."""
@@ -5665,9 +6173,7 @@ def test_resource_uri_formatter_is_context_scoped(tmp_path, monkeypatch):
 
     # Override scoped to a child context: parent context stays on the default.
     def install_http():
-        set_resource_uri_formatter(
-            lambda run_id, slug: f"https://example.com/runs/{run_id}/{slug}"
-        )
+        set_resource_uri_formatter(lambda run_id, slug: f"https://example.com/runs/{run_id}/{slug}")
         return paths.resource_uri("alpha")
 
     child_ctx = contextvars.copy_context()
@@ -5692,10 +6198,14 @@ async def test_synth_persists_cost_to_manifest(tmp_path, monkeypatch):
     # Build a minimal run with one usable body + manifest on disk.
     paths = artifacts.create_run()
     entry = ManifestEntry(
-        slug="alpha", model_id="anthropic/x", status=Status.OK,
+        slug="alpha",
+        model_id="anthropic/x",
+        status=Status.OK,
         resource_uri=paths.resource_uri("alpha"),
         body_path=str(paths.response_text("alpha")),
-        latency_ms=10, cost_usd=0.005, cost_known=True,
+        latency_ms=10,
+        cost_usd=0.005,
+        cost_known=True,
     )
     paths.response_text("alpha").write_text("Some response.")
     handle = RunHandle(
@@ -5724,7 +6234,9 @@ async def test_synth_persists_cost_to_manifest(tmp_path, monkeypatch):
 
     monkeypatch.setattr(synth_mod.litellm, "acompletion", fake_acompletion)
     monkeypatch.setattr(
-        synth_mod.litellm, "completion_cost", lambda **kw: 0.05,
+        synth_mod.litellm,
+        "completion_cost",
+        lambda **kw: 0.05,
     )
 
     result = await synth_mod.synthesise(paths.run_id)
@@ -5738,9 +6250,7 @@ async def test_synth_persists_cost_to_manifest(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_orchestrate_consult_accepts_attachments_and_dry_run(
-    tmp_path, monkeypatch
-):
+async def test_orchestrate_consult_accepts_attachments_and_dry_run(tmp_path, monkeypatch):
     """orchestrate.consult must accept attachments (inlining internally)
     and dry_run (passed through to runner.fanout) so library consumers
     have parity with the MCP `consult` tool.
@@ -5784,7 +6294,9 @@ async def test_fit_prompt_to_context_no_op_when_under_budget(monkeypatch):
     from consult import runner
 
     monkeypatch.setattr(
-        runner.litellm, "token_counter", lambda model, text: len(text) // 4,
+        runner.litellm,
+        "token_counter",
+        lambda model, text: len(text) // 4,
     )
     out, dropped = await runner._fit_prompt_to_context(
         "short prompt",
@@ -5805,7 +6317,9 @@ async def test_fit_prompt_to_context_trims_when_over_budget(monkeypatch):
     from consult import runner
 
     monkeypatch.setattr(
-        runner.litellm, "token_counter", lambda model, text: len(text),
+        runner.litellm,
+        "token_counter",
+        lambda model, text: len(text),
     )
     # Budget: 1000 input - 100 output = 900 available. Build a 2000-char
     # prompt that fakes 1 token/char so we're 2× over.
@@ -5836,7 +6350,9 @@ async def test_fit_prompt_to_context_skips_when_prior_alone_exceeds_budget(
     from consult import runner
 
     monkeypatch.setattr(
-        runner.litellm, "token_counter", lambda model, text: len(text),
+        runner.litellm,
+        "token_counter",
+        lambda model, text: len(text),
     )
     prior = [
         {"role": "user", "content": "X" * 2000},
@@ -5865,10 +6381,14 @@ async def test_call_one_auto_trims_oversized_prompt(tmp_path, monkeypatch):
     # max_input_tokens=10000 leaves ~6000 for the prompt after claude-haiku's
     # default_budget_tokens (4000) is reserved for output.
     monkeypatch.setattr(
-        runner, "_max_input_tokens", lambda lid, entry: 10_000,
+        runner,
+        "_max_input_tokens",
+        lambda lid, entry: 10_000,
     )
     monkeypatch.setattr(
-        runner.litellm, "token_counter", lambda model, text: len(text),
+        runner.litellm,
+        "token_counter",
+        lambda model, text: len(text),
     )
 
     sent_messages: dict[str, Any] = {}
@@ -5893,7 +6413,9 @@ async def test_call_one_auto_trims_oversized_prompt(tmp_path, monkeypatch):
 
     monkeypatch.setattr(runner.litellm, "acompletion", fake_acompletion)
     monkeypatch.setattr(
-        runner.litellm, "completion_cost", lambda **kw: 0.01,
+        runner.litellm,
+        "completion_cost",
+        lambda **kw: 0.01,
     )
 
     spec = ModelSpec(model="claude-haiku")
@@ -5917,7 +6439,8 @@ async def test_call_one_auto_trims_oversized_prompt(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_call_one_no_trim_note_when_prompt_mentions_trimmed_literally(
-    tmp_path, monkeypatch,
+    tmp_path,
+    monkeypatch,
 ):
     """A prompt that contains the literal string `[TRIMMED` in its source
     (e.g. an attached source file from this very codebase) must NOT be
@@ -5933,24 +6456,33 @@ async def test_call_one_no_trim_note_when_prompt_mentions_trimmed_literally(
 
     monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
     monkeypatch.setattr(
-        runner, "_max_input_tokens", lambda lid, entry: 1_000_000,
+        runner,
+        "_max_input_tokens",
+        lambda lid, entry: 1_000_000,
     )
     monkeypatch.setattr(
-        runner.litellm, "token_counter", lambda model, text: len(text) // 4,
+        runner.litellm,
+        "token_counter",
+        lambda model, text: len(text) // 4,
     )
 
     class _Msg:
         content = "ok"
+
     class _Choice:
         message = _Msg()
         finish_reason = "stop"
+
     class _Resp:
         choices = [_Choice()]
         usage = type("U", (), {"prompt_tokens": 100, "completion_tokens": 10})()
-        def model_dump(self): return {"choices": []}
+
+        def model_dump(self):
+            return {"choices": []}
 
     async def fake_acompletion(**kwargs):
         return _Resp()
+
     monkeypatch.setattr(runner.litellm, "acompletion", fake_acompletion)
     monkeypatch.setattr(runner.litellm, "completion_cost", lambda **kw: 0.0)
 
@@ -5965,9 +6497,7 @@ async def test_call_one_no_trim_note_when_prompt_mentions_trimmed_literally(
     paths = artifacts.create_run()
     entry = await _call_one(spec, "x-0", prompt, paths)
     assert entry.status == Status.OK
-    assert entry.error is None, (
-        f"phantom trim note: {entry.error!r}"
-    )
+    assert entry.error is None, f"phantom trim note: {entry.error!r}"
 
 
 def test_extract_inlined_blocks_finds_attachments():
@@ -6035,12 +6565,14 @@ async def test_fit_prompt_drops_largest_attachment_with_stub(tmp_path, monkeypat
     monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
     paths = artifacts.create_run()
     monkeypatch.setattr(
-        runner.litellm, "token_counter", lambda model, text: len(text),
+        runner.litellm,
+        "token_counter",
+        lambda model, text: len(text),
     )
 
-    small_block = "small\n" * 50          # ~300 chars
-    large_block = "X" * 50_000            # 50K chars — dropped first
-    medium_block = "Y" * 5_000            # 5K chars
+    small_block = "small\n" * 50  # ~300 chars
+    large_block = "X" * 50_000  # 50K chars — dropped first
+    medium_block = "Y" * 5_000  # 5K chars
 
     prompt = (
         "instructions here\n"
@@ -6074,7 +6606,9 @@ async def test_fit_prompt_falls_back_to_head_tail_without_attachments(monkeypatc
     from consult import runner
 
     monkeypatch.setattr(
-        runner.litellm, "token_counter", lambda model, text: len(text),
+        runner.litellm,
+        "token_counter",
+        lambda model, text: len(text),
     )
     long_prompt = "A" * 1000 + "B" * 1000  # no ATTACHMENT_SEPARATOR
     out, dropped = await runner._fit_prompt_to_context(
@@ -6102,7 +6636,8 @@ def test_max_input_tokens_falls_back_to_litellm(monkeypatch):
     from consult import runner
 
     monkeypatch.setattr(
-        runner.litellm, "get_model_info",
+        runner.litellm,
+        "get_model_info",
         lambda model: {"max_input_tokens": 128_000},
     )
     assert runner._max_input_tokens("openai/gpt-x", {}) == 128_000
@@ -6127,5 +6662,6 @@ def test_slow_tail_dropout_default_is_180s():
     import inspect
 
     from consult import runner
+
     src = inspect.getsource(runner.fanout)
     assert 'os.environ.get("CONSULT_TAIL_DROPOUT_S", 180.0)' in src

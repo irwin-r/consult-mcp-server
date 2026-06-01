@@ -124,7 +124,7 @@ async def handle_list_tools() -> list[Tool]:
                 "Use when: you want one consolidated answer to a single question and "
                 "don't want to manage the panel yourself. "
                 "Don't use for: code/PR review with line-anchored findings (use `consult` "
-                "with `capsule_kind=\"review\"` and `rubric=\"code_review\"`), iterative "
+                'with `capsule_kind="review"` and `rubric="code_review"`), iterative '
                 "back-and-forth (use `refine`), or chained multi-step research (use `sequence`). "
                 "Returns: {run_id, synthesis (markdown), manifest, cost_usd, synthesiser}."
             ),
@@ -247,7 +247,9 @@ def _build_progress_callback() -> Callable[[ProgressEvent], Awaitable[None]] | N
 
 
 async def _run_handler_with_envelopes(
-    name: str, arguments: dict[str, Any], on_progress: Callable | None,
+    name: str,
+    arguments: dict[str, Any],
+    on_progress: Callable | None,
 ) -> dict[str, Any] | list[TextContent]:
     """Execute a tool handler, mapping exceptions into ErrorEnvelopes.
 
@@ -270,9 +272,7 @@ async def _run_handler_with_envelopes(
         return errors.envelope(errors.ErrorCode.RUN_NOT_FOUND, str(e))
     except Exception as e:  # noqa: BLE001
         logger.exception("unhandled exception in tool %s", name)
-        return errors.envelope(
-            errors.ErrorCode.INTERNAL_ERROR, f"{type(e).__name__}: {e}"
-        )
+        return errors.envelope(errors.ErrorCode.INTERNAL_ERROR, f"{type(e).__name__}: {e}")
     if name in _TEXT_RESULT_TOOLS and isinstance(result, str):
         return [TextContent(type="text", text=result)]
     return result
@@ -328,6 +328,7 @@ async def handle_call_tool(
 
     # Task path: register, spawn, return immediately.
     rec = task_store.create(ttl_ms=ttl or None)
+
     # Background tasks cannot use `server.request_context` (it's tied
     # to the originating request which is about to end). Pass a None
     # callback — clients polling `tasks/get` see status changes via the
@@ -366,6 +367,7 @@ async def handle_call_tool(
 def _iso(epoch_seconds: float) -> str:
     """ISO-8601 timestamp from an `epoch_seconds` float, UTC."""
     from datetime import UTC, datetime
+
     return datetime.fromtimestamp(epoch_seconds, tz=UTC).isoformat()
 
 
@@ -386,9 +388,8 @@ async def _handle_get_task(req: GetTaskRequest) -> ServerResult:
         # this case. Clients should treat it as "resubmit", per SEP-1686.
         from mcp.shared.exceptions import McpError
         from mcp.types import INVALID_PARAMS, ErrorData
-        raise McpError(
-            ErrorData(code=INVALID_PARAMS, message=f"Unknown taskId: {task_id}")
-        )
+
+        raise McpError(ErrorData(code=INVALID_PARAMS, message=f"Unknown taskId: {task_id}"))
     return ServerResult(
         GetTaskResult(
             taskId=rec.task_id,

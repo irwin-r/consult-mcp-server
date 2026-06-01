@@ -129,9 +129,7 @@ def _validate_repo_path(repo_path: str | None) -> Path:
     return validate_under_trusted_roots(repo_path, strict=True)
 
 
-def resolve_git_diff(
-    base: str, head: str, repo_path: str | None = None
-) -> str:
+def resolve_git_diff(base: str, head: str, repo_path: str | None = None) -> str:
     """Run `git diff base..head` in the repo and return the diff text.
 
     Raises `ValueError` for invalid refs or untrusted repo paths.
@@ -170,12 +168,8 @@ def resolve_git_diff(
             env=env,
         )
     except subprocess.TimeoutExpired:
-        raise RuntimeError(
-            f"git diff timed out after {_DEFAULT_GIT_TIMEOUT_S}s for {base}..{head}"
-        ) from None
+        raise RuntimeError(f"git diff timed out after {_DEFAULT_GIT_TIMEOUT_S}s for {base}..{head}") from None
     except subprocess.CalledProcessError as e:
         # stderr length capped — a buggy git wrapper can spew megabytes.
-        raise RuntimeError(
-            f"git diff failed (exit {e.returncode}): {e.stderr.strip()[:1024]}"
-        ) from e
+        raise RuntimeError(f"git diff failed (exit {e.returncode}): {e.stderr.strip()[:1024]}") from e
     return result.stdout

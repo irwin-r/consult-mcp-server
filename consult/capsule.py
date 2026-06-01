@@ -145,9 +145,7 @@ MAX_TOKENS_BY_KIND: dict[str, int] = {
 _CAPSULE_PROMPT_RESPONSE_MARKER = "PANELLIST RESPONSE:\n"
 
 
-def _build_capsule_prompt(
-    body: str, original_question: str | None, *, kind: str = "decision"
-) -> str:
+def _build_capsule_prompt(body: str, original_question: str | None, *, kind: str = "decision") -> str:
     """Construct the extractor prompt, optionally with original-question context.
 
     Without the question, the extractor sees only the body and may flatten
@@ -162,14 +160,13 @@ def _build_capsule_prompt(
     head = _HEAD_BY_KIND.get(kind, _CAPSULE_PROMPT_HEAD_DECISION)
     parts: list[str] = [head]
     if original_question:
-        parts.append(
-            "ORIGINAL QUESTION (context — extract claims from the response below, not from this):\n"
-        )
+        parts.append("ORIGINAL QUESTION (context — extract claims from the response below, not from this):\n")
         parts.append(original_question.strip())
         parts.append("\n\n")
     parts.append(_CAPSULE_PROMPT_RESPONSE_MARKER)
     parts.append(body)
     return "".join(parts)
+
 
 _CONFIDENCE = re.compile(r"^\s*CONFIDENCE\s*:\s*([0-9.]+)", re.M | re.I)
 
@@ -258,9 +255,7 @@ async def _extract_one(
             timeout=timeout,
         )
     except Exception as e:
-        logger.warning(
-            "capsule extractor call failed for extractor=%s: %s", extractor_id, e
-        )
+        logger.warning("capsule extractor call failed for extractor=%s: %s", extractor_id, e)
         return capsule_cls(confidence=_body_confidence(body)), None, False
 
     # 2) Capsule build — failures here are JSON shape or Pydantic validation
@@ -274,9 +269,7 @@ async def _extract_one(
                 data["confidence"] = body_conf
         # Filter to known fields so an extractor adding an extra key doesn't
         # break the strict (`extra="forbid"`) Pydantic model.
-        capsule = capsule_cls(
-            **{k: v for k, v in data.items() if k in capsule_cls.model_fields}
-        )
+        capsule = capsule_cls(**{k: v for k, v in data.items() if k in capsule_cls.model_fields})
     except Exception as e:
         logger.warning("capsule JSON build failed for extractor=%s: %s", extractor_id, e)
         # Pydantic validation on the body-fallback path must NOT propagate:
@@ -287,8 +280,9 @@ async def _extract_one(
             capsule = capsule_cls(confidence=_body_confidence(body))
         except Exception as ce:
             logger.warning(
-                "capsule fallback construction failed for extractor=%s: %s "
-                "(returning empty capsule)", extractor_id, ce,
+                "capsule fallback construction failed for extractor=%s: %s (returning empty capsule)",
+                extractor_id,
+                ce,
             )
             capsule = capsule_cls()
 
@@ -297,18 +291,16 @@ async def _extract_one(
     # emits a verdict + confidence but zero findings (a stochastic miss — seen
     # with well-formatted grok/llama review bodies); a single sharper re-ask
     # usually recovers them. Only fires for the finding-bearing kinds.
-    if (
-        kind in ("review", "research")
-        and not getattr(capsule, "findings", None)
-        and _body_has_findings(body)
-    ):
+    if kind in ("review", "research") and not getattr(capsule, "findings", None) and _body_has_findings(body):
         retry_kwargs = dict(kwargs)
-        retry_kwargs["messages"] = [{
-            "role": "user",
-            "content": prompt + "\n\nIMPORTANT: the panellist response above DOES "
-            "contain findings. Enumerate every one as a separate object — "
-            "returning an empty findings list is incorrect.",
-        }]
+        retry_kwargs["messages"] = [
+            {
+                "role": "user",
+                "content": prompt + "\n\nIMPORTANT: the panellist response above DOES "
+                "contain findings. Enumerate every one as a separate object — "
+                "returning an empty findings list is incorrect.",
+            }
+        ]
         try:
             retry_resp = await asyncio.wait_for(litellm.acompletion(**retry_kwargs), timeout=timeout)
             retry_data = extract_json(retry_resp.choices[0].message.content or "") or {}
@@ -329,9 +321,7 @@ async def _extract_one(
         cost = litellm.completion_cost(completion_response=resp)
         cost_known = cost is not None
     except Exception as e:
-        logger.warning(
-            "capsule cost lookup failed for extractor=%s: %s", extractor_id, e
-        )
+        logger.warning("capsule cost lookup failed for extractor=%s: %s", extractor_id, e)
         cost = None
         cost_known = False
 
@@ -369,8 +359,7 @@ async def annotate(
     original_question = bundle.prompt_for_downstream() if bundle else None
 
     targets: list[ManifestEntry] = [
-        entry for entry in handle.manifest
-        if entry.status in (Status.OK, Status.TRUNCATED)
+        entry for entry in handle.manifest if entry.status in (Status.OK, Status.TRUNCATED)
     ]
 
     if not targets:
@@ -383,8 +372,7 @@ async def annotate(
     # `asyncio.to_thread` keeps the loop free while still preserving
     # per-target ordering.
     bodies: list[str] = await asyncio.gather(
-        *(asyncio.to_thread(paths.response_text(entry.slug).read_text)
-          for entry in targets)
+        *(asyncio.to_thread(paths.response_text(entry.slug).read_text) for entry in targets)
     )
 
     total = len(targets)
@@ -413,8 +401,9 @@ async def annotate(
             # capsule pass is a best-effort enrichment on top of bodies
             # the panellists already produced.
             logger.warning(
-                "capsule extraction crashed for slug=%s: %s "
-                "(returning empty capsule)", slug, e,
+                "capsule extraction crashed for slug=%s: %s (returning empty capsule)",
+                slug,
+                e,
             )
             cls = _RESPONSE_FORMAT_BY_KIND.get(kind, Capsule)
             result = (cls(), None, False)

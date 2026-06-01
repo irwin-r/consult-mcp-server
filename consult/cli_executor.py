@@ -89,9 +89,7 @@ async def call_cli(
         # (we pass through the empty stdout) — but for the error string
         # the head is the most useful.
         err_snippet = stderr.decode("utf-8", "replace")[:500]
-        raise RuntimeError(
-            f"CLI {cli_command[0]!r} exited {proc.returncode}: {err_snippet}"
-        )
+        raise RuntimeError(f"CLI {cli_command[0]!r} exited {proc.returncode}: {err_snippet}")
 
     body = stdout.decode("utf-8", "replace")
     return SimpleNamespace(

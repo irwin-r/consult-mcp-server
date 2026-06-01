@@ -64,17 +64,14 @@ def _read_text_safely(path: Path) -> str:
         raise ValueError(f"{type(e).__name__}: {e}") from e
     cap = _max_bytes()
     if size > cap:
-        raise ValueError(
-            f"attachment {size} bytes exceeds CONSULT_ATTACHMENT_MAX_BYTES={cap}"
-        )
+        raise ValueError(f"attachment {size} bytes exceeds CONSULT_ATTACHMENT_MAX_BYTES={cap}")
     try:
         return resolved.read_text()
     except UnicodeDecodeError as e:
-        raise ValueError(
-            f"not a text file (UnicodeDecodeError at byte {e.start})"
-        ) from e
+        raise ValueError(f"not a text file (UnicodeDecodeError at byte {e.start})") from e
     except OSError as e:
         raise ValueError(f"{type(e).__name__}: {e}") from e
+
 
 # JSON Schema fragment for one attachment entry. Used by every tool that
 # accepts attachments (panel, refine, consult, sequence) — keeping the
@@ -108,8 +105,7 @@ ATTACHMENT_SCHEMA_ITEMS = {
                 "repo_path": {
                     "type": "string",
                     "description": (
-                        "Repo dir. Must resolve under CONSULT_TRUSTED_REPO_ROOTS "
-                        "(defaults to cwd)."
+                        "Repo dir. Must resolve under CONSULT_TRUSTED_REPO_ROOTS (defaults to cwd)."
                     ),
                 },
                 "label": {"type": "string"},
@@ -280,15 +276,17 @@ def extract_inlined_blocks(prompt: str) -> list[InlinedBlock]:
     blocks: list[InlinedBlock] = []
     for m in _BLOCK_RE.finditer(prompt, region_start):
         label, path = _parse_header(m.group("header"))
-        blocks.append(InlinedBlock(
-            header=m.group("header"),
-            label=label,
-            path=path,
-            lang=m.group("lang"),
-            content=m.group("content"),
-            start=m.start(),
-            end=m.end(),
-        ))
+        blocks.append(
+            InlinedBlock(
+                header=m.group("header"),
+                label=label,
+                path=path,
+                lang=m.group("lang"),
+                content=m.group("content"),
+                start=m.start(),
+                end=m.end(),
+            )
+        )
     return blocks
 
 
@@ -345,7 +343,9 @@ def persist_inlined_attachments(paths: Any, prompt: str) -> dict[int, str]:
         except OSError as e:
             logger.warning(
                 "could not persist attachment block %r → %s: %s",
-                block.path or block.label, target, e,
+                block.path or block.label,
+                target,
+                e,
             )
             continue
         out[block.start] = paths.attachment_resource_uri(name)
