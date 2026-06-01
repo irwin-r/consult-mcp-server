@@ -935,6 +935,11 @@ async def refine(
             rubric=rubric,
         )
         text = synth_result.text
+        # A non-OK synth means `text` is a sentinel, not a real synthesis.
+        # Surface it as partial, unless an earlier round already set a reason
+        # (an arbiter failure or cap break, which we keep).
+        if synth_result.status is not synth.SynthStatus.OK and partial_reason is None:
+            partial_reason = f"synthesis status={synth_result.status.value}"
         cumulative_cost += synth_result.cost_usd
         if not synth_result.cost_known:
             cost_all_known = False

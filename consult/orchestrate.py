@@ -268,6 +268,11 @@ async def consult(
         cost_usd=total_cost,
         cost_known=total_cost_known,
     )
+    # A non-OK synth status means `.text` is a sentinel ("# Synthesis
+    # unavailable" / "# Synthesis empty"), not a real answer. Surface that as
+    # a partial result instead of a clean success — otherwise the caller sees
+    # partial=False with an error string in `synthesis`. Mirrors sequence.py.
+    synth_failed = synth_result.status is not synth.SynthStatus.OK
     return RunResult(
         run_id=handle.run_id,
         synthesis=synth_result.text,
@@ -275,7 +280,8 @@ async def consult(
         cost_usd=total_cost,
         cost_known=total_cost_known,
         wall_ms=handle.wall_ms,
-        partial=False,
+        partial=synth_failed,
+        partial_reason=(f"synthesis status={synth_result.status.value}" if synth_failed else None),
         synthesiser=synth_alias,
         disagreement=disagreement,
     )

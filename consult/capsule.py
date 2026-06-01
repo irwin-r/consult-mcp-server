@@ -291,6 +291,13 @@ async def _extract_one(
     # emits a verdict + confidence but zero findings (a stochastic miss — seen
     # with well-formatted grok/llama review bodies); a single sharper re-ask
     # usually recovers them. Only fires for the finding-bearing kinds.
+    # `billed_responses` accrues every extractor call we actually made so the
+    # cost lookup below prices all of them. The retry call is billed by the
+    # provider whether or not we end up adopting its capsule, so it must be
+    # counted either way — overwriting `resp` here would silently drop the
+    # first call's cost.
+    billed_responses = [resp]
+
     if kind in ("review", "research") and not getattr(capsule, "findings", None) and _body_has_findings(body):
         retry_kwargs = dict(kwargs)
         retry_kwargs["messages"] = [
@@ -303,6 +310,7 @@ async def _extract_one(
         ]
         try:
             retry_resp = await asyncio.wait_for(litellm.acompletion(**retry_kwargs), timeout=timeout)
+            billed_responses.append(retry_resp)
             retry_data = extract_json(retry_resp.choices[0].message.content or "") or {}
             if retry_data.get("confidence") in (None, "null"):
                 bc = _body_confidence(body)
@@ -312,18 +320,25 @@ async def _extract_one(
                 **{k: v for k, v in retry_data.items() if k in capsule_cls.model_fields}
             )
             if getattr(retry_capsule, "findings", None):
-                capsule, resp = retry_capsule, retry_resp
+                capsule = retry_capsule
         except Exception as e:
             logger.warning("capsule empty-findings retry failed for extractor=%s: %s", extractor_id, e)
 
-    # 3) Cost lookup — never let a pricing miss discard a successful capsule
-    try:
-        cost = litellm.completion_cost(completion_response=resp)
-        cost_known = cost is not None
-    except Exception as e:
-        logger.warning("capsule cost lookup failed for extractor=%s: %s", extractor_id, e)
-        cost = None
-        cost_known = False
+    # 3) Cost lookup — sum every extractor call we made (first + any retry).
+    # A pricing miss on any call flips cost_known False but never discards a
+    # successful capsule.
+    cost: float | None = None
+    cost_known = True
+    for billed in billed_responses:
+        try:
+            c = litellm.completion_cost(completion_response=billed)
+        except Exception as e:
+            logger.warning("capsule cost lookup failed for extractor=%s: %s", extractor_id, e)
+            c = None
+        if c is None:
+            cost_known = False
+        else:
+            cost = (cost or 0.0) + c
 
     return capsule, cost, cost_known
 
