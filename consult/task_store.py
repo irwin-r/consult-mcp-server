@@ -135,7 +135,11 @@ def attach_run_id(task_id: str, run_id: str) -> None:
 
 def complete(task_id: str, result: Any) -> None:
     rec = _REGISTRY.get(task_id)
-    if rec is None:
+    # Don't resurrect a terminal task. A cancel() can land while the
+    # background coroutine is already past its last await and about to call
+    # complete(); without this guard the cancelled task flips back to
+    # completed and a polling client sees the wrong status.
+    if rec is None or rec.status in _TERMINAL_STATUSES:
         return
     rec.status = STATUS_COMPLETED
     rec.result = result
@@ -144,7 +148,9 @@ def complete(task_id: str, result: Any) -> None:
 
 def fail(task_id: str, error: str) -> None:
     rec = _REGISTRY.get(task_id)
-    if rec is None:
+    # Same terminal-state guard as complete(): a cancelled (or already
+    # failed) task must not be overwritten by a late failure callback.
+    if rec is None or rec.status in _TERMINAL_STATUSES:
         return
     rec.status = STATUS_FAILED
     rec.error = error

@@ -365,3 +365,24 @@ async def test_tasks_get_unknown_task_raises_invalid_params(
             )
     assert exc_info.value.error.code == INVALID_PARAMS
     assert "task-doesnotexist" in exc_info.value.error.message
+
+
+def test_task_store_complete_does_not_resurrect_cancelled(_clean_task_store):
+    """Regression: complete()/fail() must not flip a CANCELLED task back to a
+    completed/failed status when the background coroutine finishes just after
+    cancel() lands (it passed its last await, so CancelledError never raised).
+    """
+    from consult import task_store
+
+    rec = task_store.create(ttl_ms=60_000)
+    assert task_store.cancel(rec.task_id) is True
+    assert task_store.get(rec.task_id).status == task_store.STATUS_CANCELLED
+
+    # A late completion callback must be ignored.
+    task_store.complete(rec.task_id, {"run_id": "x"})
+    assert task_store.get(rec.task_id).status == task_store.STATUS_CANCELLED
+    assert task_store.get(rec.task_id).result is None
+
+    # fail() is guarded the same way.
+    task_store.fail(rec.task_id, "boom")
+    assert task_store.get(rec.task_id).status == task_store.STATUS_CANCELLED
