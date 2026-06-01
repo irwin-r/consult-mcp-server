@@ -76,15 +76,11 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
+# `consult` is the only package; hatchling includes every non-ignored file
+# under it, data files (config/*.json, schemas/*.json) included. No
+# force-include is needed — adding one double-counts those paths and the
+# build fails with "a second file is being added at the same path".
 packages = ["consult"]
-
-# Include data files (rubrics, capsule JSON Schema, default registry/stances)
-# in the wheel. Without this, `consult.config.*.json` and the schema file
-# work in editable installs (they live in the source tree) but go missing
-# from a `pip install consult-mcp-server` wheel.
-[tool.hatch.build.targets.wheel.force-include]
-"consult/config" = "consult/config"
-"consult/schemas" = "consult/schemas"
 
 [tool.ruff]
 line-length = 110
