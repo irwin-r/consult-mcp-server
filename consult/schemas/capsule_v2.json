@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/irwinr/consult-mcp-server/consult/schemas/capsule_v2.json",
+  "title": "Consult capsule",
+  "description": "Structured ~200-token extract from a panellist response. Schema version 2 introduces the discriminated union over decision / review / research capsule kinds. Version 1 manifests are upgradeable: a missing `kind` field is treated as `decision`.",
+  "oneOf": [
+    {
+      "type": "object",
+      "title": "DecisionCapsule",
+      "description": "General-purpose capsule: position + recommendation + key points. Use for `consult` / `panel` / `refine` / `sequence` calls that ask a decision-shaped question.",
+      "required": ["kind"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "decision" },
+        "position": { "type": "string", "description": "One-line summary of stance/conclusion." },
+        "recommendation": { "type": "string", "description": "What the panellist recommends." },
+        "key_points": { "type": "array", "items": { "type": "string" } },
+        "unique_claims": { "type": "array", "items": { "type": "string" }, "description": "Claims only this panellist made." },
+        "caveats": { "type": "array", "items": { "type": "string" } },
+        "agrees_with": { "type": "array", "items": { "type": "string" }, "description": "Slugs this agrees with." },
+        "disagrees_with": { "type": "array", "items": { "type": "string" } },
+        "confidence": { "type": ["number", "null"], "minimum": 0.0, "maximum": 1.0 }
+      }
+    },
+    {
+      "type": "object",
+      "title": "ReviewCapsule",
+      "description": "Code/PR review capsule: line-anchored findings + overall verdict. Pass `capsule_kind=\"review\"` to elicit.",
+      "required": ["kind"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "review" },
+        "findings": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["severity", "category", "summary"],
+            "properties": {
+              "severity": { "enum": ["blocker", "major", "minor", "nit", "praise"] },
+              "file": { "type": ["string", "null"] },
+              "line_range": {
+                "type": ["array", "null"],
+                "items": { "type": "integer", "minimum": 1 },
+                "minItems": 2,
+                "maxItems": 2
+              },
+              "category": { "enum": ["security", "performance", "correctness", "style", "maintainability", "tests", "docs"] },
+              "summary": { "type": "string", "description": "≤30 words." },
+              "suggestion": { "type": "string", "description": "≤30 words." }
+            }
+          }
+        },
+        "overall_verdict": { "enum": ["ship", "changes_requested", "discuss"] },
+        "confidence": { "type": ["number", "null"], "minimum": 0.0, "maximum": 1.0 }
+      }
+    },
+    {
+      "type": "object",
+      "title": "ResearchCapsule",
+      "description": "Evidence-survey capsule: claims + evidence + uncertainties + sources. Pass `capsule_kind=\"research\"` to elicit.",
+      "required": ["kind"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "const": "research" },
+        "claims": { "type": "array", "items": { "type": "string" } },
+        "evidence": { "type": "array", "items": { "type": "string" } },
+        "uncertainties": { "type": "array", "items": { "type": "string" } },
+        "sources_cited": { "type": "array", "items": { "type": "string" } },
+        "confidence": { "type": ["number", "null"], "minimum": 0.0, "maximum": 1.0 }
+      }
+    }
+  ]
+}

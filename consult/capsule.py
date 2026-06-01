@@ -129,14 +129,16 @@ _RESPONSE_FORMAT_BY_KIND: dict[str, type] = {
 
 # Per-kind max-output budget. Sized for the panellist body (free-form prose
 # enumerating findings/claims), not just the structured capsule — a review
-# body needs room for ~20-30 findings with reasoning, so 8000 tokens. The
-# capsule extractor reuses the same budget; overcapping the extractor is
-# harmless (it stops at the actual end-of-output). Review at 4000 truncated
-# claude-haiku mid-review on a long-context architecture review (FRICTION
-# pass #16), so the dimension was flipped from per-model to per-kind.
+# body needs room for ~20-30 findings with reasoning. The capsule extractor
+# reuses the same budget; overcapping the extractor is harmless (it stops at
+# the actual end-of-output). History: review at 4000 truncated claude-haiku
+# mid-review (FRICTION #16), so the dimension was flipped from per-model to
+# per-kind at 8000; 8000 then truncated verbose/reasoning models (gpt-5.5,
+# glm, mimo, gemini-pro) at finish_reason=length — reasoning tokens eat the
+# budget before findings are emitted — so review is now 16000.
 MAX_TOKENS_BY_KIND: dict[str, int] = {
     "decision": 2000,
-    "review": 8000,
+    "review": 16000,
     "research": 4000,
 }
 
@@ -192,6 +194,16 @@ def _body_confidence(body: str) -> float | None:
     if not (0.0 <= v <= 1.0):
         return None
     return v
+
+
+def _body_has_findings(body: str) -> bool:
+    # Gate for the empty-findings retry: only re-ask when the body is substantial
+    # and looks like it enumerates issues, so we don't burn a retry on a model
+    # that genuinely abstained or returned a short non-answer.
+    if len(body.strip()) < 300:
+        return False
+    low = body.lower()
+    return any(m in low for m in ("severity", "finding", "fix:", "issue", "\n- ", "\n1.", "\n* ", "\n#"))
 
 
 async def _extract_one(
@@ -279,6 +291,38 @@ async def _extract_one(
                 "(returning empty capsule)", extractor_id, ce,
             )
             capsule = capsule_cls()
+
+    # 2b) Retry once when the extractor returned an empty findings list on a
+    # body that clearly enumerates findings. The cheap extractor occasionally
+    # emits a verdict + confidence but zero findings (a stochastic miss — seen
+    # with well-formatted grok/llama review bodies); a single sharper re-ask
+    # usually recovers them. Only fires for the finding-bearing kinds.
+    if (
+        kind in ("review", "research")
+        and not getattr(capsule, "findings", None)
+        and _body_has_findings(body)
+    ):
+        retry_kwargs = dict(kwargs)
+        retry_kwargs["messages"] = [{
+            "role": "user",
+            "content": prompt + "\n\nIMPORTANT: the panellist response above DOES "
+            "contain findings. Enumerate every one as a separate object — "
+            "returning an empty findings list is incorrect.",
+        }]
+        try:
+            retry_resp = await asyncio.wait_for(litellm.acompletion(**retry_kwargs), timeout=timeout)
+            retry_data = extract_json(retry_resp.choices[0].message.content or "") or {}
+            if retry_data.get("confidence") in (None, "null"):
+                bc = _body_confidence(body)
+                if bc is not None:
+                    retry_data["confidence"] = bc
+            retry_capsule = capsule_cls(
+                **{k: v for k, v in retry_data.items() if k in capsule_cls.model_fields}
+            )
+            if getattr(retry_capsule, "findings", None):
+                capsule, resp = retry_capsule, retry_resp
+        except Exception as e:
+            logger.warning("capsule empty-findings retry failed for extractor=%s: %s", extractor_id, e)
 
     # 3) Cost lookup — never let a pricing miss discard a successful capsule
     try:
