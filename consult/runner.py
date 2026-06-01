@@ -1349,6 +1349,20 @@ async def fanout(
         _persist_partial_handle(handle)
         return handle
 
+    # Committed to a real run now. If a cap was set but the estimate isn't
+    # fully priced, the `estimate > cap` gate above could not enforce it (the
+    # estimate covers only known-priced models), so the run may exceed the cap
+    # silently. Warn rather than block — refusing every unpriced panel would be
+    # too aggressive for openrouter-routed models, most of which are unpriced.
+    if max_run_usd is not None and not all_known:
+        logger.warning(
+            "max_run_usd=$%.2f set but at least one panellist has unknown pricing; "
+            "the $%.2f estimate covers only known-priced models, so the cap cannot be "
+            "fully enforced for this run.",
+            cap,
+            estimate,
+        )
+
     # Build slugs + prompts
     slugs = _make_slugs(specs, blinded)
     # Duplicate slugs ⇒ multiple panellists racing to write to the same
