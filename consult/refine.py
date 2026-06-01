@@ -752,7 +752,7 @@ async def refine(
         fanout_est, fanout_known = await runner.aestimate_cost(
             round_base_specs, fanout_cost_input, capsule_kind=resolved_kind,
         )
-        # Arbiter call has its own hardcoded max_tokens=2000 (see _ask_arbiter);
+        # Arbiter call has its own hardcoded max_completion_tokens=2000 (see _ask_arbiter);
         # "decision" matches that budget so the estimate is honest.
         arbiter_est, arbiter_known = await runner.aestimate_cost(
             [arbiter_spec], round_prompt, capsule_kind="decision",
