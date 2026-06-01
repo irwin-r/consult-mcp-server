@@ -381,8 +381,10 @@ Read [`SECURITY.md`](SECURITY.md) for the full threat model. Short version:
 - **`git diff` runs with global/system git config neutralised** so a
   malicious `.gitattributes` filter can't execute.
 - **LiteLLM exception strings are scrubbed** for `sk-…`, `AIza…`,
-  `Bearer …`, `x-api-key:` and similar before anything hits disk or the
-  manifest.
+  `Bearer …`, `x-api-key:` and similar before they reach the manifest or
+  the progress log. This covers provider *error* text only. The raw prompt
+  and panellist responses are stored unredacted inside the `0o700` run
+  directory, so treat that directory as sensitive.
 
 ### Privacy note
 
@@ -420,11 +422,22 @@ consult/                # ENGINE — no mcp.* imports
   progress.py           # typed ProgressEvent union
   status.py             # LiteLLM response → Status
   types.py              # Pydantic models (StrictModel base)
+  jsonparse.py          # tolerant JSON extraction from model output
+  provider_caps.py      # per-provider capability flags (temperature, etc.)
+  cli_executor.py       # CLI-as-panellist subprocess transport
+  telemetry.py          # optional OpenTelemetry spans (otel extra)
+  peer_rank.py          # peer-ranking aggregation (opt-in, off by default)
+  voting.py             # medoid selection over model:N capsules (opt-in)
+  strategies.py         # refine elimination strategies (opt-in)
+  task_store.py         # in-process registry for long-running task mode
   mcp/                  # MCP ADAPTER — only thing that imports mcp.*
     server.py, handlers.py, schemas.py, errors.py, __main__.py
   config/
     models.json         # registry with privacy_tier annotations
     stances.json        # persona prompts
+    rubrics/            # synthesis rubric markdown (consensus, code_review, ...)
+  schemas/
+    capsule_v2.json     # JSON Schema for the capsule wire shape (reference)
 tests/                  # pytest (offline + live, gated on keys)
 .github/workflows/      # CI: ruff + pytest on Py 3.11/3.12/3.13
 FRICTION.md             # internal dogfooding log (kept for transparency)
