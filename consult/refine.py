@@ -557,6 +557,60 @@ def _apply_continuation(prompt: str, continuation_id: str | None) -> tuple[str, 
     return combined_for_storage, prior_turns
 
 
+async def _round_cost_gate(
+    *,
+    round_base_specs: list[ModelSpec],
+    round_prompt: str,
+    prior_turns: list[dict[str, Any]] | None,
+    resolved_kind: str,
+    arbiter_spec: ModelSpec,
+    cumulative_cost: float,
+    cap: float,
+) -> str | None:
+    """Estimate the next refine round's cost (fanout + arbiter) and decide
+    whether to proceed. Returns a `partial_reason` when the round should be
+    refused, or None to proceed.
+
+    Two refusals: the estimate would push cumulative spend past the cap, or
+    pricing is unknown and spend is already past 80% of the cap (a conservative
+    floor that still leaves headroom for one bounded round).
+    """
+    # Mirror runner.fanout's view: when a continuation is active, the
+    # prior_turns text is part of every panellist call's input. Omitting it
+    # here would wave through a round that fanout then rejects as cap-exceeded,
+    # whose early return clobbers the prior round's manifest (shared `paths`).
+    fanout_cost_input = round_prompt
+    if prior_turns:
+        fanout_cost_input = runner.concat_turn_text(prior_turns) + "\n" + round_prompt
+    fanout_est, fanout_known = await runner.aestimate_cost(
+        round_base_specs, fanout_cost_input, capsule_kind=resolved_kind
+    )
+    # The arbiter call has its own hardcoded max_completion_tokens=2000 (see
+    # _ask_arbiter); "decision" matches that budget so the estimate is honest.
+    arbiter_est, arbiter_known = await runner.aestimate_cost(
+        [arbiter_spec], round_prompt, capsule_kind="decision"
+    )
+    estimate = fanout_est + arbiter_est
+    est_known = fanout_known and arbiter_known
+    if cumulative_cost + estimate > cap:
+        return (
+            f"would exceed cap: spent ${cumulative_cost:.2f}, next round estimate "
+            f"${estimate:.2f} (fanout ${fanout_est:.2f} + arbiter ${arbiter_est:.2f}), "
+            f"cap ${cap:.2f}"
+        )
+    # Refuse further rounds only when pricing is unknown AND spend is already
+    # most of the way to the cap. FRICTION pass #14 saw an asymmetric
+    # round-1-proceeds / round-2-refuses surprise callers with mixed-provider
+    # panels; the 80% floor leaves headroom for one more bounded round.
+    if not est_known and cumulative_cost > cap * 0.8:
+        return (
+            f"refusing further rounds: per-model pricing unknown for at least one "
+            f"panellist and spend is past 80% of cap "
+            f"(${cumulative_cost:.2f} spent / ${cap:.2f} cap)"
+        )
+    return None
+
+
 async def refine(
     prompt: str,
     specs: list[ModelSpec],
@@ -709,54 +763,19 @@ async def refine(
                 f"{round_num}; aborting to avoid a zero-panel fanout"
             )
             break
-        # Estimate next-round cost (fanout + arbiter); refuse if it'd blow
-        # the cap. The arbiter's prompt isn't known until after fanout, but
-        # token_counter on the round prompt is a reasonable proxy — the
-        # arbiter's input is roughly "round prompt + capsule summaries"
-        # which scales with the prompt size for code-review / long-context
-        # work where the cap actually matters.
-        # Mirror runner.fanout's view: when a continuation is active, the
-        # prior_turns text is part of every panellist call's input. Omitting
-        # it here lets refine wave a round through that fanout would then
-        # reject as cap-exceeded — and fanout's early-return path would
-        # clobber the prior round's manifest because we share `paths`.
-        fanout_cost_input = round_prompt
-        if prior_turns:
-            fanout_cost_input = runner.concat_turn_text(prior_turns) + "\n" + round_prompt
-        fanout_est, fanout_known = await runner.aestimate_cost(
-            round_base_specs,
-            fanout_cost_input,
-            capsule_kind=resolved_kind,
+        # Estimate the next round's cost (fanout + arbiter) and refuse if it
+        # would blow the cap. See `_round_cost_gate`.
+        gate_reason = await _round_cost_gate(
+            round_base_specs=round_base_specs,
+            round_prompt=round_prompt,
+            prior_turns=prior_turns,
+            resolved_kind=resolved_kind,
+            arbiter_spec=arbiter_spec,
+            cumulative_cost=cumulative_cost,
+            cap=cap,
         )
-        # Arbiter call has its own hardcoded max_completion_tokens=2000 (see _ask_arbiter);
-        # "decision" matches that budget so the estimate is honest.
-        arbiter_est, arbiter_known = await runner.aestimate_cost(
-            [arbiter_spec],
-            round_prompt,
-            capsule_kind="decision",
-        )
-        estimate = fanout_est + arbiter_est
-        est_known = fanout_known and arbiter_known
-        if cumulative_cost + estimate > cap:
-            partial_reason = (
-                f"would exceed cap: spent ${cumulative_cost:.2f}, next round estimate "
-                f"${estimate:.2f} (fanout ${fanout_est:.2f} + arbiter ${arbiter_est:.2f}), "
-                f"cap ${cap:.2f}"
-            )
-            break
-        # Refuse further rounds only when partial pricing AND spend is
-        # already most of the way to the cap. Earlier behaviour was an
-        # asymmetric "round 1 with unknown pricing proceeds, round 2
-        # refuses" which surprised callers with mixed-provider panels
-        # (FRICTION pass #14 saw this on sequence). Conservative threshold
-        # of 80% leaves headroom for one more bounded round.
-        cap_warning_floor = cap * 0.8
-        if not est_known and cumulative_cost > cap_warning_floor:
-            partial_reason = (
-                f"refusing further rounds: per-model pricing unknown for at least one "
-                f"panellist and spend is past 80% of cap "
-                f"(${cumulative_cost:.2f} spent / ${cap:.2f} cap)"
-            )
+        if gate_reason is not None:
+            partial_reason = gate_reason
             break
 
         round_base = (round_num - 1) * (panel_n * 2 + 1)
