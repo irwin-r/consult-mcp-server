@@ -6917,3 +6917,48 @@ async def test_refine_breaks_when_next_round_would_exceed_cap(tmp_path, monkeypa
     assert result.partial is True
     assert result.partial_reason is not None and "exceed cap" in result.partial_reason
     assert result.final_manifest  # round-1 manifest preserved (clobber guard)
+
+
+@pytest.mark.asyncio
+async def test_fanout_warns_when_cap_set_but_pricing_unknown(tmp_path, monkeypatch, caplog):
+    """A cap with unknown panellist pricing can't be enforced (the estimate
+    covers only known-priced models). fanout proceeds but warns, so the silent
+    bypass is at least visible in the logs.
+    """
+    import logging
+
+    from consult import runner
+    from consult.runner import fanout
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    # Low estimate, NOT all known → under any cap, but unenforceable.
+    monkeypatch.setattr(runner, "estimate_cost", lambda *a, **kw: (0.0, False))
+
+    async def fake_acompletion(**kwargs):
+        class _Msg:
+            content = "ok\n\nCONFIDENCE: 0.7"
+            tool_calls = None
+
+        class _Choice:
+            message = _Msg()
+            finish_reason = "stop"
+
+        class _Resp:
+            choices = [_Choice()]
+            usage = None
+
+            def model_dump(self):
+                return {"_stub": True}
+
+        return _Resp()
+
+    monkeypatch.setattr(runner.litellm, "acompletion", fake_acompletion)
+    monkeypatch.setattr(runner.litellm, "completion_cost", lambda **_: 0.0)
+
+    specs = [ModelSpec(model="claude-haiku")]
+    with caplog.at_level(logging.WARNING, logger="consult.runner"):
+        handle = await fanout("p", specs, max_run_usd=5.0)
+
+    assert handle.partial is False
+    assert len(handle.manifest) == 1
+    assert "cap cannot be fully enforced" in caplog.text
