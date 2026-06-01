@@ -1,0 +1,37 @@
+name: audit
+
+# pip-audit on every push to main + a weekly cron, with PR runs informational
+# only (the security check shouldn't block normal PRs unless the PR itself
+# touches dependencies).
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/audit.yml"
+  schedule:
+    - cron: "17 8 * * 1"  # Mondays 08:17 UTC
+  workflow_dispatch:
+
+jobs:
+  pip-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --extra dev --extra mcp --extra otel
+
+      - name: Run pip-audit
+        # If a transitive CVE is irrelevant to consult's usage, document
+        # the exception by adding `--ignore-vuln <ID>` with a justification
+        # comment here. Keep the list short.
+        run: uv run pip-audit --strict

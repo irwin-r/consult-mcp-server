@@ -1,0 +1,35 @@
+version: 2
+updates:
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    groups:
+      dev-deps:
+        patterns:
+          - "pytest*"
+          - "ruff*"
+          - "pre-commit*"
+          - "pip-audit*"
+    ignore:
+      # litellm and mcp are pinned to tight minor ranges and audited manually
+      # on each bump (see pyproject.toml comments). Dependabot floating them
+      # would defeat the manual-audit policy.
+      - dependency-name: "litellm"
+      - dependency-name: "mcp"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 2
