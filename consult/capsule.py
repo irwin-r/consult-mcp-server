@@ -236,7 +236,7 @@ async def _extract_one(
     kwargs: dict[str, Any] = {
         "model": extractor_id,
         "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": MAX_TOKENS_BY_KIND.get(kind, MAX_TOKENS_BY_KIND["decision"]),
+        "max_completion_tokens": MAX_TOKENS_BY_KIND.get(kind, MAX_TOKENS_BY_KIND["decision"]),
         "response_format": capsule_cls,
     }
     provider_caps.apply_temperature(kwargs, extractor_id, 0.0)

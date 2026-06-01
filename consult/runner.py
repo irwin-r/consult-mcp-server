@@ -962,7 +962,7 @@ async def _call_one(
                         start=start,
                         model=litellm_id,
                         messages=messages,
-                        max_tokens=budget,
+                        max_completion_tokens=budget,
                         **extra,
                     )
                 else:
@@ -970,7 +970,7 @@ async def _call_one(
                         timeout=timeout,
                         model=litellm_id,
                         messages=messages,
-                        max_tokens=budget,
+                        max_completion_tokens=budget,
                         **extra,
                     )
             # Persist raw response — use model_dump for Pydantic, fall

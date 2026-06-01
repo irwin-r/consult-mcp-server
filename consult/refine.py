@@ -363,7 +363,7 @@ async def _ask_arbiter(
     call_kwargs: dict[str, Any] = {
         "model": litellm_id,
         "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": 2000,
+        "max_completion_tokens": 2000,
     }
     provider_caps.apply_temperature(call_kwargs, litellm_id, 0.0)
     try:

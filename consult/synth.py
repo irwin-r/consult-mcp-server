@@ -286,7 +286,7 @@ async def synthesise(
             litellm.acompletion(
                 model=litellm_id,
                 messages=build_messages(synth_input, provider),
-                max_tokens=budget,
+                max_completion_tokens=budget,
             ),
             timeout=timeout,
         )

@@ -157,7 +157,7 @@ async def _ask_one_ranker(
             litellm.acompletion(
                 model=litellm_id,
                 messages=[{"role": "user", "content": prompt}],
-                max_tokens=512,
+                max_completion_tokens=512,
             ),
             timeout=120,
         )
