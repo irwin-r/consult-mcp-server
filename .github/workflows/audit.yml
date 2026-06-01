@@ -31,7 +31,9 @@ jobs:
         run: uv sync --extra dev --extra mcp --extra otel
 
       - name: Run pip-audit
-        # If a transitive CVE is irrelevant to consult's usage, document
-        # the exception by adding `--ignore-vuln <ID>` with a justification
-        # comment here. Keep the list short.
-        run: uv run pip-audit --strict
+        # --skip-editable: the project installs itself editable into the uv
+        # venv, and pip-audit --strict errors on it ("not found on PyPI")
+        # until it is published. We audit the dependencies, not the project.
+        # If a transitive CVE is irrelevant to consult's usage, document the
+        # exception by adding `--ignore-vuln <ID>` with a justification here.
+        run: uv run pip-audit --strict --skip-editable
