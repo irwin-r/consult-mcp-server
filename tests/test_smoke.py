@@ -6773,3 +6773,147 @@ async def test_consult_marks_synth_failure_as_partial(tmp_path, monkeypatch):
     assert result.partial_reason is not None
     assert "synthesis status=" in result.partial_reason
     assert result.synthesis == "# Synthesis unavailable"
+
+
+def _refine_fake_fanout(fanout_calls, *, cost=0.001):
+    """A minimal `runner.fanout` stand-in for refine loop tests: records the
+    prompt, writes a body file per slug, and returns an all-OK manifest."""
+
+    async def fake_fanout(prompt, specs, **kwargs):
+        fanout_calls.append(prompt)
+        paths = kwargs.get("existing_paths") or artifacts.create_run()
+        manifest = []
+        for spec in specs:
+            slug = spec.slug or spec.model
+            bp = paths.root / "responses" / f"{slug}.txt"
+            bp.parent.mkdir(parents=True, exist_ok=True)
+            bp.write_text(f"{slug} body")
+            manifest.append(
+                ManifestEntry(
+                    slug=slug,
+                    model_id="x/a",
+                    status=Status.OK,
+                    resource_uri=f"consult://x/{slug}",
+                    body_path=str(bp),
+                    latency_ms=10,
+                    cost_usd=cost,
+                    cost_known=True,
+                    capsule=Capsule(position=f"{slug} pos"),
+                )
+            )
+        return RunHandle(
+            run_id=paths.run_id,
+            artifacts_dir=str(paths.root),
+            manifest=manifest,
+            cost_usd=cost * len(specs),
+            cost_known=True,
+            wall_ms=10,
+        )
+
+    return fake_fanout
+
+
+async def _refine_fake_synth(*args, **kwargs):
+    from consult import synth as _synth_mod
+
+    return _synth_mod.SynthResult(text="final synth")
+
+
+async def _refine_noop_annotate(handle, **kwargs):
+    return handle
+
+
+@pytest.mark.asyncio
+async def test_refine_aborts_when_arbiter_parse_fails(tmp_path, monkeypatch):
+    """A non-parseable arbiter verdict stops the loop after that round, so its
+    error text never seeds the next-round prompt. The result is partial.
+    """
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    fanout_calls: list = []
+
+    async def fake_arbiter(*args, **kwargs):
+        return ArbiterVerdict(round=1, score=0.0, parsed_ok=False, error="unparseable verdict")
+
+    async def fake_aestimate(*a, **kw):
+        return (0.001, True)
+
+    monkeypatch.setattr("consult.refine.runner.fanout", _refine_fake_fanout(fanout_calls))
+    monkeypatch.setattr("consult.refine.capsule.annotate", _refine_noop_annotate)
+    monkeypatch.setattr("consult.refine._ask_arbiter", fake_arbiter)
+    monkeypatch.setattr("consult.refine.synth.synthesise", _refine_fake_synth)
+    monkeypatch.setattr("consult.refine.runner.aestimate_cost", fake_aestimate)
+
+    result = await refine_mod.refine("q", [ModelSpec(model="claude-haiku")], threshold=0.85, max_rounds=3)
+
+    assert len(fanout_calls) == 1  # no round 2 after the parse failure
+    assert result.rounds_completed == 1
+    assert result.converged is False
+    assert result.partial is True
+    assert result.partial_reason is not None and "arbiter failed" in result.partial_reason
+    assert result.final_manifest  # round-1 manifest preserved
+
+
+@pytest.mark.asyncio
+async def test_refine_runs_all_rounds_without_converging(tmp_path, monkeypatch):
+    """Sub-threshold scores every round: refine exhausts max_rounds, reports
+    converged=False, and still synthesises from the final round. Running out
+    of rounds is not a partial result.
+    """
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    fanout_calls: list = []
+
+    async def fake_arbiter(*args, **kwargs):
+        return ArbiterVerdict(round=1, score=0.2, parsed_ok=True)
+
+    async def fake_aestimate(*a, **kw):
+        return (0.001, True)
+
+    monkeypatch.setattr("consult.refine.runner.fanout", _refine_fake_fanout(fanout_calls))
+    monkeypatch.setattr("consult.refine.capsule.annotate", _refine_noop_annotate)
+    monkeypatch.setattr("consult.refine._ask_arbiter", fake_arbiter)
+    monkeypatch.setattr("consult.refine.synth.synthesise", _refine_fake_synth)
+    monkeypatch.setattr("consult.refine.runner.aestimate_cost", fake_aestimate)
+
+    result = await refine_mod.refine("q", [ModelSpec(model="claude-haiku")], threshold=0.85, max_rounds=2)
+
+    assert len(fanout_calls) == 2
+    assert result.rounds_completed == 2
+    assert result.converged is False
+    assert result.partial is False  # ran to completion, just below threshold
+    assert result.synthesis == "final synth"
+
+
+@pytest.mark.asyncio
+async def test_refine_breaks_when_next_round_would_exceed_cap(tmp_path, monkeypatch):
+    """When the next round's estimate would exceed max_run_usd, refine stops
+    before launching it and preserves the prior round's manifest.
+    """
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    fanout_calls: list = []
+
+    async def fake_arbiter(*args, **kwargs):
+        return ArbiterVerdict(round=1, score=0.2, parsed_ok=True)  # wants another round
+
+    est_n = {"n": 0}
+
+    async def fake_aestimate(*a, **kw):
+        # Round 1's two estimates (fanout + arbiter) are cheap; round 2's blow
+        # the cap regardless of how much round 1 actually spent.
+        est_n["n"] += 1
+        return (0.05 if est_n["n"] <= 2 else 100.0, True)
+
+    monkeypatch.setattr("consult.refine.runner.fanout", _refine_fake_fanout(fanout_calls))
+    monkeypatch.setattr("consult.refine.capsule.annotate", _refine_noop_annotate)
+    monkeypatch.setattr("consult.refine._ask_arbiter", fake_arbiter)
+    monkeypatch.setattr("consult.refine.synth.synthesise", _refine_fake_synth)
+    monkeypatch.setattr("consult.refine.runner.aestimate_cost", fake_aestimate)
+
+    result = await refine_mod.refine(
+        "q", [ModelSpec(model="claude-haiku")], threshold=0.85, max_rounds=3, max_run_usd=1.0
+    )
+
+    assert len(fanout_calls) == 1  # round 2 refused before fanout
+    assert result.rounds_completed == 1
+    assert result.partial is True
+    assert result.partial_reason is not None and "exceed cap" in result.partial_reason
+    assert result.final_manifest  # round-1 manifest preserved (clobber guard)
