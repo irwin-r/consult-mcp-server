@@ -16,13 +16,12 @@ import asyncio
 import json
 import logging
 import random
-import re
 import time
 from typing import Any
 
 import litellm
 
-from . import artifacts, capsule, context, provider_caps, registry, runner, strategies, synth
+from . import artifacts, capsule, context, provider_caps, registry, runner, slugs, strategies, synth
 from . import progress as progress_mod
 from .jsonparse import extract_json
 from .types import (
@@ -231,12 +230,9 @@ def _format_positions(manifest: list[ManifestEntry]) -> str:
     return "\n".join(lines) or "(none extracted)"
 
 
-_ROUND_SUFFIX_RE = re.compile(r"\.r\d+$")
-
-
 def _base_slug(slug: str) -> str:
     """Strip the `.r<n>` round suffix so a panellist matches across rounds."""
-    return _ROUND_SUFFIX_RE.sub("", slug)
+    return slugs.strip_round(slug)
 
 
 def _format_position_diff(

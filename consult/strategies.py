@@ -30,6 +30,7 @@ import logging
 from abc import ABC, abstractmethod
 from difflib import SequenceMatcher
 
+from . import slugs
 from .types import (
     Capsule,
     ManifestEntry,
@@ -189,35 +190,11 @@ class EliminationStrategy(Strategy):
         worst_slug: str,
         base_specs: list[ModelSpec],
     ) -> int | None:
-        """Map a round-suffixed slug back to its base-spec index.
-
-        Refine's `_suffix_specs` builds slugs as
-        `<base>-<i>.r<round_num>`. The base part may or may not match
-        the spec's `model` field directly. The most robust mapping is
-        via the index `i`. We extract it from the slug by stripping
-        the `.r<N>` and the trailing `-<i>` (since refine always adds
-        one) — but this requires knowing the actual derivation rules.
-
-        Approach: scan base_specs and find the one whose
-        `_make_slug_for_round(i, round_num)` would produce
-        `worst_slug`. Since we don't import the runner private here,
-        we approximate: strip the `.r<n>` suffix and check if it
-        starts with a known model alias.
-        """
-        # Strip the `.r<n>` suffix
-        base_part = worst_slug
-        rfind = base_part.rfind(".r")
-        if rfind != -1:
-            base_part = base_part[:rfind]
-        # Strip the trailing `-<i>` (the panel-index suffix from
-        # _suffix_specs)
-        rdash = base_part.rfind("-")
-        if rdash != -1:
-            tail = base_part[rdash + 1 :]
-            if tail.isdigit():
-                idx = int(tail)
-                if 0 <= idx < len(base_specs):
-                    return idx
+        """Map a round-suffixed `<base>-<i>.r<n>` slug back to its base-spec
+        index via the shared slug grammar (`slugs.panel_index`)."""
+        idx = slugs.panel_index(worst_slug)
+        if idx is not None and 0 <= idx < len(base_specs):
+            return idx
         return None
 
 
