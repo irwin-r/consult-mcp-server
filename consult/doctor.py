@@ -208,7 +208,6 @@ def _claude_desktop_config() -> dict[str, Any]:
     the current shell — Claude Desktop also does not inherit shell env,
     so each key must be set explicitly inside the config.
     """
-    bin_path = shutil.which("consult-mcp") or "consult-mcp"
     env: dict[str, str] = {}
     for env_var in _PROVIDER_KEYS:
         val = os.environ.get(env_var)
@@ -216,14 +215,18 @@ def _claude_desktop_config() -> dict[str, Any]:
             env[env_var] = val
     if not env:
         env = {k: f"<your {k} here>" for k in _PROVIDER_KEYS}
-    return {
-        "mcpServers": {
-            "consult": {
-                "command": bin_path,
-                "env": env,
-            }
-        }
-    }
+    # Claude Desktop does not inherit the shell PATH, so always emit an
+    # absolute command. If `consult-mcp` is installed on PATH, point at it
+    # directly; otherwise fall back to an absolute `uvx` invocation matching
+    # the README's no-install flow, since a bare command would not resolve.
+    bin_path = shutil.which("consult-mcp")
+    if bin_path:
+        server: dict[str, Any] = {"command": bin_path}
+    else:
+        uvx_path = shutil.which("uvx") or "uvx"
+        server = {"command": uvx_path, "args": ["--from", "consult-mcp-server[mcp]", "consult-mcp"]}
+    server["env"] = env
+    return {"mcpServers": {"consult": server}}
 
 
 def quick_check() -> int:
