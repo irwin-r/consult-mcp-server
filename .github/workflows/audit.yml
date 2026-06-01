@@ -32,19 +32,10 @@ jobs:
 
       - name: Run pip-audit
         # Audit the installed dependencies, skipping the editable local
-        # project (pip-audit can't resolve the unpublished consult-mcp-server
-        # on PyPI). --strict is intentionally omitted because it would fail on
-        # that skip; real vulnerabilities still fail the build without it.
-        #
-        # The four ignored advisories are all litellm proxy-server issues
-        # (privilege escalation, RCE via the /config/update endpoint, and
-        # JWT / auth bypass on proxy endpoints). consult imports litellm only
-        # as a client SDK (acompletion / completion_cost) and never runs the
-        # proxy, so none are reachable. Revisit if we ever pull litellm[proxy].
-        # Document any further irrelevant CVE the same way, with a reason.
-        run: >
-          uv run pip-audit --skip-editable
-          --ignore-vuln CVE-2025-0628
-          --ignore-vuln CVE-2026-35029
-          --ignore-vuln CVE-2026-35030
-          --ignore-vuln GHSA-69x8-hrgq-fjj8
+        # project. Once the local dev version moves ahead of the published
+        # one, pip-audit can't resolve it on PyPI and --strict would fail, so
+        # we audit the deps and leave the project out. The litellm proxy CVEs
+        # that were ignored here are fixed as of the 1.83 bump, so no
+        # --ignore-vuln entries remain; add one (with a reason) for a future
+        # irrelevant CVE.
+        run: uv run pip-audit --skip-editable
