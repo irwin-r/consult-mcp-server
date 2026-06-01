@@ -6665,3 +6665,111 @@ def test_slow_tail_dropout_default_is_180s():
 
     src = inspect.getsource(runner.fanout)
     assert 'os.environ.get("CONSULT_TAIL_DROPOUT_S", 180.0)' in src
+
+
+@pytest.mark.asyncio
+async def test_capsule_retry_counts_both_extractor_calls_cost(monkeypatch):
+    """Regression: when the empty-findings re-ask fires, the cost of BOTH
+    extractor calls must be counted. A previous version overwrote `resp`
+    with the retry response and priced only the retry, silently dropping
+    the first (already-billed) call's cost — understating spend against
+    `max_run_usd`.
+    """
+    import litellm
+
+    from consult import capsule as capsule_mod
+
+    # Long, finding-shaped body so `_body_has_findings` opens the retry gate.
+    body = "Severity: major. " + ("There is a real correctness finding here. " * 12)
+
+    calls = {"n": 0}
+
+    async def fake_acompletion(**kwargs):
+        calls["n"] += 1
+        # 1st call: a valid ReviewCapsule with no findings (triggers retry).
+        # 2nd (retry): a capsule that does enumerate a finding.
+        if calls["n"] == 1:
+            content = '{"overall_verdict": "discuss", "findings": []}'
+        else:
+            content = (
+                '{"overall_verdict": "changes_requested", "findings": '
+                '[{"severity": "major", "category": "correctness", "summary": "real bug"}]}'
+            )
+
+        class _Resp:
+            choices = [type("C", (), {"message": type("M", (), {"content": content})()})()]
+
+            def model_dump(self):
+                return {}
+
+        return _Resp()
+
+    monkeypatch.setattr(litellm, "acompletion", fake_acompletion)
+    monkeypatch.setattr(litellm, "completion_cost", lambda completion_response: 0.001)
+
+    capsule, cost, cost_known = await capsule_mod._extract_one(
+        body, "anthropic/claude-haiku-4-5", 30, kind="review"
+    )
+
+    assert calls["n"] == 2  # the retry fired
+    assert [f.summary for f in capsule.findings] == ["real bug"]  # retry capsule adopted
+    assert cost_known is True
+    assert cost == pytest.approx(0.002)  # both calls counted, not just the retry
+
+
+@pytest.mark.asyncio
+async def test_consult_marks_synth_failure_as_partial(tmp_path, monkeypatch):
+    """Regression: a non-OK synth status must surface as partial=True with a
+    reason, not a clean success whose `synthesis` is a sentinel string.
+    `sequence` already did this; `consult`/`orchestrate` did not.
+    """
+    from consult import capsule as capsule_mod
+    from consult import orchestrate as orchestrate_mod
+    from consult import runner as runner_mod
+    from consult import synth as synth_mod
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+
+    async def fake_fanout(prompt, specs, **kwargs):
+        paths = artifacts.create_run()
+        return RunHandle(
+            run_id=paths.run_id,
+            artifacts_dir=str(paths.root),
+            manifest=[
+                ManifestEntry(
+                    slug="alpha",
+                    model_id="x/y",
+                    status=Status.OK,
+                    finish_reason="stop",
+                    resource_uri=paths.resource_uri("alpha"),
+                    body_path=str(paths.response_text("alpha")),
+                    latency_ms=1,
+                    cost_usd=0.01,
+                    cost_known=True,
+                )
+            ],
+            cost_usd=0.01,
+            cost_known=True,
+            wall_ms=1,
+            partial=False,
+        )
+
+    async def fake_annotate(handle, **kwargs):
+        return handle
+
+    async def fake_synth(run_id, **kwargs):
+        return synth_mod.SynthResult(
+            text="# Synthesis unavailable",
+            status=synth_mod.SynthStatus.FAILED,
+        )
+
+    monkeypatch.setattr(runner_mod, "fanout", fake_fanout)
+    monkeypatch.setattr(capsule_mod, "annotate", fake_annotate)
+    monkeypatch.setattr(synth_mod, "synthesise", fake_synth)
+
+    result = await orchestrate_mod.consult("q", tier="quick")
+
+    assert result.partial is True
+    assert result.partial_reason is not None
+    assert "synthesis status=" in result.partial_reason
+    assert result.synthesis == "# Synthesis unavailable"
