@@ -31,9 +31,20 @@ jobs:
         run: uv sync --extra dev --extra mcp --extra otel
 
       - name: Run pip-audit
-        # --skip-editable: the project installs itself editable into the uv
-        # venv, and pip-audit --strict errors on it ("not found on PyPI")
-        # until it is published. We audit the dependencies, not the project.
-        # If a transitive CVE is irrelevant to consult's usage, document the
-        # exception by adding `--ignore-vuln <ID>` with a justification here.
-        run: uv run pip-audit --strict --skip-editable
+        # Audit the installed dependencies, skipping the editable local
+        # project (pip-audit can't resolve the unpublished consult-mcp-server
+        # on PyPI). --strict is intentionally omitted because it would fail on
+        # that skip; real vulnerabilities still fail the build without it.
+        #
+        # The four ignored advisories are all litellm proxy-server issues
+        # (privilege escalation, RCE via the /config/update endpoint, and
+        # JWT / auth bypass on proxy endpoints). consult imports litellm only
+        # as a client SDK (acompletion / completion_cost) and never runs the
+        # proxy, so none are reachable. Revisit if we ever pull litellm[proxy].
+        # Document any further irrelevant CVE the same way, with a reason.
+        run: >
+          uv run pip-audit --skip-editable
+          --ignore-vuln CVE-2025-0628
+          --ignore-vuln CVE-2026-35029
+          --ignore-vuln CVE-2026-35030
+          --ignore-vuln GHSA-69x8-hrgq-fjj8
