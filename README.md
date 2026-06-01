@@ -382,6 +382,20 @@ export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
 Without the extra (or without the endpoint set) the telemetry helpers are
 no-ops at zero overhead.
 
+## Retention
+
+Run artefacts under the runs directory accumulate indefinitely. `consult-gc`
+prunes them by age and/or count:
+
+```bash
+consult-gc --max-age-days 30           # drop runs older than 30 days
+consult-gc --max-count 500             # keep only the newest 500 runs
+consult-gc --dry-run --max-count 500   # show what would go, delete nothing
+```
+
+Defaults can be set with `CONSULT_RUNS_RETENTION_DAYS` and `CONSULT_RUNS_MAX`;
+the CLI flags override them.
+
 ## Security
 
 Read [`SECURITY.md`](SECURITY.md) for the full threat model. Short version:

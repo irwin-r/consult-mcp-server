@@ -26,14 +26,18 @@ unchanged but slugs may contain dots and an `.r<digit>` suffix.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import random
 import re
+import shutil
 import time
 from collections.abc import Callable
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 # Injectable URI formatter. The default produces the `consult://` scheme
 # that the MCP adapter dereferences via `read_resource`. Library or HTTP
@@ -246,6 +250,58 @@ def load_run(run_id: str) -> RunPaths:
 
 def write_manifest(paths: RunPaths, payload: dict) -> None:
     paths.manifest_json.write_text(json.dumps(payload, indent=2, default=str))
+
+
+def prune_runs(
+    *, max_age_days: float | None = None, max_count: int | None = None, dry_run: bool = False
+) -> list[str]:
+    """Delete old run directories under `runs_root()` to bound disk growth.
+
+    A run is removed when it is older than `max_age_days` (by directory mtime)
+    OR falls outside the newest `max_count` runs; both bounds apply when both
+    are set. Returns the deleted run_ids (or, with `dry_run=True`, the ones
+    that would be deleted). No-op when neither bound is given.
+
+    Containment-guarded: only directories that resolve under `runs_root()` and
+    match the run-id charset are ever removed.
+    """
+    if max_age_days is None and max_count is None:
+        return []
+    base = runs_root().resolve()
+    runs: list[tuple[float, Path]] = []
+    for child in base.iterdir():
+        if not child.is_dir() or not _SAFE_ID_RE.match(child.name):
+            continue
+        try:
+            runs.append((child.stat().st_mtime, child))
+        except OSError:
+            continue
+    runs.sort(key=lambda t: t[0], reverse=True)  # newest first
+
+    cutoff = (time.time() - max_age_days * 86400.0) if max_age_days is not None else None
+    doomed: list[Path] = []
+    for i, (mtime, child) in enumerate(runs):
+        over_count = max_count is not None and i >= max_count
+        too_old = cutoff is not None and mtime < cutoff
+        if over_count or too_old:
+            doomed.append(child)
+
+    deleted: list[str] = []
+    for child in doomed:
+        resolved = child.resolve()
+        try:
+            resolved.relative_to(base)  # never rmtree outside runs_root
+        except ValueError:
+            continue
+        if dry_run:
+            deleted.append(child.name)
+            continue
+        try:
+            shutil.rmtree(resolved)
+            deleted.append(child.name)
+        except OSError as e:
+            logger.warning("prune_runs: failed to remove %s: %s", child.name, e)
+    return deleted
 
 
 def augment_manifest(paths: RunPaths, **fields: object) -> None:
