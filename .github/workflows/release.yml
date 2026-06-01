@@ -30,7 +30,7 @@ jobs:
     runs-on: ubuntu-latest
     # Trusted publishing via OIDC — no API token in repo secrets.
     # Configure on PyPI under "Trusted publishers" with:
-    #   owner: irwinr  repo: consult-mcp-server  workflow: release.yml
+    #   owner: irwin-r  repo: consult-mcp-server  workflow: release.yml
     #   environment: pypi
     environment:
       name: pypi

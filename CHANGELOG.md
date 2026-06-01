@@ -68,6 +68,6 @@ First public release.
 
 Internal iterations (iter1..iter11). See git history.
 
-[Unreleased]: https://github.com/irwinr/consult-mcp-server/compare/v0.2.0...HEAD
-[0.2.0]: https://github.com/irwinr/consult-mcp-server/releases/tag/v0.2.0
-[0.1.0]: https://github.com/irwinr/consult-mcp-server/releases/tag/v0.1.0
+[Unreleased]: https://github.com/irwin-r/consult-mcp-server/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/irwin-r/consult-mcp-server/releases/tag/v0.2.0
+[0.1.0]: https://github.com/irwin-r/consult-mcp-server/releases/tag/v0.1.0

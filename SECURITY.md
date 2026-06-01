@@ -13,7 +13,7 @@ receives security fixes; older versions do not.
 ## Reporting a Vulnerability
 
 Please report security issues privately via
-[GitHub Security Advisories](https://github.com/irwinr/consult-mcp-server/security/advisories/new).
+[GitHub Security Advisories](https://github.com/irwin-r/consult-mcp-server/security/advisories/new).
 Do **not** open a public issue for security-impacting bugs.
 
 You can expect:

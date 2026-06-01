@@ -46,7 +46,7 @@ when an individual is officially representing the community in public spaces.
 
 Instances of abusive, harassing, or otherwise unacceptable behaviour may be
 reported to the project maintainers via
-[GitHub Security Advisories](https://github.com/irwinr/consult-mcp-server/security/advisories/new)
+[GitHub Security Advisories](https://github.com/irwin-r/consult-mcp-server/security/advisories/new)
 (the private channel). All complaints will be reviewed and investigated
 promptly and fairly.
 

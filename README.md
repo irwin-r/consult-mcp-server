@@ -2,7 +2,7 @@
 
 > **Get a second opinion from a parallel panel of LLMs — without bloating your agent's context window.**
 
-[![CI](https://github.com/irwinr/consult-mcp-server/actions/workflows/tests.yml/badge.svg)](https://github.com/irwinr/consult-mcp-server/actions/workflows/tests.yml)
+[![CI](https://github.com/irwin-r/consult-mcp-server/actions/workflows/tests.yml/badge.svg)](https://github.com/irwin-r/consult-mcp-server/actions/workflows/tests.yml)
 [![PyPI](https://img.shields.io/pypi/v/consult-mcp-server.svg)](https://pypi.org/project/consult-mcp-server/)
 [![Python](https://img.shields.io/pypi/pyversions/consult-mcp-server.svg)](https://pypi.org/project/consult-mcp-server/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -117,7 +117,7 @@ your shell rc will be visible.
 docker run -i --rm \
   -e ANTHROPIC_API_KEY -e OPENAI_API_KEY -e GEMINI_API_KEY -e OPENROUTER_API_KEY \
   -v ~/.consult:/root/.consult \
-  ghcr.io/irwinr/consult-mcp-server:latest
+  ghcr.io/irwin-r/consult-mcp-server:latest
 ```
 
 Stdio in / stdio out, just like the local binary. Image published per release
@@ -135,7 +135,7 @@ applies.
 ### From source (development)
 
 ```sh
-git clone https://github.com/irwinr/consult-mcp-server
+git clone https://github.com/irwin-r/consult-mcp-server
 cd consult-mcp-server
 uv venv
 uv pip install -e ".[dev]"

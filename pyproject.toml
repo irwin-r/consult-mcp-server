@@ -32,10 +32,10 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/irwinr/consult-mcp-server"
-Repository = "https://github.com/irwinr/consult-mcp-server"
-Issues = "https://github.com/irwinr/consult-mcp-server/issues"
-Changelog = "https://github.com/irwinr/consult-mcp-server/blob/main/CHANGELOG.md"
+Homepage = "https://github.com/irwin-r/consult-mcp-server"
+Repository = "https://github.com/irwin-r/consult-mcp-server"
+Issues = "https://github.com/irwin-r/consult-mcp-server/issues"
+Changelog = "https://github.com/irwin-r/consult-mcp-server/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 # MCP adapter dependencies. Install with `pip install consult-mcp-server[mcp]`

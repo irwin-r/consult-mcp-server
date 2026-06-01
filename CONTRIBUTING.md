@@ -7,7 +7,7 @@ trying to solve, then we can agree on shape before you write code.
 ## Dev setup
 
 ```sh
-git clone https://github.com/irwinr/consult-mcp-server
+git clone https://github.com/irwin-r/consult-mcp-server
 cd consult-mcp-server
 uv venv
 uv pip install -e ".[dev]"
