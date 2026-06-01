@@ -1,211 +1,246 @@
 # consult-mcp-server
 
-A multi-model panel-orchestration MCP server. Built for agentic CLIs (Claude Code, Codex, etc.) that want a structured second opinion from a panel of LLMs without bloating the parent's context window.
+> **Get a second opinion from a parallel panel of LLMs — without bloating your agent's context window.**
 
-## Why it exists
+[![CI](https://github.com/irwinr/consult-mcp-server/actions/workflows/tests.yml/badge.svg)](https://github.com/irwinr/consult-mcp-server/actions/workflows/tests.yml)
+[![PyPI](https://img.shields.io/pypi/v/consult-mcp-server.svg)](https://pypi.org/project/consult-mcp-server/)
+[![Python](https://img.shields.io/pypi/pyversions/consult-mcp-server.svg)](https://pypi.org/project/consult-mcp-server/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Smithery](https://smithery.ai/badge/consult-mcp-server)](https://smithery.ai/server/consult-mcp-server)
 
-Existing options each fall short:
+`consult` is an MCP server that lets your agent (Claude Desktop, Cursor,
+Claude Code, etc.) fan a single prompt out to many LLMs in parallel, then
+return either the synthesised answer or a manifest of structured
+~200-token capsules — so panel breadth doesn't cost parent-context tokens.
 
-- **PAL `consensus`** serialises model calls — sum of latencies.
-- **`multi_mcp`** parallelises but bakes server-side synthesis with no escape hatch.
-- **`ai-council-mcp`** has clever blinded anonymisation but small surface.
-- **`llm-consortium`** has a refinement loop but isn't MCP.
-- **Skill-only fan-outs** assembled by the LLM via bash are brittle (token budget traps, endpoint drift, key handling).
-
-`consult` keeps the parallel fan-out, kills the brittleness, and exposes responses as MCP Resources so panel breadth doesn't cost parent context.
-
-## Surface
-
-Five tools:
-
-| Tool | When |
-|---|---|
-| `panel(prompt, models, blinded?, ...)` → manifest | Parent wants to synthesise itself from rich capsules |
-| `synthesise(run_id, by_model?)` → markdown | Collapse a prior run via a flagship |
-| `consult(prompt, tier?, roles?)` → synthesis + manifest | "Just give me the answer" |
-| `refine(prompt, models, arbiter, threshold, max_rounds, continuation_id?)` → result + verdicts | Iterate to consensus; arbiter scores sufficiency per round. `continuation_id` chains a follow-up onto a prior run. |
-| `sequence(prompts, models)` → per-step results + final synth | Chain a list of prompts where each step's synthesis is prepended to the next. Multi-stage research, plan-then-execute. |
-
-Plus MCP resources at `consult://runs/<id>/responses/<slug>` for direct body access, and live progress via `notifications/progress` (when the client sends a `progressToken`) or a tailable JSONL log at `<run>/_progress.log`.
-
-Multi-instance panellists via `model:N` syntax — e.g. `claude-haiku:3` requests 3 parallel instances of the same model for stochastic averaging.
-
-## Models & tiers
-
-Aliases are `<family>-<tier>` — version-neutral. The registry maps each alias to the current best model in that slot; the exact resolved ID is captured per run in `registry_snapshot.json` for reproducibility. Pass a raw LiteLLM ID (e.g. `openai/gpt-5.5-pro`) to bypass the registry.
-
-| Tier | Models | Use |
-|---|---|---|
-| `nano` (3) | `claude-haiku`, `gemini-flash`, `gpt-nano` | sub-$0.05 panels for smoke tests / trivia |
-| `quick` (5) | `claude-haiku`, `gemini-pro`, `grok`, `qwen-max`, `kimi` | ~30s snap second opinions |
-| `standard` (10) | `claude-opus`, `claude-sonnet`, `gpt-pro`, `gpt`, `gemini-pro`, `grok`, `qwen-max`, `kimi`, `glm`, `llama` | normal decisions |
-| `deep` (14) | standard + `mistral`, `deepseek`, `mimo`, `sonar-pro` | high-stakes; includes Perplexity for web search |
-| `code` (5) | `claude-opus`, `gpt-codex`, `gpt-mini`, `gemini-pro`, `deepseek` | code-heavy questions |
-
-Specialist single-model aliases also available: `gpt-codex` (latest OpenAI codex), `sonar-pro` (web search), `gpt-mini`/`gpt-nano` (fast/ultra-cheap general-purpose).
-
-## The manifest capsule
-
-Each panellist returns ~200 structured tokens, extracted by a cheap model (`claude-haiku` by default):
-
-```json
-{
-  "slug": "panelist-alpha",
-  "model_id": "anthropic/claude-opus-4-7",
-  "status": "OK",
-  "persona": "contrarian",
-  "capsule": {
-    "position": "supports B with caveats",
-    "recommendation": "Use approach B with fallback to A",
-    "key_points": ["...", "..."],
-    "unique_claims": ["Only model to flag cold-start regression"],
-    "caveats": ["Assumes >100 RPS steady-state"],
-    "confidence": 0.85
-  },
-  "resource_uri": "consult://runs/abc/responses/alpha",
-  "latency_ms": 3420,
-  "cost_usd": 0.04
-}
+```
+┌────────────┐    consult tool call     ┌──────────────────┐    parallel    ┌──────────┐
+│ Your agent │ ───────────────────────▶ │  consult-mcp     │ ─────────────▶ │ Claude   │
+│ (Claude    │   "what's your take?"    │  (this server)   │                │ GPT      │
+│  Desktop / │ ◀─────────────────────── │                  │ ◀───────────── │ Gemini   │
+│  Cursor /  │  synthesis + manifest    │  capsules ~200t  │   capsules     │ Grok     │
+│  …)        │                          │  + resources     │                │ DeepSeek │
+└────────────┘                          └──────────────────┘                │ …        │
+                                                                            └──────────┘
 ```
 
-The parent can synthesise from this alone in most cases. Bodies are fetched via MCP resource read only when depth is needed.
+## Why this exists
+
+If your agent already calls `claude` once, you might wonder why you'd want to
+ask 8 more models the same question. Three reasons:
+
+1. **One pass, many perspectives.** Different families catch different things.
+   Anthropic finds different bugs than OpenAI; Gemini calls out different
+   risks; DeepSeek often surfaces the contrarian take.
+2. **Cheap structured second opinion.** The manifest's per-panellist capsule
+   is ~200 tokens — your agent can synthesise it in-band without paying for
+   another flagship round-trip.
+3. **No context-window bloat.** Full panellist bodies live as MCP resources
+   at `consult://runs/<id>/responses/<slug>`; your agent only fetches them
+   when it needs depth.
+
+Alternatives fall short: PAL `consensus` serialises calls (sum of latencies);
+`multi_mcp` parallelises but no escape hatch from server-side synth;
+skill-only fan-outs assembled by the LLM via bash are brittle (token traps,
+key handling, endpoint drift).
+
+---
 
 ## Install
 
-Once published to PyPI (not yet — local-only for now), one-shot install via uvx:
+### Claude Desktop
 
-```bash
-# Run without any persistent install (recommended for stdio MCP clients):
-uvx --from consult-mcp-server[mcp] consult-mcp
+> Claude Desktop does **not** inherit your shell's `PATH` or environment
+> variables — you must give it the absolute path to `consult-mcp` and
+> declare API keys inside the `env` block.
 
-# Or pin into a tool environment:
-uv tool install "consult-mcp-server[mcp]"
-```
+Tip: run `consult-doctor --config` after install to print a ready-to-paste
+JSON block populated with the absolute binary path and whichever keys are
+present in your shell environment.
 
-For development (and right now, until PyPI publish):
-
-```bash
-git clone <this repo> ~/Projects/personal/consult-mcp-server
-cd ~/Projects/personal/consult-mcp-server
-uv venv
-uv pip install -e ".[dev]"   # full install: engine + mcp adapter + dev deps
-# or, for library-only use (no MCP SDK pulled in):
-# uv pip install -e .
-# or, engine + MCP adapter without dev deps:
-# uv pip install -e ".[mcp]"
-cp .env.example .env  # then fill in your provider keys
-```
-
-For one-click discovery / install via the Smithery registry, a `smithery.yaml`
-ships with the package. For container deployments, a `Dockerfile` is also
-included — build with `docker build -t consult-mcp .` then run with the
-provider keys passed as env: `docker run -i --rm -e ANTHROPIC_API_KEY=... consult-mcp`.
-
-Provider keys (set whichever you'll use):
-
-```bash
-ANTHROPIC_API_KEY=...
-OPENAI_API_KEY=...
-GEMINI_API_KEY=...
-OPENROUTER_API_KEY=...
-```
-
-## Claude Code config
-
-Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (or the equivalent for your client):
+Edit `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS)
+or `%APPDATA%\Claude\claude_desktop_config.json` (Windows):
 
 ```json
 {
   "mcpServers": {
     "consult": {
-      "command": "/Users/you/Projects/personal/consult-mcp-server/.venv/bin/consult-mcp",
+      "command": "/Users/you/.local/bin/uvx",
+      "args": ["--from", "consult-mcp-server[mcp]", "consult-mcp"],
       "env": {
-        "ANTHROPIC_API_KEY": "...",
-        "OPENROUTER_API_KEY": "...",
-        "GEMINI_API_KEY": "...",
-        "OPENAI_API_KEY": "..."
+        "ANTHROPIC_API_KEY": "sk-ant-…",
+        "OPENAI_API_KEY": "sk-…",
+        "GEMINI_API_KEY": "AIza…",
+        "OPENROUTER_API_KEY": "sk-or-…"
       }
     }
   }
 }
 ```
 
-A copy lives in `claude_config_example.json`.
+Restart Claude Desktop, then ask: *"use the consult tool to ask 3 models
+which Python package manager I should use."*
 
-## Quick start
+### Cursor
+
+Edit `~/.cursor/mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "consult": {
+      "command": "/Users/you/.local/bin/uvx",
+      "args": ["--from", "consult-mcp-server[mcp]", "consult-mcp"],
+      "env": {
+        "ANTHROPIC_API_KEY": "sk-ant-…",
+        "OPENAI_API_KEY": "sk-…"
+      }
+    }
+  }
+}
+```
+
+Same caveat as Claude Desktop: absolute path to `uvx`, env keys in the block.
+
+### Claude Code CLI
+
+```sh
+claude mcp add consult -- uvx --from "consult-mcp-server[mcp]" consult-mcp
+```
+
+The CLI inherits your shell env, so the keys you already have in `.env` /
+your shell rc will be visible.
+
+### Docker
+
+```sh
+docker run -i --rm \
+  -e ANTHROPIC_API_KEY -e OPENAI_API_KEY -e GEMINI_API_KEY -e OPENROUTER_API_KEY \
+  -v ~/.consult:/root/.consult \
+  ghcr.io/irwinr/consult-mcp-server:latest
+```
+
+Stdio in / stdio out, just like the local binary. Image published per release
+to GHCR (multi-stage Python 3.12-slim base, ~150MB).
+
+### Smithery
+
+```
+https://smithery.ai/server/consult-mcp-server
+```
+
+Smithery's hosted UI prompts for keys; the same `smithery.yaml` config-schema
+applies.
+
+### From source (development)
+
+```sh
+git clone https://github.com/irwinr/consult-mcp-server
+cd consult-mcp-server
+uv venv
+uv pip install -e ".[dev]"
+cp .env.example .env   # fill in keys
+uv run pytest -v
+```
+
+### Verify the install
+
+```sh
+consult-doctor          # offline: config + paths + key presence
+consult-doctor --ping   # also fires a 1-token call per provider (~$0.0001)
+consult-doctor --config # print copy-paste-ready MCP client JSON
+```
+
+---
+
+## The five tools
+
+| Tool | What it does | Use when |
+|---|---|---|
+| **`consult`** | Parallel panel + server-side synthesis. Hero. | "Just give me the answer." |
+| **`panel`** | Parallel panel, returns raw manifest (no synth). | You want to synthesise yourself. |
+| **`refine`** | Iterative consortium with arbiter scoring (≤3 rounds). | High-stakes; disagreement-heavy. |
+| **`sequence`** | Chained multi-step where step N depends on N-1. | Decompose-then-answer; plan-then-execute. |
+| **`synthesise`** | Re-collapse an existing run via a flagship model. | Different rubric/synthesiser on a prior `run_id`. |
+
+Tool descriptions are intentionally written as **prompts for the calling
+agent** (verb-first, explicit "use when…/don't use for…") so the agent
+reliably picks the right one without you having to spell it out.
+
+---
+
+## Tiers & cost
+
+Aliases are `<family>-<tier>` — version-neutral. The registry maps each alias
+to the current best model; the resolved LiteLLM ID is captured per run in
+`registry_snapshot.json` for reproducibility.
+
+| Tier | Models | Typical run cost | Use |
+|---|---|---|---|
+| `nano` (3) | claude-haiku, gemini-flash, gpt-nano | < $0.01 | smoke tests / trivia |
+| `quick` (5) | claude-haiku, gemini-pro, grok, qwen-max, kimi | ~$0.05 | snap second opinions |
+| `standard` (10) | opus, sonnet, gpt-pro, gpt, gemini-pro, grok, qwen-max, kimi, glm, llama | $0.30–0.60 | normal decisions |
+| `wide` (10) | as standard, openrouter-routed where possible | $0.20–0.50 | maximum diversity |
+| `deep` (14) | standard + mistral, deepseek, mimo, sonar-pro | $0.50–1.00 | high-stakes, includes web search |
+| `code` (5) | opus, gpt-codex, gpt-mini, gemini-pro, deepseek | $0.20–0.40 | code-heavy questions |
+| `review` (6) | opus, gpt-codex, gpt-pro, gemini-pro, deepseek, grok | $0.30–0.60 | PR / code review |
+
+A per-run cap (`max_run_usd`, default `$5.00`) refuses panels whose estimated
+cost exceeds the limit before any provider is called.
+
+---
+
+## The manifest capsule
+
+Each panellist returns a ~200-token structured extract (decision shape shown
+below; `review` and `research` kinds also supported):
+
+```json
+{
+  "slug": "claude-opus-1",
+  "model_id": "anthropic/claude-opus-4-7",
+  "status": "OK",
+  "capsule": {
+    "kind": "decision",
+    "position": "supports B with caveats",
+    "recommendation": "Use B with fallback to A",
+    "key_points": ["…"],
+    "unique_claims": ["Only model to flag cold-start regression"],
+    "caveats": ["Assumes >100 RPS steady-state"],
+    "confidence": 0.85
+  },
+  "resource_uri": "consult://runs/abc/responses/claude-opus-1",
+  "latency_ms": 3420,
+  "cost_usd": 0.04
+}
+```
+
+Your agent can synthesise from this alone in most cases. Read the full body
+via the resource URI only when depth is needed.
+
+---
+
+## Quickstart
+
+After installing, from any connected agent:
 
 ```text
-> consult: tier=standard, prompt="Is async asyncio fanout the right move here?"
+> consult: prompt="Polars vs DuckDB for a 10GB Parquet timeseries?", tier="code"
 ```
 
-The hero tool runs ~8 panellists in parallel, drops the synthesiser from the panel, extracts capsules, and synthesises via Gemini 3.1 Pro.
+Returns `{run_id, synthesis, manifest, cost_usd, synthesiser}`. The synthesis
+is markdown, ready to drop into your conversation.
+
+For iterative consensus:
 
 ```text
-> panel: models=[{model:"gpt-pro"},{model:"claude-opus",stance:"contrarian"},{model:"gemini-pro"}], prompt="..."
+> refine:
+    prompt="Should we migrate from REST to gRPC for the internal mesh?",
+    models=[{model:"claude-opus"},{model:"gpt-pro"},{model:"gemini-pro"},{model:"deepseek"}],
+    threshold=0.85
 ```
 
-Lower-level — returns the manifest, you synthesise yourself.
-
-## End-to-end walkthrough
-
-A complete tour through the v1 surface. Assumes the install above is done and at least one provider key is in `.env`.
-
-### 1. Smoke-test the install (no API spend)
-
-A dry-run verifies config + cost-estimation without any model calls:
-
-```bash
-.venv/bin/python -c "
-import asyncio
-from consult.runner import fanout
-from consult.types import ModelSpec
-async def go():
-    h = await fanout('hello', [ModelSpec(model='claude-haiku')], dry_run=True)
-    print('partial:', h.partial, '| reason:', h.partial_reason)
-asyncio.run(go())
-"
-# partial: True | reason: dry_run: estimated cost $0.0001
-```
-
-### 2. First real consult (~$0.10–0.20 on the `code` tier)
-
-From any MCP client connected to consult:
-
-```text
-> consult: prompt="Polars vs DuckDB for 10GB Parquet timeseries?", tier=code
-```
-
-Runs the panel in parallel, extracts ~200-token capsules, and synthesises. Returns `{run_id, synthesis, manifest, cost_usd, synthesiser, ...}`.
-
-### 3. Inspect a panellist's full body
-
-The manifest has resource URIs for every panellist:
-
-```text
-> read resource: consult://runs/<run_id>/responses/claude-opus
-```
-
-### 4. Tail progress in real time
-
-While a long refine runs, in a second terminal:
-
-```bash
-tail -f ~/.consult/runs/<run_id>/_progress.log
-# {"ts":"...","kind":"panellist","slug":"claude-opus","status":"OK","latency_ms":35420}
-# {"ts":"...","kind":"capsule","slug":"claude-opus"}
-```
-
-MCP clients that send a `progressToken` get the same events as `notifications/progress` — no log-tailing required.
-
-### 5. Follow up via `continuation_id`
-
-```text
-> refine: prompt="OK now what about Iceberg vs Delta on top of that?", continuation_id="<prior run_id>", models=[{model:"claude-opus"},{model:"deepseek"}]
-```
-
-The prior run's synthesis is prepended as "Prior consultation summary" context so the next panel knows where the discussion has been.
-
-### 6. Multi-step research with `sequence`
+For chained reasoning:
 
 ```text
 > sequence:
@@ -218,125 +253,112 @@ The prior run's synthesis is prepended as "Prior consultation summary" context s
     models=[{model:"claude-opus"},{model:"gpt-pro"}]
 ```
 
-Each step's synthesis feeds the next step's prompt. Returns per-step run_ids + the final synthesis.
+---
 
-### 7. Stochastic averaging with `model:N`
+## End-to-end walkthrough
+
+A full tour. Assumes the install above and at least one provider key in
+`.env`.
+
+### 1. Smoke-test the install (no API spend)
+
+```sh
+.venv/bin/python -c "
+import asyncio
+from consult import panel, ModelSpec
+async def go():
+    h = await panel('hello', [ModelSpec(model='claude-haiku')], dry_run=True)
+    print('partial:', h.partial, '| reason:', h.partial_reason)
+asyncio.run(go())
+"
+# partial: True | reason: dry_run: estimated cost $0.0001
+```
+
+### 2. First real consult (~$0.20 on the `code` tier)
 
 ```text
-> panel: models=[{model:"claude-haiku:3"},{model:"gpt-mini:3"}], prompt="..."
+> consult: prompt="Polars vs DuckDB for 10GB Parquet timeseries?", tier=code
 ```
 
-Six panellists total — three runs each of two cheap models. Useful for measuring response variance on prompts where temperature matters.
+### 3. Inspect a panellist's full body
 
-### 8. Check today's spend
-
-```bash
-.venv/bin/consult-ledger today
-# {"date":"2026-05-20","total_usd":2.36,"total_known":false,"runs":[...]}
+```text
+> read resource: consult://runs/<run_id>/responses/claude-opus-1
 ```
 
-`total_known: false` means at least one panellist had pricing missing from the LiteLLM table — the displayed total is a lower bound. Pass any `YYYY-MM-DD` to ledger past days.
+### 4. Tail progress in real time
 
-### 9. View a run as a rich HTML page
-
-```bash
-.venv/bin/consult-view <run_id>          # writes ~/.consult/runs/<run_id>/feed.html, prints the path
-.venv/bin/consult-view <run_id> --open   # also opens it in the default browser
+```sh
+tail -f ~/.consult/runs/<run_id>/_progress.log
 ```
 
-Renders the entire run as one self-contained HTML file — header with cost / wall-time / status pills, prompt, synthesis (markdown), per-round arbiter verdicts (for `refine`), per-panellist cards with capsule + full body, and a chronological timeline derived from `_progress.log`. No external assets, no JavaScript, light/dark via `prefers-color-scheme`. Regenerable: `feed.html` is a pure derivation of the on-disk artifacts.
+Agents that send a `progressToken` get the same events as
+`notifications/progress`.
 
-## What's in scope for v1
+### 5. Follow-up via `continuation_id`
 
-- 4 tools: `panel`, `synthesise`, `consult`, `refine`
-- LiteLLM provider layer (no custom HTTP)
-- Rich manifest capsules
-- MCP Resources for bodies
-- Anonymous Alpha/Beta blinding
-- Per-run cost cap + `dry_run`
-- Stance/persona injection
-- Parametric `usable()` viability check
-- Status enum: OK / TRUNCATED / MALFORMED / EMPTY / REFUSED / CONTENT_FILTERED / RATE_LIMITED / TIMEOUT / ERROR
-
-## Landed since v1
-
-- `sequence` tool (chained multi-step consultations with shared context)
-- MCP `notifications/progress` + JSONL `_progress.log` fallback
-- Daily cost ledger (`consult-ledger` CLI + `consult/ledger.py`)
-- Static HTML run viewer (`consult-view <run_id>` → `feed.html`)
-- Continuation IDs for `refine` (chain a follow-up onto a prior run)
-- `model:N` multi-instance syntax
-- GitHub Actions CI on Python 3.11/3.12/3.13
-- Anthropic prompt caching (`cache_control: ephemeral`) on fanout + synth
-- Schema-enforced capsule extraction via `response_format=Capsule`
-- LiteLLM stderr-noise suppression (`suppress_debug_info=True`)
-- `RunResult.synthesiser`, `RefineResult.partial_reason` / `continuation_of` surfaced to callers
-- Per-panellist `Status.ERROR` isolation when a single alias is unknown
-
-## Still deferred
-
-- Auto-retry on token exhaustion (cost bomb — return TRUNCATED, let the parent decide)
-- Startup registry validation against provider `/models`
-- PyPI publish (needs explicit user authorisation)
-
-## Layout
-
-The package splits engine (`consult.*`) from MCP adapter (`consult.mcp.*`).
-Only the adapter imports the `mcp` SDK; everything under `consult/` is
-pure async-Python + Pydantic and is directly callable from any consumer
-(CLI, HTTP, library use, tests). `pip install consult-mcp-server` gives
-you the engine; `pip install consult-mcp-server[mcp]` adds the adapter
-and the `consult-mcp` stdio server.
-
-```
-consult/                # ENGINE — no mcp.* imports
-  runner.py             # asyncio.gather + LiteLLM fanout + progress log
-  capsule.py            # post-fanout structured extraction
-  synth.py              # flagship synthesiser pass
-  refine.py             # iterative arbiter-driven loop (max 3 rounds) + continuation
-  sequence.py           # chained multi-step consultations
-  orchestrate.py        # consult() hero: fanout → capsule → synth, typed
-  ledger.py             # daily cost ledger (consult-ledger entry point)
-  viewer.py             # static HTML run renderer (consult-view entry point)
-  registry.py           # models.json + stances.json loader
-  artifacts.py          # ~/.consult/runs/<id>/ layout + injectable URI formatter
-  attachments.py        # file/diff inlining
-  context.py            # per-run context bundle + blinding scrub
-  progress.py           # typed ProgressEvent union (consumer-agnostic)
-  status.py             # LiteLLM response → Status
-  types.py              # Pydantic models
-  mcp/                  # MCP ADAPTER — only thing that imports mcp.*
-    server.py           # MCP wiring (panel, synthesise, consult, refine, sequence)
-    handlers.py         # MCP args-dict adapter — calls engine via typed kwargs
-    schemas.py          # MCP tool JSON Schemas
-    errors.py           # MCP error-envelope wire shape
-    __main__.py         # consult-mcp entry point
-  config/
-    models.json         # default model registry
-    stances.json        # default persona prompts
-tests/
-  test_smoke.py         # offline + live tests
-.github/
-  workflows/
-    tests.yml           # CI: pytest on 3.11 / 3.12 / 3.13
-FRICTION.md             # dogfooding log
+```text
+> refine: prompt="OK now what about Iceberg vs Delta on top of that?",
+          continuation_id="<prior run_id>",
+          models=[{model:"claude-opus"},{model:"deepseek"}]
 ```
 
-### Driving the engine directly
+The prior run's synthesis is prepended as "Prior consultation summary".
+
+### 6. Stochastic averaging with `model:N`
+
+```text
+> panel: models=[{model:"claude-haiku:3"},{model:"gpt-mini:3"}], prompt="…"
+```
+
+Six panellists total — three runs each of two cheap models.
+
+### 7. Check today's spend
+
+```sh
+consult-ledger today
+# {"date":"2026-05-21","total_usd":2.36,"total_known":false,"runs":[…]}
+```
+
+`total_known: false` means at least one panellist had pricing missing from
+the LiteLLM table.
+
+### 8. View a run as a rich HTML page
+
+```sh
+consult-view <run_id>          # writes ~/.consult/runs/<run_id>/feed.html
+consult-view <run_id> --open   # also opens in default browser
+```
+
+Self-contained HTML — header pills, prompt, synthesis (markdown), per-round
+arbiter verdicts (refine), per-panellist cards with capsule + full body, and
+a chronological timeline from `_progress.log`. No external assets, no JS.
+
+---
+
+## Driving the engine without MCP
+
+The engine package (`consult.*`) is MCP-free and reusable as a library:
 
 ```python
-from consult import orchestrate
-result = await orchestrate.consult("question?", tier="standard")
+from consult import consult, panel, refine, ModelSpec
+
+# Hero tool
+result = await consult("question?", tier="standard")
 print(result.synthesis, result.cost_usd)
 
-# Or compose primitives directly:
-from consult import runner, capsule, synth
-handle = await runner.fanout(prompt, specs)
-handle = await capsule.annotate(handle)
-synth_result = await synth.synthesise(handle.run_id)
+# Lower-level
+handle = await panel("question?", [ModelSpec(model="claude-opus"), ModelSpec(model="gpt-pro")])
+
+# Iterative
+verdict = await refine(
+    "tough decision?",
+    [ModelSpec(model="claude-opus"), ModelSpec(model="deepseek")],
+    threshold=0.85,
+)
 ```
 
-A non-MCP consumer can swap the URI scheme on the manifest:
+Swap the URI scheme for a non-MCP transport:
 
 ```python
 from consult import artifacts
@@ -345,14 +367,78 @@ artifacts.set_resource_uri_formatter(
 )
 ```
 
-## Testing
+---
 
-```bash
-uv run pytest -v
+## Security
+
+Read [`SECURITY.md`](SECURITY.md) for the full threat model. Short version:
+
+- **File attachments and `git_diff`** must resolve under
+  `CONSULT_TRUSTED_REPO_ROOTS` (defaults to CWD). Symlinks resolved with
+  `strict=True`; escape attempts fail closed.
+- **Run artefacts are `chmod 0o700`** — per-run prompts (often containing
+  pasted credentials or code) are not world-readable on shared hosts.
+- **`git diff` runs with global/system git config neutralised** so a
+  malicious `.gitattributes` filter can't execute.
+- **LiteLLM exception strings are scrubbed** for `sk-…`, `AIza…`,
+  `Bearer …`, `x-api-key:` and similar before anything hits disk or the
+  manifest.
+
+### Privacy note
+
+The model registry tags each entry with a `privacy_tier`:
+
+- `first_party` — direct API to Anthropic / OpenAI / Google.
+- `aggregator` — routed via OpenRouter (Grok, Kimi, Qwen, DeepSeek, Llama,
+  Mistral, GLM, MiMo, Sonar-Pro).
+
+Mixing tiers in one panel broadcasts the **same prompt** to providers with
+**different data-retention policies**. For prompts containing sensitive
+material, prefer `tier="standard"` (mostly first-party) over `tier="wide"`
+or `tier="deep"` (heavily aggregator-routed).
+
+---
+
+## Repo layout
+
+```
+consult/                # ENGINE — no mcp.* imports
+  runner.py             # async fanout + LiteLLM + progress log
+  capsule.py            # post-fanout structured extraction
+  synth.py              # flagship synthesiser
+  refine.py             # arbiter-driven loop (max 3 rounds) + continuation
+  sequence.py           # chained multi-step
+  orchestrate.py        # consult() hero
+  ledger.py             # daily cost ledger (consult-ledger)
+  viewer.py             # static HTML run renderer (consult-view)
+  doctor.py             # diagnostic CLI (consult-doctor)
+  registry.py           # models.json + stances.json loader
+  artifacts.py          # ~/.consult/runs/<id>/ layout + URI formatter
+  attachments.py        # file/diff inlining + trusted-roots enforcement
+  sources.py            # git_diff resolver (hardened subprocess)
+  context.py            # per-run bundle + blinding
+  progress.py           # typed ProgressEvent union
+  status.py             # LiteLLM response → Status
+  types.py              # Pydantic models (StrictModel base)
+  mcp/                  # MCP ADAPTER — only thing that imports mcp.*
+    server.py, handlers.py, schemas.py, errors.py, __main__.py
+  config/
+    models.json         # registry with privacy_tier annotations
+    stances.json        # persona prompts
+tests/                  # pytest (offline + live, gated on keys)
+.github/workflows/      # CI: ruff + pytest on Py 3.11/3.12/3.13
+FRICTION.md             # internal dogfooding log (kept for transparency)
+SECURITY.md             # threat model + disclosure path
+CONTRIBUTING.md         # dev setup + style
 ```
 
-Live tests are gated on API keys; they skip cleanly when absent.
+---
+
+## Contributing
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md). Issues and PRs welcome; please open
+an issue first for non-trivial changes so we can agree on shape.
 
 ## License
 
-MIT.
+MIT. See [`LICENSE`](LICENSE).
