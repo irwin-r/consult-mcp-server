@@ -36,6 +36,14 @@ First public release.
   `~/.consult/runs` continues to work.
 - Repo boilerplate: `LICENSE`, `SECURITY.md`, `CONTRIBUTING.md`,
   `CODE_OF_CONDUCT.md`, issue templates, PR template.
+- Opt-in aggregation side-cars (none run in the default flow): peer-ranking
+  (`peer_rank`), medoid voting over `model:N` samples (`voting`), and refine
+  elimination strategies (`strategies`).
+- Long-running task mode (MCP SEP-1686): `consult` / `refine` / `sequence`
+  accept `task: {ttl}` and return a task handle the client polls via
+  `tasks/get`.
+- OpenTelemetry spans via the `otel` extra, emitted per panellist call when
+  `OTEL_EXPORTER_OTLP_ENDPOINT` is set.
 
 ### Security
 

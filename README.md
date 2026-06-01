@@ -369,6 +369,19 @@ artifacts.set_resource_uri_formatter(
 
 ---
 
+## Telemetry
+
+Install the `otel` extra and point it at a collector to emit `gen_ai.*`
+OpenTelemetry spans, one per panellist call:
+
+```bash
+pip install "consult-mcp-server[otel]"
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
+```
+
+Without the extra (or without the endpoint set) the telemetry helpers are
+no-ops at zero overhead.
+
 ## Security
 
 Read [`SECURITY.md`](SECURITY.md) for the full threat model. Short version:
