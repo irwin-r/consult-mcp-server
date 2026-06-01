@@ -87,7 +87,14 @@ class UnknownModelError(ConsultError, KeyError):
 
 
 class BudgetExceededError(ConsultError):
-    """Raised when an estimated or accumulated cost exceeds `max_run_usd`."""
+    """A run's estimated or accumulated cost exceeded `max_run_usd`.
+
+    The engine degrades rather than raising: an over-cap run returns a result
+    with `partial=True` and a cap `partial_reason`, so output already produced
+    isn't thrown away. Check `partial` for the budget path. This type stays in
+    the taxonomy for callers that wrap the engine and want to re-raise a budget
+    breach as a typed error.
+    """
 
 
 class PathTrustError(ConsultError, ValueError):
@@ -101,18 +108,26 @@ class PathTrustError(ConsultError, ValueError):
 
 
 class ProviderError(ConsultError):
-    """Raised when an upstream LLM provider returns an unrecoverable error
-    after retries are exhausted.
+    """An upstream LLM provider returned an unrecoverable error after retries
+    were exhausted.
 
-    Subclassed errors carry the redacted provider message; the original
-    exception (with secrets potentially intact) is `.__cause__`.
+    The engine degrades rather than raising: the failing panellist is recorded
+    in the manifest with `status=ERROR` and a redacted error message while the
+    rest of the panel proceeds, so inspect `ManifestEntry` for per-panellist
+    failures. This type stays in the taxonomy for callers that re-raise a
+    provider failure as a typed error.
     """
 
 
 class CapsuleParseError(ConsultError):
-    """Raised when the structured-extractor output can't be parsed into a
-    `Capsule` / `ReviewCapsule` / `ResearchCapsule` even after the
-    salvage path."""
+    """The structured-extractor output couldn't be parsed into a `Capsule` /
+    `ReviewCapsule` / `ResearchCapsule`, even after the salvage path.
+
+    The engine degrades rather than raising: the panellist gets an empty
+    capsule (with a body-derived confidence when available) so one bad
+    extraction doesn't sink the panel. This type stays in the taxonomy for
+    callers that re-raise an extraction failure as a typed error.
+    """
 
 
 __all__ = [
