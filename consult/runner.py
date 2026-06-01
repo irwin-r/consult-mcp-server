@@ -332,6 +332,36 @@ async def _acompletion_with_retry(*, timeout: float, **kwargs: Any) -> Any:
 
 _ERROR_MAX_CHARS = 4096
 
+# Secret-shaped tokens that may end up embedded in LiteLLM exception strings.
+# LiteLLM frequently includes upstream response bodies / request headers in the
+# exception when an HTTP error occurs, and those bodies routinely echo back the
+# `Authorization: Bearer sk-…` header (or the provider-specific equivalent).
+# Redacting at the manifest/log boundary means a leaked exception message can
+# never carry a working key to disk under ~/.consult/runs/ or into a parent
+# agent's transcript.
+_SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"sk-(?:ant-)?[A-Za-z0-9_\-]{20,}"),
+    re.compile(r"AIza[0-9A-Za-z_\-]{35}"),
+    re.compile(r"sk-or-[A-Za-z0-9_\-]{20,}"),
+    re.compile(r"or-v1-[A-Za-z0-9_\-]{20,}"),
+    re.compile(r"(?i)Authorization\s*[:=]\s*Bearer\s+[A-Za-z0-9_\-\.]{20,}"),
+    re.compile(r"(?i)x-api-key\s*[:=]\s*[A-Za-z0-9_\-\.]{20,}"),
+    re.compile(r'(?i)["\']?api[_-]?key["\']?\s*[:=]\s*["\'][A-Za-z0-9_\-\.]{20,}["\']'),
+)
+
+
+def _redact_secrets(text: str) -> str:
+    """Replace API-key-shaped tokens with `[REDACTED]`.
+
+    Defence-in-depth: LiteLLM's exception text often embeds the raw HTTP
+    response, which on auth-failure paths can carry the request
+    `Authorization` header verbatim. Redacting here ensures a leaked
+    manifest or `_progress.log` line never carries a working key.
+    """
+    for pattern in _SECRET_PATTERNS:
+        text = pattern.sub("[REDACTED]", text)
+    return text
+
 
 def _format_error_message(exc: BaseException) -> str:
     """Coerce a provider exception into a compact manifest-friendly string.
@@ -343,9 +373,8 @@ def _format_error_message(exc: BaseException) -> str:
 
     Strategy: keep the first non-empty line (the diagnostic), then collapse
     long runs of consecutive whitespace-only lines into a single `[...]`
-    marker, and hard-cap at `_ERROR_MAX_CHARS`. Original raw response is
-    still available in `responses/<slug>.json` if forensic detail is
-    needed.
+    marker, redact secret-shaped tokens (see `_SECRET_PATTERNS`), and
+    hard-cap at `_ERROR_MAX_CHARS`.
     """
     raw = str(exc)
     if not raw:
@@ -363,9 +392,8 @@ def _format_error_message(exc: BaseException) -> str:
             out.extend([""] * blank_run)
         blank_run = 0
         out.append(line)
-    # Trailing blank run — drop unless meaningful (we already lost any
-    # content there by definition).
     collapsed = "\n".join(out).strip()
+    collapsed = _redact_secrets(collapsed)
     if len(collapsed) > _ERROR_MAX_CHARS:
         collapsed = collapsed[: _ERROR_MAX_CHARS - 1] + "…"
     return collapsed or type(exc).__name__

@@ -83,9 +83,37 @@ def reset_resource_uri_formatter() -> None:
 
 
 def runs_root() -> Path:
+    # Resolution order (first match wins):
+    #   1. CONSULT_RUNS_DIR — explicit user override
+    #   2. ~/.consult/runs   — legacy default; preserved when it already
+    #      exists so upgrading users don't lose history
+    #   3. $XDG_STATE_HOME/consult/runs (defaults to ~/.local/state/consult/runs)
+    #      — XDG Base Dir spec for runtime/state data
     env = os.environ.get("CONSULT_RUNS_DIR")
-    base = Path(os.path.expanduser(env)) if env else Path.home() / ".consult" / "runs"
-    base.mkdir(parents=True, exist_ok=True)
+    if env:
+        base = Path(os.path.expanduser(env))
+    else:
+        legacy = Path.home() / ".consult" / "runs"
+        if legacy.exists():
+            base = legacy
+        else:
+            xdg = os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local" / "state")
+            base = Path(xdg).expanduser() / "consult" / "runs"
+    # 0o700 on the runs root + every run dir. Per-run artifacts include the
+    # raw prompt (often carries paths / repo state / sometimes secrets the
+    # caller pasted in), every panellist's raw response, and the synth
+    # input — all of which can be private. World-readable defaults would
+    # leak them to any local user on a shared host. mkdir() honours the
+    # mode arg only on creation, so we also chmod existing dirs to repair
+    # already-created world-readable trees from earlier runs.
+    base.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # Best-effort chmod for pre-existing dirs from older versions that may
+    # be world-readable. Suppressed errors: read-only filesystem,
+    # foreign-owned dir, etc. — over-permissive is a worse user experience
+    # than the server refusing to start.
+    import contextlib
+    with contextlib.suppress(OSError):
+        base.chmod(0o700)
     return base
 
 
@@ -188,13 +216,16 @@ class RunPaths:
 def create_run() -> RunPaths:
     rid = new_run_id()
     root = runs_root() / rid
-    root.mkdir(parents=True, exist_ok=False)
+    # 0o700 — see `runs_root` comment. Per-run dirs inherit the same
+    # private-by-default posture so a fresh run never lands world-readable
+    # even if the umask is lax.
+    root.mkdir(parents=True, exist_ok=False, mode=0o700)
     paths = RunPaths(run_id=rid, root=root)
-    paths.prompts.mkdir()
-    paths.responses.mkdir()
-    paths.capsules.mkdir()
-    paths.arbiters.mkdir()
-    paths.attachments.mkdir()
+    paths.prompts.mkdir(mode=0o700)
+    paths.responses.mkdir(mode=0o700)
+    paths.capsules.mkdir(mode=0o700)
+    paths.arbiters.mkdir(mode=0o700)
+    paths.attachments.mkdir(mode=0o700)
     return paths
 
 

@@ -40,7 +40,13 @@ def _max_bytes() -> int:
 def _read_text_safely(path: Path) -> str:
     """Read a file as text, surfacing every failure mode inline.
 
+    Path containment is enforced via `sources.validate_under_trusted_roots`:
+    the file must live under `CONSULT_TRUSTED_REPO_ROOTS` (or, by default,
+    the process's CWD). A symlink that points outside the trusted set
+    fails closed because we resolve the path before checking.
+
     Catches:
+    - containment failure: raises `ValueError` from the validator
     - `OSError`: missing / permission denied / non-regular file
     - `UnicodeDecodeError`: binary blob attached by mistake — without this,
       it bubbles up as INTERNAL_ERROR and the whole tool call fails. The
@@ -51,8 +57,9 @@ def _read_text_safely(path: Path) -> str:
     Returns the file content or raises `ValueError` with a one-line reason
     the caller turns into an `[ERROR: ...]` block.
     """
+    resolved = sources.validate_under_trusted_roots(path)
     try:
-        size = path.stat().st_size
+        size = resolved.stat().st_size
     except OSError as e:
         raise ValueError(f"{type(e).__name__}: {e}") from e
     cap = _max_bytes()
@@ -61,7 +68,7 @@ def _read_text_safely(path: Path) -> str:
             f"attachment {size} bytes exceeds CONSULT_ATTACHMENT_MAX_BYTES={cap}"
         )
     try:
-        return path.read_text()
+        return resolved.read_text()
     except UnicodeDecodeError as e:
         raise ValueError(
             f"not a text file (UnicodeDecodeError at byte {e.start})"

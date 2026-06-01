@@ -66,20 +66,67 @@ def _validate_ref(ref: str, *, field: str) -> None:
         )
 
 
+def validate_under_trusted_roots(path: str | Path, *, strict: bool = False) -> Path:
+    """Resolve `path` and confirm it sits under one of the trusted roots.
+
+    Uses `Path.resolve()` (symlinks resolved) and `os.path.commonpath()`
+    against each trusted root so a symlink pointing outside the root fails
+    closed.
+
+    Three modes:
+
+    * `strict=True` — always enforce containment. Caller is `git_diff`,
+      which then spawns a subprocess; allowing arbitrary paths there is
+      a higher-impact threat than for read-only file attachments.
+
+    * `strict=False` and `CONSULT_TRUSTED_REPO_ROOTS` is set — enforce
+      containment. The operator has explicitly opted into restricted mode
+      for file attachments; honour it.
+
+    * `strict=False` and `CONSULT_TRUSTED_REPO_ROOTS` is unset — only
+      verify the path exists and is readable, then return the resolved
+      path. Rationale: the calling agent already has full filesystem
+      access via its own tools; refusing to read files the agent
+      explicitly attached is friction without much added security.
+
+    Raises `ValueError` on containment failure or missing/unreadable path.
+    """
+    p = Path(path).expanduser()
+    try:
+        resolved = p.resolve(strict=True)
+    except (OSError, FileNotFoundError) as e:
+        raise ValueError(f"path {str(path)!r} does not exist or is unreadable: {e}") from e
+    env_set = bool(os.environ.get("CONSULT_TRUSTED_REPO_ROOTS"))
+    if not strict and not env_set:
+        return resolved
+    roots = _trusted_roots()
+    resolved_str = str(resolved)
+    for trusted in roots:
+        try:
+            common = os.path.commonpath([resolved_str, str(trusted)])
+        except ValueError:
+            # Different drives on Windows — definitively not under this root.
+            continue
+        if common == str(trusted):
+            return resolved
+    raise ValueError(
+        f"path {str(path)!r} is not under any CONSULT_TRUSTED_REPO_ROOTS entry "
+        f"(trusted: {[str(p) for p in roots]})"
+    )
+
+
 def _validate_repo_path(repo_path: str | None) -> Path:
+    # git_diff containment policy:
+    # - repo_path unset → use CWD (the agent is operating from its own repo).
+    # - repo_path set → must resolve under the trusted roots. By default
+    #   the only trusted root is CWD, so a malicious prompt asking to
+    #   diff `/etc` still gets rejected unless the operator opted in by
+    #   setting CONSULT_TRUSTED_REPO_ROOTS. strict=True is forced here
+    #   because git diff spawns a subprocess — higher impact than a
+    #   read-only file attachment.
     if repo_path is None:
         return Path.cwd().resolve()
-    resolved = Path(repo_path).expanduser().resolve()
-    for trusted in _trusted_roots():
-        try:
-            resolved.relative_to(trusted)
-            return resolved
-        except ValueError:
-            continue
-    raise ValueError(
-        f"repo_path {repo_path!r} is not under any CONSULT_TRUSTED_REPO_ROOTS entry "
-        f"(trusted: {[str(p) for p in _trusted_roots()]})"
-    )
+    return validate_under_trusted_roots(repo_path, strict=True)
 
 
 def resolve_git_diff(
@@ -94,6 +141,18 @@ def resolve_git_diff(
     _validate_ref(head, field="head")
     repo = _validate_repo_path(repo_path)
     git = shutil.which("git") or "git"
+    # Neutralise global / system git config files. A malicious repo could
+    # define a `.gitattributes` filter or a `core.fsmonitor` hook that
+    # executes on `git diff`; pointing GIT_CONFIG_GLOBAL/SYSTEM at /dev/null
+    # blocks the user-level and system-level configs from injecting hooks.
+    # GIT_TERMINAL_PROMPT=0 stops git from blocking on a credential prompt
+    # when a ref accidentally references a remote.
+    env = {
+        **os.environ,
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_SYSTEM": os.devnull,
+        "GIT_TERMINAL_PROMPT": "0",
+    }
     try:
         # `--` after the diff range forces git to stop interpreting any
         # subsequent arg as an option. Belt-and-braces with the ref regex's
@@ -108,6 +167,7 @@ def resolve_git_diff(
             timeout=_DEFAULT_GIT_TIMEOUT_S,
             check=True,
             shell=False,
+            env=env,
         )
     except subprocess.TimeoutExpired:
         raise RuntimeError(
