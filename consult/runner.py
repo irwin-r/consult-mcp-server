@@ -19,7 +19,7 @@ from typing import Any
 
 import litellm
 
-from . import artifacts, context, registry, telemetry
+from . import artifacts, context, registry, slugs, telemetry
 from . import attachments as attachments_mod
 from .capsule import MAX_TOKENS_BY_KIND
 from .progress import (
@@ -102,9 +102,6 @@ _MODEL_COUNT_SUFFIX = re.compile(r"^(.+):(\d+)$")
 # user-supplied slug path is unchanged: that goes through ModelSpec's
 # field_validator which fails fast at the input boundary.
 _SLUG_BAD_CHARS_RE = re.compile(r"[^A-Za-z0-9._-]+")
-# refine `_suffix_specs` writes `.r<n>` suffixes onto slugs; recognise
-# the same shape here so blinded mode can preserve per-round identity.
-_ROUND_SUFFIX_RE = re.compile(r"\.r\d+$")
 
 
 def sanitise_derived_slug(base: str) -> str:
@@ -481,9 +478,8 @@ def _make_slug(spec: ModelSpec, idx: int, blinded: bool) -> str:
         # blinded refine writes every round to the same `panelist-alpha.txt`
         # file and the per-round transcript is destroyed.
         if spec.slug:
-            m = _ROUND_SUFFIX_RE.search(spec.slug)
-            if m:
-                base = f"{base}{m.group(0)}"
+            # Preserve the `.r<n>` round suffix (round_suffix is "" if absent).
+            base = f"{base}{slugs.round_suffix(spec.slug)}"
         return base
     if spec.slug:
         return spec.slug

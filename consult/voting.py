@@ -30,9 +30,9 @@ This module is a side-car helper, NOT wired into the default flow:
 from __future__ import annotations
 
 import logging
-import re
 from difflib import SequenceMatcher
 
+from . import slugs
 from .types import (
     Capsule,
     ManifestEntry,
@@ -44,13 +44,9 @@ from .types import (
 logger = logging.getLogger(__name__)
 
 
-_ROUND_SUFFIX_RE = re.compile(r"\.r(\d+)$")
-
-
 def _round_from_slug(slug: str) -> int:
     """Parse the `.r<n>` round number from a refine slug, or 0 if absent."""
-    m = _ROUND_SUFFIX_RE.search(slug)
-    return int(m.group(1)) if m else 0
+    return slugs.round_number(slug) or 0
 
 
 def _feature_string(entry: ManifestEntry) -> str:
