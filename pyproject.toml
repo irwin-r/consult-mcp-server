@@ -18,15 +18,17 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
     "Topic :: Software Development :: Libraries",
 ]
-# litellm: pinned to a tight minor range. LiteLLM is the security boundary
-# for every outbound provider call and ships frequent breaking changes in
-# its provider routing, cost lookup, and exception classes — we audit each
-# minor bump manually rather than letting Dependabot/Renovate float us
-# forward silently. Bump deliberately when a new minor is needed.
+# litellm: pinned to a tight range. LiteLLM is the security boundary for
+# every outbound provider call and ships frequent breaking changes in its
+# provider routing, cost lookup, and exception classes, so we audit each bump
+# manually rather than letting Dependabot/Renovate float us forward silently.
+# Bumped to the 1.8x line: the proxy-auth advisories (CVE-2025-0628,
+# CVE-2026-35029, CVE-2026-35030, GHSA-69x8-hrgq-fjj8) are fixed at 1.83.
+# Re-audit and run the suite on each widen; see CONTRIBUTING for the cadence.
 # pydantic v2 is required for `StrictModel` / discriminated unions.
 # python-dotenv loads provider keys from .env at startup.
 dependencies = [
-    "litellm>=1.55.0,<1.57.0",
+    "litellm>=1.83,<1.90",
     "pydantic>=2.6.0,<3",
     "python-dotenv>=1.0.0,<2",
 ]
