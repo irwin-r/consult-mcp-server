@@ -5,6 +5,7 @@ description = "Multi-model panel orchestration engine with an MCP adapter. The e
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
+authors = [{ name = "Irwin Razaghi", email = "irwin@razaghi.com.au" }]
 keywords = ["mcp", "model-context-protocol", "llm", "consultation", "panel", "consensus", "litellm"]
 classifiers = [
     "Development Status :: 4 - Beta",
