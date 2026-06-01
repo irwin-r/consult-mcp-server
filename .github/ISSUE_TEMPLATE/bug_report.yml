@@ -1,0 +1,48 @@
+name: Bug report
+description: Something broke or behaved unexpectedly
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. Before filing, please run `consult-doctor` and
+        paste the output below — it covers the common config / key / path
+        failures and saves a round-trip.
+  - type: textarea
+    id: doctor
+    attributes:
+      label: consult-doctor output
+      description: Output of `consult-doctor` (no `--ping` needed unless you suspect a key issue).
+      render: shell
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: consult-mcp-server version
+      description: Output of `consult-mcp --version`.
+      placeholder: "consult-mcp 0.2.0"
+    validations:
+      required: true
+  - type: input
+    id: client
+    attributes:
+      label: MCP client
+      description: e.g. Claude Desktop 0.7.4, Cursor 0.42, Claude Code CLI 1.0.x
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, what did you get?
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: |
+        From the MCP client's MCP log directory and/or
+        `~/.consult/runs/<run_id>/_progress.log` if a run was created.
+      render: shell

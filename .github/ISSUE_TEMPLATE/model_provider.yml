@@ -1,0 +1,47 @@
+name: New model provider / registry entry
+description: Add a new model alias to consult/config/models.json
+labels: ["enhancement", "models"]
+body:
+  - type: input
+    id: alias
+    attributes:
+      label: Proposed alias
+      description: Short registry name (e.g. `claude-opus-5`, `gpt-6-mini`).
+      placeholder: "kebab-case, version-neutral if possible"
+    validations:
+      required: true
+  - type: input
+    id: litellm_id
+    attributes:
+      label: LiteLLM ID
+      description: The exact ID LiteLLM uses (verify with `litellm.completion(model=…)`).
+      placeholder: "anthropic/claude-…"
+    validations:
+      required: true
+  - type: dropdown
+    id: privacy_tier
+    attributes:
+      label: Privacy tier
+      description: |
+        `first_party` = direct API to the model vendor (Anthropic, OpenAI, Google).
+        `aggregator` = routed via OpenRouter, Together, Groq, etc — multiple
+        intermediaries see the prompt.
+      options:
+        - first_party
+        - aggregator
+    validations:
+      required: true
+  - type: input
+    id: family
+    attributes:
+      label: Family
+      placeholder: claude / gpt / gemini / grok / llama / …
+    validations:
+      required: true
+  - type: textarea
+    id: tiers
+    attributes:
+      label: Suggested tier membership
+      description: |
+        Which existing tiers (`nano`/`quick`/`standard`/`deep`/`wide`/`code`/`review`)
+        should this alias appear in? Justify briefly.
