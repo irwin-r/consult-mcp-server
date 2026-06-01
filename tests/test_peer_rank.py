@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-from unittest.mock import AsyncMock
 
 import pytest
 
@@ -68,7 +67,7 @@ async def test_peer_rank_borda_aggregates_per_ranker_contributions(monkeypatch):
             ),
             {
                 label: entry.slug
-                for label, entry in zip(["Alpha", "Beta", "Gamma"], others)
+                for label, entry in zip(["Alpha", "Beta", "Gamma"], others, strict=False)
             },
         ),
     )
@@ -121,7 +120,7 @@ async def test_peer_rank_skips_failed_rankers(monkeypatch):
             ),
             {
                 label: entry.slug
-                for label, entry in zip(["Alpha", "Beta", "Gamma"], others)
+                for label, entry in zip(["Alpha", "Beta", "Gamma"], others, strict=False)
             },
         ),
     )
@@ -166,7 +165,7 @@ async def test_peer_rank_rejects_incomplete_ranking(monkeypatch):
             ),
             {
                 label: entry.slug
-                for label, entry in zip(["Alpha", "Beta", "Gamma"], others)
+                for label, entry in zip(["Alpha", "Beta", "Gamma"], others, strict=False)
             },
         ),
     )
@@ -221,7 +220,7 @@ async def test_peer_rank_filters_failed_panellists(monkeypatch):
             ),
             {
                 label: entry.slug
-                for label, entry in zip(["Alpha", "Beta"], others)
+                for label, entry in zip(["Alpha", "Beta"], others, strict=False)
             },
         ),
     )

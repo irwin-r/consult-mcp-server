@@ -97,6 +97,7 @@ async def test_call_cli_nonzero_exit_raises_with_stderr(monkeypatch):
 @pytest.mark.asyncio
 async def test_call_cli_timeout_kills_the_child(monkeypatch):
     import asyncio
+
     from consult import cli_executor
 
     timed_out_proc = _FakeProc(

@@ -151,7 +151,6 @@ def test_manifest_after_medoid_preserves_order():
     out = manifest_after_medoid(manifest)
     # b-0 must remain in its position regardless of which a-entry is chosen
     assert any(e.slug == "b-0" for e in out)
-    b_idx = next(i for i, e in enumerate(out) if e.slug == "b-0")
     a_idxs = [i for i, e in enumerate(out) if e.slug.startswith("a-")]
     # Exactly one a-entry survives, and the survivor's position is < or > b's
     # but never displaced from b's original neighbouring slot.
@@ -186,7 +185,8 @@ def test_panel_disagreement_returns_none_for_zero_or_one_usable():
     """Fewer than two usable capsules → None, not 0.0. Caller must
     handle None as "unknown" rather than treating it as full agreement."""
     # Zero usable
-    from consult.types import ManifestEntry as M, Status as S
+    from consult.types import ManifestEntry as M
+    from consult.types import Status as S
     empty = [
         M(slug="x-0", model_id="x/a", status=S.ERROR,
           resource_uri="x", body_path="/x", error="boom", capsule=None),

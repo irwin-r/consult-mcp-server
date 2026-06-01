@@ -34,7 +34,7 @@ from __future__ import annotations
 import logging
 import os
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -128,7 +128,5 @@ def record_exception(span_or_none: Any, exc: BaseException) -> None:
     """Record an exception on the span. No-op when OTel is off."""
     if span_or_none is None:
         return
-    try:
+    with suppress(Exception):
         span_or_none.record_exception(exc)
-    except Exception:  # noqa: BLE001
-        pass

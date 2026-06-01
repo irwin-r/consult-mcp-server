@@ -23,6 +23,7 @@ is equivalent to trusting any local code on the user's machine.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from types import SimpleNamespace
 from typing import Any
@@ -71,16 +72,14 @@ async def call_cli(
             proc.communicate(input=prompt.encode("utf-8")),
             timeout=timeout,
         )
-    except asyncio.TimeoutError:
+    except TimeoutError:
         # Kill the child and let the caller raise — `_call_one`'s outer
         # `except TimeoutError` already handles the status update.
-        try:
+        with contextlib.suppress(ProcessLookupError):
             proc.kill()
-        except ProcessLookupError:
-            pass
         try:
             await asyncio.wait_for(proc.wait(), timeout=1.0)
-        except asyncio.TimeoutError:  # pragma: no cover — pathological
+        except TimeoutError:  # pragma: no cover — pathological
             logger.warning("cli %r did not exit within 1s of SIGKILL", cli_command[0])
         raise
 

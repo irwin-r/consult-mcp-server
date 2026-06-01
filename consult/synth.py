@@ -146,7 +146,7 @@ def _deblind(text: str, label_to_slug: dict[str, str]) -> str:
         return text
     sorted_labels = sorted(label_to_slug, key=len, reverse=True)
     pattern = re.compile(
-        r"\b(?:" + "|".join(re.escape(l) for l in sorted_labels) + r")\b"
+        r"\b(?:" + "|".join(re.escape(lbl) for lbl in sorted_labels) + r")\b"
     )
     return pattern.sub(lambda m: label_to_slug[m.group(0)], text)
 

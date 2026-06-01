@@ -12,14 +12,15 @@ import os
 import random
 import re
 import time
+from collections.abc import Awaitable, Callable
 from contextlib import nullcontext, suppress
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import litellm
 
-from . import artifacts, attachments as attachments_mod, context, registry, telemetry
+from . import artifacts, context, registry, telemetry
+from . import attachments as attachments_mod
 from .capsule import MAX_TOKENS_BY_KIND
 from .progress import (
     Heartbeat,

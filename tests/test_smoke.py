@@ -327,6 +327,7 @@ def test_refine_arbiter_v2_dimensions_normalised_to_overall_score(monkeypatch):
     `_ask_arbiter`'s JSON-parse path.
     """
     import asyncio
+
     from consult.refine import _ask_arbiter
 
     arbiter_text = json.dumps({
@@ -380,6 +381,7 @@ def test_refine_arbiter_v1_score_field_still_accepted(monkeypatch):
     when `dimensions` is missing or empty.
     """
     import asyncio
+
     from consult.refine import _ask_arbiter
 
     arbiter_text = json.dumps({
@@ -563,8 +565,7 @@ def test_append_progress_log_writes_jsonl(tmp_path):
     event.model_dump() with a `ts` prepended so programmatic consumers can
     parse by `kind` without scraping free-text.
     """
-    from consult.progress import CapsuleExtracted, PanellistCompleted
-    from consult.progress import append_progress_log
+    from consult.progress import CapsuleExtracted, PanellistCompleted, append_progress_log
 
     append_progress_log(tmp_path, PanellistCompleted(
         done=1, total=2, slug="haiku", status="OK", latency_ms=42,
@@ -3005,7 +3006,7 @@ async def test_refine_round_two_passes_per_panellist_conversation(
     r2 = fanout_calls[1]
     assert r2["prior_turns_by_slug"] is not None
     assert len(r2["prior_turns_by_slug"]) == 2  # one per panellist
-    for slug, history in r2["prior_turns_by_slug"].items():
+    for _slug, history in r2["prior_turns_by_slug"].items():
         # 2 turns: user(round-1 prompt) + assistant(round-1 body)
         assert len(history) == 2
         assert history[0]["role"] == "user"
@@ -5352,7 +5353,7 @@ async def test_orchestrate_consult_does_not_gate_on_high_disagreement(
     from consult import orchestrate
     from consult import runner as runner_mod
     from consult import synth as synth_mod
-    from consult.types import Capsule, RunResult
+    from consult.types import Capsule
 
     monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
     monkeypatch.setattr(
