@@ -11,15 +11,15 @@ local clock).
 
 from __future__ import annotations
 
+import argparse
 import json
 import logging
-import sys
 from datetime import date, datetime
 from pathlib import Path
 
 from pydantic import Field
 
-from . import artifacts
+from . import __version__, artifacts
 from .types import StrictModel
 
 logger = logging.getLogger(__name__)
@@ -117,7 +117,20 @@ def _parse_arg(arg: str | None) -> date:
 
 def cli() -> None:
     """Console entry point. Usage: `consult-ledger [YYYY-MM-DD]`."""
-    arg = sys.argv[1] if len(sys.argv) > 1 else None
-    d = _parse_arg(arg)
+    parser = argparse.ArgumentParser(
+        prog="consult-ledger",
+        description="Aggregate consult runs for a given day into a JSON ledger.",
+    )
+    parser.add_argument(
+        "--version", action="version", version=f"consult-ledger {__version__}"
+    )
+    parser.add_argument(
+        "date",
+        nargs="?",
+        default=None,
+        help="ISO date (YYYY-MM-DD). Defaults to today, local clock.",
+    )
+    args = parser.parse_args()
+    d = _parse_arg(args.date)
     ledger = daily_ledger(d)
     print(ledger.model_dump_json(indent=2))

@@ -1804,9 +1804,13 @@ def cli() -> None:
       consult-view <run_id>          generate feed.html, print its path
       consult-view <run_id> --open   also open it in the default browser
     """
+    from . import __version__
     parser = argparse.ArgumentParser(
         prog="consult-view",
         description="Render a consult run as a self-contained HTML page.",
+    )
+    parser.add_argument(
+        "--version", action="version", version=f"consult-view {__version__}"
     )
     parser.add_argument("run_id", help="A run_id under ~/.consult/runs/")
     parser.add_argument(
