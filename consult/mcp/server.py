@@ -41,7 +41,7 @@ from mcp.types import (
     ToolAnnotations,
 )
 
-from .. import artifacts, task_store
+from .. import __version__, artifacts, task_store
 from ..progress import ProgressEvent, event_message
 from . import errors, handlers, schemas
 
@@ -111,41 +111,53 @@ _SEQUENCE_ANN = ToolAnnotations(
 
 @server.list_tools()
 async def handle_list_tools() -> list[Tool]:
+    # Tool descriptions are prompts read by the calling agent, not docs
+    # for humans. Verb-first, explicit "Use when…" / "Don't use for…", and
+    # disambiguation against the other four tools so the agent reliably
+    # picks the right one. The shape "<one-line action>. Use when: <X>.
+    # Don't use for: <Y>. Returns <Z>." is consistent across all five.
     return [
-        Tool(
-            name="panel",
-            description=(
-                "Fan a prompt out to multiple models in parallel. Returns a manifest "
-                "with structured capsules (~200 tokens each) and resource URIs for full "
-                "bodies. Use when the parent agent wants to synthesise itself."
-            ),
-            inputSchema=schemas.PANEL_SCHEMA,
-            annotations=_PANEL_ANN,
-        ),
-        Tool(
-            name="synthesise",
-            description=(
-                "Synthesise an existing run via a flagship model. Reads the run's "
-                "manifest + bodies and returns markdown under a consensus rubric."
-            ),
-            inputSchema=schemas.SYNTH_SCHEMA,
-            annotations=_SYNTH_ANN,
-        ),
         Tool(
             name="consult",
             description=(
-                "Hero tool: parallel panel + server-side synthesis. Returns synthesis "
-                "+ manifest. Use for 'just give me the answer' workflows."
+                "Get a synthesised second opinion from a panel of LLMs in parallel. "
+                "Use when: you want one consolidated answer to a single question and "
+                "don't want to manage the panel yourself. "
+                "Don't use for: code/PR review with line-anchored findings (use `consult` "
+                "with `capsule_kind=\"review\"` and `rubric=\"code_review\"`), iterative "
+                "back-and-forth (use `refine`), or chained multi-step research (use `sequence`). "
+                "Returns: {run_id, synthesis (markdown), manifest, cost_usd, synthesiser}."
             ),
             inputSchema=schemas.consult_schema(),
             annotations=_CONSULT_ANN,
         ),
         Tool(
+            name="panel",
+            description=(
+                "Run a parallel panel and return the raw manifest WITHOUT server-side "
+                "synthesis. Use when: you (the calling agent) want to do the synthesis "
+                "yourself, e.g. to interleave panel evidence with your own reasoning. "
+                "Don't use for: 'just give me the answer' — use `consult` instead, which "
+                "is faster and cheaper to drive. "
+                "Returns: {run_id, manifest with ~200-token capsules + resource URIs for "
+                "full bodies, cost_usd}."
+            ),
+            inputSchema=schemas.PANEL_SCHEMA,
+            annotations=_PANEL_ANN,
+        ),
+        Tool(
             name="refine",
             description=(
-                "Consortium-style iterative consultation. Fans out, asks an arbiter "
-                "to score sufficiency, refines with another round if below threshold. "
-                "Hard cap at 3 rounds. Per-round transcripts available as MCP resources."
+                "Consortium-style iterative consultation: fan out, arbiter scores "
+                "sufficiency, run another round if below threshold (hard cap 3 rounds). "
+                "Use when: a single panel pass isn't enough — high-stakes decisions, "
+                "disagreement-heavy questions, or when the prior panel left obvious gaps. "
+                "Don't use for: cheap one-shot answers (use `consult`), or when you "
+                "already have a satisfactory panel and just want a fresh synthesis "
+                "(use `synthesise`). Pass `continuation_id` to thread a follow-up onto "
+                "a prior refine run. "
+                "Returns: {run_id, rounds_completed, verdicts per round, final_manifest, "
+                "synthesis, converged}."
             ),
             inputSchema=schemas.REFINE_SCHEMA,
             annotations=_REFINE_ANN,
@@ -153,14 +165,32 @@ async def handle_list_tools() -> list[Tool]:
         Tool(
             name="sequence",
             description=(
-                "Run an ordered list of prompts where each step's synthesis is "
-                "prepended as context for the next step. Use for multi-stage "
-                "research (e.g. break-down → per-subquestion → meta-synth) or "
-                "any plan-then-execute workflow. Returns per-step run_ids + "
-                "the final synthesis."
+                "Run an ordered list of prompts where each step's synthesis is prepended "
+                "as context for the next step. "
+                "Use when: a question is too large for a single prompt (decompose → "
+                "per-subquestion → meta-synth), or for plan-then-execute workflows where "
+                "step N depends on step N-1's conclusion. "
+                "Don't use for: parallel diverse opinions on the same question (use "
+                "`consult`/`refine`) — sequence is for chained reasoning, not breadth. "
+                "Returns: {step_run_ids, final synthesis, total cost_usd}."
             ),
             inputSchema=schemas.SEQUENCE_SCHEMA,
             annotations=_SEQUENCE_ANN,
+        ),
+        Tool(
+            name="synthesise",
+            description=(
+                "Re-synthesise an existing run via a flagship model under a (possibly "
+                "different) rubric. "
+                "Use when: you already ran `panel`/`consult`/`refine` and want a fresh "
+                "synthesis — different rubric, different synthesiser model, or to "
+                "anonymise the model IDs. "
+                "Don't use for: fresh questions (use `consult`) or when you don't have a "
+                "prior `run_id` to feed in. "
+                "Returns: markdown text (not a structured dict)."
+            ),
+            inputSchema=schemas.SYNTH_SCHEMA,
+            annotations=_SYNTH_ANN,
         ),
     ]
 
@@ -441,7 +471,7 @@ async def main() -> None:
             write,
             InitializationOptions(
                 server_name="consult",
-                server_version="0.1.0",
+                server_version=__version__,
                 # Derive capabilities from the registered @list_tools /
                 # @list_resources / @read_resource handlers so the initialize
                 # response actually advertises tools+resources to the client.
