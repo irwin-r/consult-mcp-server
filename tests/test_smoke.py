@@ -6962,3 +6962,53 @@ async def test_fanout_warns_when_cap_set_but_pricing_unknown(tmp_path, monkeypat
     assert handle.partial is False
     assert len(handle.manifest) == 1
     assert "cap cannot be fully enforced" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_fanout_dropout_preserves_manifest_order(tmp_path, monkeypatch):
+    """The assembled manifest stays in input-spec order even when a straggler
+    in a middle position is dropped. Characterization guard for the fanout
+    tail-dropout assembly (pins ordering before the gatherer extraction).
+    """
+    import asyncio as _asyncio
+
+    from consult import runner
+    from consult.runner import fanout
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    monkeypatch.setattr(runner, "estimate_cost", lambda *a, **kw: (0.0, True))
+    monkeypatch.setenv("CONSULT_HEARTBEAT_INTERVAL_S", "0")
+    monkeypatch.setenv("CONSULT_TAIL_DROPOUT_S", "0.05")
+    monkeypatch.setenv("CONSULT_TAIL_K_FRAC", "0.25")  # k=1, trigger=3 for n=4
+
+    async def fake_call(spec, slug, per_prompt, paths, provider_sems=None, **_):
+        if "slow" in slug:
+            await _asyncio.sleep(5.0)
+        paths.response_text(slug).write_text("ok")
+        return ManifestEntry(
+            slug=slug,
+            model_id="x/y",
+            persona=None,
+            status=Status.OK,
+            finish_reason="stop",
+            resource_uri=paths.resource_uri(slug),
+            body_path=str(paths.response_text(slug)),
+            latency_ms=1,
+            cost_usd=0.0,
+            cost_known=True,
+        )
+
+    monkeypatch.setattr(runner, "_call_one", fake_call)
+
+    specs = [
+        ModelSpec(model="claude-haiku", slug="a-0"),
+        ModelSpec(model="claude-haiku", slug="slow-1"),  # middle straggler, dropped
+        ModelSpec(model="claude-haiku", slug="c-2"),
+        ModelSpec(model="claude-haiku", slug="d-3"),
+    ]
+    handle = await fanout("anything", specs)
+
+    assert [m.slug for m in handle.manifest] == ["a-0", "slow-1", "c-2", "d-3"]
+    dropped = handle.manifest[1]
+    assert dropped.status is Status.TIMEOUT
+    assert dropped.cost_known is False
