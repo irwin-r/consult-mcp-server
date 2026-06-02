@@ -24,6 +24,7 @@ import litellm
 from . import artifacts, capsule, context, provider_caps, registry, runner, slugs, strategies, synth
 from . import progress as progress_mod
 from .jsonparse import extract_json
+from .redact import redact_exc
 from .types import (
     ArbiterVerdict,
     Capsule,
@@ -356,7 +357,7 @@ async def _ask_arbiter(
             timeout=timeout,
         )
     except Exception as e:
-        logger.warning("arbiter call failed: %s: %s", type(e).__name__, e)
+        logger.warning("arbiter call failed: %s", redact_exc(e))
         return ArbiterVerdict(
             round=round_num,
             score=0.0,
@@ -365,7 +366,7 @@ async def _ask_arbiter(
             cost_usd=None,
             cost_known=False,
             parsed_ok=False,
-            error=f"{type(e).__name__}: {e!s:.150}",
+            error=redact_exc(e, limit=150),
         )
 
     text = resp.choices[0].message.content or ""
@@ -375,7 +376,7 @@ async def _ask_arbiter(
         cost = litellm.completion_cost(completion_response=resp)
         cost_known = cost is not None
     except Exception as e:
-        logger.warning("arbiter cost lookup failed: %s", e)
+        logger.warning("arbiter cost lookup failed: %s", redact_exc(e))
         cost = None
         cost_known = False
 

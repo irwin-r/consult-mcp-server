@@ -43,6 +43,7 @@ from mcp.types import (
 
 from .. import __version__, artifacts, task_store
 from ..progress import ProgressEvent, event_message
+from ..redact import redact_exc, redact_traceback
 from . import errors, handlers, schemas
 
 logger = logging.getLogger("consult")
@@ -271,8 +272,10 @@ async def _run_handler_with_envelopes(
     except FileNotFoundError as e:
         return errors.envelope(errors.ErrorCode.RUN_NOT_FOUND, str(e))
     except Exception as e:  # noqa: BLE001
-        logger.exception("unhandled exception in tool %s", name)
-        return errors.envelope(errors.ErrorCode.INTERNAL_ERROR, f"{type(e).__name__}: {e}")
+        # Redact: a provider exception can carry the auth header, and both the
+        # log traceback and the returned envelope reach outside the process.
+        logger.error("unhandled exception in tool %s\n%s", name, redact_traceback(e))
+        return errors.envelope(errors.ErrorCode.INTERNAL_ERROR, redact_exc(e))
     if name in _TEXT_RESULT_TOOLS and isinstance(result, str):
         return [TextContent(type="text", text=result)]
     return result
@@ -346,8 +349,10 @@ async def handle_call_tool(
             # Already marked CANCELLED by task_store.cancel(); just exit.
             raise
         except Exception as e:  # noqa: BLE001
-            logger.exception("background task %s failed", rec.task_id)
-            task_store.fail(rec.task_id, f"{type(e).__name__}: {e}")
+            # Same redaction as the foreground path: the traceback goes to the
+            # log and the error string is surfaced to a polling client.
+            logger.error("background task %s failed\n%s", rec.task_id, redact_traceback(e))
+            task_store.fail(rec.task_id, redact_exc(e))
 
     bg = asyncio.create_task(_bg())
     task_store.attach_bg_task(rec.task_id, bg)

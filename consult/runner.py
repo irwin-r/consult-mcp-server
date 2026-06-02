@@ -34,6 +34,7 @@ from .progress import (
     ProgressEvent,
     append_progress_log,
 )
+from .redact import redact_exc, redact_secrets, redact_traceback
 from .status import classify
 from .types import ManifestEntry, ModelSpec, RunHandle, Status
 
@@ -400,36 +401,6 @@ async def _acompletion_with_retry(*, timeout: float, **kwargs: Any) -> Any:
 
 _ERROR_MAX_CHARS = 4096
 
-# Secret-shaped tokens that may end up embedded in LiteLLM exception strings.
-# LiteLLM frequently includes upstream response bodies / request headers in the
-# exception when an HTTP error occurs, and those bodies routinely echo back the
-# `Authorization: Bearer sk-…` header (or the provider-specific equivalent).
-# Redacting at the manifest/log boundary means a leaked exception message can
-# never carry a working key to disk under ~/.consult/runs/ or into a parent
-# agent's transcript.
-_SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"sk-(?:ant-)?[A-Za-z0-9_\-]{20,}"),
-    re.compile(r"AIza[0-9A-Za-z_\-]{35}"),
-    re.compile(r"sk-or-[A-Za-z0-9_\-]{20,}"),
-    re.compile(r"or-v1-[A-Za-z0-9_\-]{20,}"),
-    re.compile(r"(?i)Authorization\s*[:=]\s*Bearer\s+[A-Za-z0-9_\-\.]{20,}"),
-    re.compile(r"(?i)x-api-key\s*[:=]\s*[A-Za-z0-9_\-\.]{20,}"),
-    re.compile(r'(?i)["\']?api[_-]?key["\']?\s*[:=]\s*["\'][A-Za-z0-9_\-\.]{20,}["\']'),
-)
-
-
-def _redact_secrets(text: str) -> str:
-    """Replace API-key-shaped tokens with `[REDACTED]`.
-
-    Defence-in-depth: LiteLLM's exception text often embeds the raw HTTP
-    response, which on auth-failure paths can carry the request
-    `Authorization` header verbatim. Redacting here ensures a leaked
-    manifest or `_progress.log` line never carries a working key.
-    """
-    for pattern in _SECRET_PATTERNS:
-        text = pattern.sub("[REDACTED]", text)
-    return text
-
 
 def _format_error_message(exc: BaseException) -> str:
     """Coerce a provider exception into a compact manifest-friendly string.
@@ -441,7 +412,7 @@ def _format_error_message(exc: BaseException) -> str:
 
     Strategy: keep the first non-empty line (the diagnostic), then collapse
     long runs of consecutive whitespace-only lines into a single `[...]`
-    marker, redact secret-shaped tokens (see `_SECRET_PATTERNS`), and
+    marker, redact secret-shaped tokens (see `consult.redact`), and
     hard-cap at `_ERROR_MAX_CHARS`.
     """
     raw = str(exc)
@@ -461,7 +432,7 @@ def _format_error_message(exc: BaseException) -> str:
         blank_run = 0
         out.append(line)
     collapsed = "\n".join(out).strip()
-    collapsed = _redact_secrets(collapsed)
+    collapsed = redact_secrets(collapsed)
     if len(collapsed) > _ERROR_MAX_CHARS:
         collapsed = collapsed[: _ERROR_MAX_CHARS - 1] + "…"
     return collapsed or type(exc).__name__
@@ -1182,7 +1153,7 @@ async def _call_one(
                     cost = float(pc or 0.0) + float(cc or 0.0)
                     cost_known = True
                 except Exception as ce:  # noqa: BLE001
-                    logger.warning("responses cost lookup failed for %s: %s", litellm_id, ce)
+                    logger.warning("responses cost lookup failed for %s: %s", litellm_id, redact_exc(ce))
                     cost = None
                     cost_known = False
             else:
@@ -1190,7 +1161,7 @@ async def _call_one(
                     cost = litellm.completion_cost(completion_response=resp)
                     cost_known = cost is not None
                 except Exception as ce:  # noqa: BLE001
-                    logger.warning("cost lookup failed for %s: %s", litellm_id, ce)
+                    logger.warning("cost lookup failed for %s: %s", litellm_id, redact_exc(ce))
                     cost = None
                     cost_known = False
             # Populate the OTel span with per-call telemetry (tokens /
@@ -1356,7 +1327,7 @@ def estimate_cost(
                 continue
             total += in_per_tok + out_per_tok
         except Exception as e:  # noqa: BLE001
-            logger.warning("estimate_cost: no price for %s (%s)", litellm_id, e)
+            logger.warning("estimate_cost: no price for %s (%s)", litellm_id, redact_exc(e))
             all_known = False
             continue
     return total, all_known
@@ -1483,8 +1454,16 @@ async def _gather_with_tail_dropout(
                 continue
             except asyncio.CancelledError:
                 pass
-            except Exception:  # noqa: BLE001 — _run_one isn't supposed to raise
-                logger.exception("panellist task for %s raised; treating as dropout", slug)
+            except Exception as e:  # noqa: BLE001 — _run_one isn't supposed to raise
+                # Redact before logging: a LiteLLM exception here can carry the
+                # provider auth header, and `logger.exception` would render the
+                # raw repr through a formatter we don't own. Format and redact
+                # the traceback ourselves, then log it as a plain message.
+                logger.error(
+                    "panellist task for %s raised; treating as dropout\n%s",
+                    slug,
+                    redact_traceback(e),
+                )
             # The cancel can land AFTER _run_one ran `record_completed` but
             # before its final progress await (only reachable when on_progress
             # is set — the suite's on_progress=None path has no suspension point
