@@ -313,6 +313,11 @@ The prior run's synthesis is prepended as "Prior consultation summary".
 
 Six panellists total — three runs each of two cheap models.
 
+A single panel is capped at 64 panellists (the `:N` counts plus any bare
+specs, summed). Set `CONSULT_MAX_PANEL_SIZE` to raise or lower it; a request
+over the cap is rejected before the run starts. The default leaves room for
+the largest built-in tier (`deep`, 14) and generous averaging.
+
 ### 7. Check today's spend
 
 ```sh
