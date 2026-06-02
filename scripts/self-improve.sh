@@ -12,6 +12,7 @@
 #   self-improve.sh            run one cycle
 #   self-improve.sh --dry-run  preflight + lock only, never launch the agent
 #   self-improve.sh --pr-only  force pr-only for this run regardless of $AUTONOMY
+#   self-improve.sh --watch    stream a readable agent trace to the terminal
 #
 # Tunables come from the environment (launchd sets none, so defaults apply):
 #   AUTONOMY        auto-merge | pr-only        (default auto-merge)
@@ -44,10 +45,12 @@ CYCLE_TIMEOUT_S="${CYCLE_TIMEOUT_S:-2700}"
 CI_TIMEOUT_S="${CI_TIMEOUT_S:-1800}"
 
 DRY_RUN=0
+WATCH=0
 for a in "$@"; do
   case "$a" in
     --dry-run) DRY_RUN=1 ;;
     --pr-only) AUTONOMY="pr-only" ;;
+    --watch) WATCH=1 ;;
     *) echo "unknown arg: $a" >&2; exit 2 ;;
   esac
 done
@@ -133,14 +136,26 @@ export DAILY_REMAINING="$remaining"
 export SELF_IMPROVE_VERDICT="$VERDICT"
 export SELF_IMPROVE_JOURNAL="$JOURNAL"
 
-log "launching agent (timeout ${CYCLE_TIMEOUT_S}s)"
+AGENT_LOG="$STATE/agent-$(date +%F).log"
+PROMPT_TEXT="$(cat "$REPO/prompts/self-improver.md")"
+log "launching agent (timeout ${CYCLE_TIMEOUT_S}s watch=$WATCH)"
 set +e
-"$CLAUDE" -p "$(cat "$REPO/prompts/self-improver.md")" \
-  --permission-mode bypassPermissions < /dev/null >>"$STATE/agent-$(date +%F).log" 2>&1 &
-CL=$!
-( sleep "$CYCLE_TIMEOUT_S"; kill -TERM "$CL" 2>/dev/null ) & WD=$!
-wait "$CL"; agent_rc=$?
-kill "$WD" 2>/dev/null
+if [ "$WATCH" = "1" ]; then
+  # Manual, watchable run: stream a readable trace to the terminal and keep
+  # the raw JSON in the log. No watchdog here, since a human is watching and
+  # can Ctrl-C; the timeout matters for the unattended path below.
+  "$CLAUDE" -p "$PROMPT_TEXT" --permission-mode bypassPermissions \
+    --output-format stream-json --verbose < /dev/null 2>>"$AGENT_LOG" \
+    | tee -a "$AGENT_LOG" | python3 "$REPO/scripts/stream-pretty.py"
+  agent_rc=${PIPESTATUS[0]}
+else
+  "$CLAUDE" -p "$PROMPT_TEXT" --permission-mode bypassPermissions \
+    < /dev/null >>"$AGENT_LOG" 2>&1 &
+  CL=$!
+  ( sleep "$CYCLE_TIMEOUT_S"; kill -TERM "$CL" 2>/dev/null ) & WD=$!
+  wait "$CL"; agent_rc=$?
+  kill "$WD" 2>/dev/null
+fi
 set -e
 log "agent exited rc=$agent_rc"
 echo "$(now)" >"$LAST_FILE"
@@ -183,7 +198,7 @@ fi
 # protected paths never auto-merge (the agent must not weaken its own guardrails)
 is_protected() {
   case "$1" in
-    prompts/self-improver.md|scripts/self-improve.sh|scripts/*.plist|\
+    prompts/self-improver.md|scripts/*|\
     .github/*|consult/schemas/*|consult/config/models.json|pyproject.toml|uv.lock|.self-improve/*)
       return 0 ;;
     *) return 1 ;;
