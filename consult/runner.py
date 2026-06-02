@@ -1249,7 +1249,7 @@ async def _gather_with_tail_dropout(
     *,
     run_one: Callable[[ModelSpec, str, str], Awaitable[ManifestEntry]],
     specs: list[ModelSpec],
-    slugs: list[str],
+    panel_slugs: list[str],
     per_prompts: list[str],
     state: _PanelProgress,
     paths: artifacts.RunPaths,
@@ -1266,6 +1266,9 @@ async def _gather_with_tail_dropout(
     is releasing 1-2 laggards). Disabled for panels < 4 or when the env knobs
     fall out of range, in which case this is a plain gather and the per-spec
     timeout still bounds the worst case.
+
+    (`panel_slugs` is named to avoid shadowing the `slugs` module imported at
+    the top of this file.)
     """
     total = state.total
     enable_dropout = total >= 4 and tail_dropout_s > 0 and 0 < tail_k_frac < 1.0
@@ -1273,82 +1276,113 @@ async def _gather_with_tail_dropout(
     if not enable_dropout:
         coros = [
             run_one(spec, slug, per_prompt)
-            for spec, slug, per_prompt in zip(specs, slugs, per_prompts, strict=True)
+            for spec, slug, per_prompt in zip(specs, panel_slugs, per_prompts, strict=True)
         ]
         return list(await asyncio.gather(*coros))
 
     task_list: list[asyncio.Task[ManifestEntry]] = []
     task_meta: dict[asyncio.Task[ManifestEntry], tuple[str, ModelSpec]] = {}
-    for spec, slug, per_prompt in zip(specs, slugs, per_prompts, strict=True):
+    for spec, slug, per_prompt in zip(specs, panel_slugs, per_prompts, strict=True):
         t = asyncio.create_task(run_one(spec, slug, per_prompt))
         task_list.append(t)
         task_meta[t] = (slug, spec)
 
-    completed_tasks: set[asyncio.Task[ManifestEntry]] = set()
-    pending: set[asyncio.Task[ManifestEntry]] = set(task_list)
-    k = max(1, math.ceil(total * tail_k_frac))
-    trigger = max(1, total - k)
+    try:
+        completed_tasks: set[asyncio.Task[ManifestEntry]] = set()
+        pending: set[asyncio.Task[ManifestEntry]] = set(task_list)
+        k = max(1, math.ceil(total * tail_k_frac))
+        trigger = max(1, total - k)
 
-    while len(completed_tasks) < trigger and pending:
-        done_set, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-        completed_tasks.update(done_set)
+        while len(completed_tasks) < trigger and pending:
+            done_set, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            completed_tasks.update(done_set)
 
-    if pending:
-        logger.info(
-            "slow-tail dropout: %d/%d complete, waiting up to %.1fs for %d stragglers",
-            len(completed_tasks),
-            total,
-            tail_dropout_s,
-            len(pending),
-        )
-        done_set, pending = await asyncio.wait(pending, timeout=tail_dropout_s)
-        completed_tasks.update(done_set)
-
-    drop_entries: dict[asyncio.Task[ManifestEntry], ManifestEntry] = {}
-    for t in pending:
-        t.cancel()
-    for t in pending:
-        slug, spec = task_meta[t]
-        try:
-            # A task may complete in the race between asyncio.wait returning and
-            # t.cancel(); in that case run_one already emitted its progress and
-            # recorded the entry, so keep its result.
-            await t
-            completed_tasks.add(t)
-            continue
-        except (asyncio.CancelledError, Exception):  # noqa: BLE001
-            pass
-        latency_ms = int((time.time() - start) * 1000)
-        entry = _dropout_entry(slug, spec, paths, latency_ms, tail_dropout_s)
-        drop_entries[t] = entry
-        state.record_completed(entry)
-        await safe_notify(
-            PanellistCompleted(
-                done=state.done,
-                total=total,
-                slug=slug,
-                status=Status.TIMEOUT.value,
-                latency_ms=latency_ms,
+        if pending:
+            logger.info(
+                "slow-tail dropout: %d/%d complete, waiting up to %.1fs for %d stragglers",
+                len(completed_tasks),
+                total,
+                tail_dropout_s,
+                len(pending),
             )
-        )
-        append_progress_log(
-            paths.root,
-            PanellistCompleted(
-                done=0,
-                total=0,
-                slug=slug,
-                status=Status.TIMEOUT.value,
-                latency_ms=latency_ms,
-            ),
-        )
+            done_set, pending = await asyncio.wait(pending, timeout=tail_dropout_s)
+            completed_tasks.update(done_set)
 
-    manifest: list[ManifestEntry] = []
-    for t in task_list:
-        if t in drop_entries:
-            manifest.append(drop_entries[t])
-        else:
-            manifest.append(t.result())
-    return manifest
+        drop_entries: dict[asyncio.Task[ManifestEntry], ManifestEntry] = {}
+        for t in pending:
+            t.cancel()
+        for t in pending:
+            slug, spec = task_meta[t]
+            try:
+                # A task may complete in the race between asyncio.wait returning
+                # and t.cancel(); keep its real result.
+                await t
+                completed_tasks.add(t)
+                continue
+            except asyncio.CancelledError:
+                pass
+            except Exception:  # noqa: BLE001 — _run_one isn't supposed to raise
+                logger.exception("panellist task for %s raised; treating as dropout", slug)
+            # The cancel can land AFTER _run_one ran `record_completed` but
+            # before its final progress await (only reachable when on_progress
+            # is set — the suite's on_progress=None path has no suspension point
+            # there). The panellist actually succeeded and its entry is already
+            # in completed_entries; keep that instead of overwriting a success
+            # with a synthetic TIMEOUT, and re-emit the close the cancel ate.
+            recovered = next((e for e in state.completed_entries if e.slug == slug), None)
+            if recovered is not None:
+                drop_entries[t] = recovered
+                completed_tasks.add(t)
+                await safe_notify(
+                    PanellistCompleted(
+                        done=state.done,
+                        total=total,
+                        slug=slug,
+                        status=recovered.status.value,
+                        latency_ms=recovered.latency_ms,
+                    )
+                )
+                continue
+            latency_ms = int((time.time() - start) * 1000)
+            entry = _dropout_entry(slug, spec, paths, latency_ms, tail_dropout_s)
+            drop_entries[t] = entry
+            state.record_completed(entry)
+            await safe_notify(
+                PanellistCompleted(
+                    done=state.done,
+                    total=total,
+                    slug=slug,
+                    status=Status.TIMEOUT.value,
+                    latency_ms=latency_ms,
+                )
+            )
+            append_progress_log(
+                paths.root,
+                PanellistCompleted(
+                    done=0,
+                    total=0,
+                    slug=slug,
+                    status=Status.TIMEOUT.value,
+                    latency_ms=latency_ms,
+                ),
+            )
+
+        manifest: list[ManifestEntry] = []
+        for t in task_list:
+            if t in drop_entries:
+                manifest.append(drop_entries[t])
+            else:
+                manifest.append(t.result())
+        return manifest
+    except BaseException:
+        # Parent unwind (MCP client / task_store cancel, or any error): cancel
+        # and drain the panellist tasks so none is left running — and billing —
+        # after we're gone. The plain-gather branch above propagates cancellation
+        # into its children automatically; the explicit-task branch must do it.
+        for t in task_list:
+            t.cancel()
+        await asyncio.gather(*task_list, return_exceptions=True)
+        raise
 
 
 async def fanout(
@@ -1682,7 +1716,7 @@ async def fanout(
         manifest = await _gather_with_tail_dropout(
             run_one=_run_one,
             specs=specs,
-            slugs=slugs,
+            panel_slugs=slugs,
             per_prompts=per_prompts,
             state=state,
             paths=paths,

@@ -223,7 +223,19 @@ def _claude_desktop_config() -> dict[str, Any]:
     if bin_path:
         server: dict[str, Any] = {"command": bin_path}
     else:
-        uvx_path = shutil.which("uvx") or "uvx"
+        uvx_path = shutil.which("uvx")
+        if uvx_path is None:
+            # Emit the uvx form anyway — this tool exists to help users who
+            # don't yet have a working setup — but warn loudly: Claude Desktop
+            # doesn't inherit PATH, so a bare "uvx" may not resolve there.
+            print(
+                "WARNING: neither 'consult-mcp' nor 'uvx' is on PATH. Install uv "
+                "(https://docs.astral.sh/uv/) or `pip install consult-mcp-server[mcp]`, "
+                "then re-run. The snippet below falls back to a bare 'uvx' that may "
+                "not resolve under Claude Desktop.",
+                file=sys.stderr,
+            )
+            uvx_path = "uvx"
         server = {"command": uvx_path, "args": ["--from", "consult-mcp-server[mcp]", "consult-mcp"]}
     server["env"] = env
     return {"mcpServers": {"consult": server}}

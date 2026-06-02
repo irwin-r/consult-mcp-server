@@ -267,10 +267,19 @@ def prune_runs(
     """
     if max_age_days is None and max_count is None:
         return []
+    # Reject non-positive bounds: max_count=0 keeps nothing, and max_age_days<=0
+    # puts the cutoff at/after now — either would silently delete every run, a
+    # nasty footgun from a fat-fingered flag or env var.
+    if max_count is not None and max_count <= 0:
+        raise ValueError(f"max_count must be > 0, got {max_count}")
+    if max_age_days is not None and max_age_days <= 0:
+        raise ValueError(f"max_age_days must be > 0, got {max_age_days}")
     base = runs_root().resolve()
     runs: list[tuple[float, Path]] = []
     for child in base.iterdir():
-        if not child.is_dir() or not _SAFE_ID_RE.match(child.name):
+        # Skip symlinks: a link named like a run-id must not have its target
+        # pruned, and we never follow one out of the runs root.
+        if child.is_symlink() or not child.is_dir() or not _SAFE_ID_RE.match(child.name):
             continue
         try:
             runs.append((child.stat().st_mtime, child))

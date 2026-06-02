@@ -11,9 +11,12 @@ CLI flags override them.
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 
 from . import __version__, artifacts
+
+logger = logging.getLogger(__name__)
 
 
 def _env_float(name: str) -> float | None:
@@ -23,6 +26,7 @@ def _env_float(name: str) -> float | None:
     try:
         return float(raw)
     except ValueError:
+        logger.warning("ignoring %s=%r: not a valid number", name, raw)
         return None
 
 
@@ -33,6 +37,7 @@ def _env_int(name: str) -> int | None:
     try:
         return int(raw)
     except ValueError:
+        logger.warning("ignoring %s=%r: not a valid integer", name, raw)
         return None
 
 
