@@ -1,10 +1,10 @@
-"""Tier panels must use chat-completable models.
+"""Tier panels must use models the engine can actually call.
 
-A model whose litellm id is `mode=responses` (e.g. openai/gpt-5.5-pro) or uses
-the legacy `text-completion-openai/` endpoint (e.g. gpt-5.3-codex) 404s on the
-chat-completions endpoint the engine drives via `litellm.acompletion`. Those
-must not appear in any default tier. This guards against re-adding that class
-of model to a tier — the gpt-pro / gpt-codex 404 a live panel hit.
+A `mode=responses` model (e.g. openai/gpt-5.5-pro, openai/gpt-5.3-codex) 404s on
+chat completions, so the engine routes it through the Responses adapter — but
+only when its registry entry is marked `"mode": "responses"`. This test ensures
+every tiered model is either chat-completable or explicitly marked for Responses
+routing, and that none uses the legacy `text-completion-openai/` endpoint.
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ import litellm
 from consult import registry
 
 
-def test_no_tier_model_uses_responses_or_text_completion_endpoint():
+def test_tier_responses_models_are_marked_for_routing():
     cfg = registry.models_config()
     models = cfg["models"]
     tiered = {alias for members in cfg["tiers"].values() for alias in members}
@@ -32,7 +32,10 @@ def test_no_tier_model_uses_responses_or_text_completion_endpoint():
             mode = litellm.get_model_info(lid).get("mode")
         except Exception:
             mode = None  # openrouter / unknown ids — no metadata, assumed chat
-        if mode == "responses":
-            offenders.append(f"{alias} ({lid}): mode=responses, needs the Responses API")
+        if mode == "responses" and entry.get("mode") != "responses":
+            offenders.append(
+                f"{alias} ({lid}): mode=responses but the registry entry is not marked "
+                '"mode": "responses", so the engine would call it as chat and 404'
+            )
 
-    assert not offenders, "tier models not chat-completable:\n  " + "\n  ".join(offenders)
+    assert not offenders, "tier models the engine can't call:\n  " + "\n  ".join(offenders)

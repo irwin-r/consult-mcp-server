@@ -16,6 +16,7 @@ from collections.abc import Awaitable, Callable
 from contextlib import nullcontext, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import litellm
@@ -826,6 +827,68 @@ async def _stream_acompletion(
         ) from e
 
 
+async def _aresponses_as_completion(
+    *, timeout: float, model: str, messages: list[dict[str, Any]], max_completion_tokens: int, **extra: Any
+) -> Any:
+    """Call litellm's Responses API for a `mode=responses` model and wrap the
+    result in the chat-completions shape the rest of `_call_one` consumes.
+
+    OpenAI Responses-API models (e.g. gpt-5.5-pro, gpt-5.3-codex) 404 on the
+    chat-completions endpoint, so they route here instead of `acompletion`.
+    Mirrors `cli_executor.call_cli`'s SimpleNamespace adaptation. System
+    messages become `instructions`; the rest become `input`. Non-streaming
+    only — the streaming path stays on chat completions.
+    """
+    instructions = "\n\n".join(m["content"] for m in messages if m.get("role") == "system") or None
+    convo = [m for m in messages if m.get("role") != "system"]
+    if len(convo) == 1:
+        rinput: Any = convo[0]["content"]
+    else:
+        # Multi-turn (refine continuation): the Responses API takes a string or
+        # an input-item list; a role-tagged string is the simplest faithful
+        # rendering of the prior turns.
+        rinput = "\n\n".join(f"{m['role']}: {m['content']}" for m in convo)
+
+    kwargs: dict[str, Any] = {"model": model, "input": rinput, "max_output_tokens": max_completion_tokens}
+    if instructions:
+        kwargs["instructions"] = instructions
+    if extra.get("reasoning_effort"):
+        kwargs["reasoning"] = {"effort": extra["reasoning_effort"]}
+    # Other chat-shaped params in `extra` (e.g. temperature) are intentionally
+    # dropped: the Responses API rejects several of them.
+
+    rresp = await asyncio.wait_for(litellm.aresponses(**kwargs), timeout=timeout)
+
+    text = getattr(rresp, "output_text", None) or ""
+    status_str = getattr(rresp, "status", None)
+    finish = "stop"
+    if status_str and status_str != "completed":
+        details = getattr(rresp, "incomplete_details", None)
+        reason = getattr(details, "reason", None) if details else None
+        finish = "length" if reason == "max_output_tokens" else (status_str or "stop")
+    usage = getattr(rresp, "usage", None)
+    tokens_in = getattr(usage, "input_tokens", None) if usage else None
+    tokens_out = getattr(usage, "output_tokens", None) if usage else None
+
+    def _dump() -> dict[str, Any]:
+        try:
+            return rresp.model_dump()  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001
+            return {"_responses_repr": repr(rresp)}
+
+    return SimpleNamespace(
+        model=model,
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(content=text, tool_calls=None),
+                finish_reason=finish,
+            )
+        ],
+        usage=SimpleNamespace(prompt_tokens=tokens_in, completion_tokens=tokens_out),
+        model_dump=_dump,
+    )
+
+
 async def _call_one(
     spec: ModelSpec,
     slug: str,
@@ -878,6 +941,9 @@ async def _call_one(
     budget = MAX_TOKENS_BY_KIND.get(capsule_kind, MAX_TOKENS_BY_KIND["decision"])
     timeout = entry.get("default_timeout_s", 180)
     provider = entry.get("provider", "")
+    # mode=responses models (e.g. gpt-pro, gpt-codex) use the OpenAI Responses
+    # API, not chat completions — routed via `_aresponses_as_completion`.
+    is_responses = entry.get("mode") == "responses"
 
     extra: dict[str, Any] = {}
     if "reasoning_effort" in entry:
@@ -985,6 +1051,16 @@ async def _call_one(
                         timeout=timeout,
                         extra_env=entry.get("cli_env"),
                     )
+                elif is_responses:
+                    # Responses-API models 404 on chat completions; route them
+                    # through the adapter. No streaming on this path.
+                    resp = await _aresponses_as_completion(
+                        timeout=timeout,
+                        model=litellm_id,
+                        messages=messages,
+                        max_completion_tokens=budget,
+                        **extra,
+                    )
                 elif stream:
                     resp = await _stream_acompletion(
                         timeout=timeout,
@@ -1022,6 +1098,21 @@ async def _call_one(
                 # response object built by `cli_executor.call_cli`).
                 cost = 0.0
                 cost_known = True
+            elif is_responses:
+                # The Responses adapter returns a synthetic chat-shaped object
+                # that `completion_cost` can't price; compute from token counts.
+                try:
+                    pc, cc = litellm.cost_per_token(
+                        model=litellm_id,
+                        prompt_tokens=tokens_in or 0,
+                        completion_tokens=tokens_out or 0,
+                    )
+                    cost = float(pc or 0.0) + float(cc or 0.0)
+                    cost_known = True
+                except Exception as ce:  # noqa: BLE001
+                    logger.warning("responses cost lookup failed for %s: %s", litellm_id, ce)
+                    cost = None
+                    cost_known = False
             else:
                 try:
                     cost = litellm.completion_cost(completion_response=resp)
