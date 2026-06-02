@@ -3,7 +3,7 @@
 # stdio transport. The container expects API keys via env (ANTHROPIC_API_KEY,
 # OPENAI_API_KEY, GEMINI_API_KEY, OPENROUTER_API_KEY). Mount a volume at
 # /root/.consult to persist runs across container starts.
-FROM python:3.12-slim AS build
+FROM python:3.14-slim AS build
 
 WORKDIR /app
 
@@ -15,7 +15,7 @@ COPY consult/ ./consult/
 # Install the engine + MCP adapter. `--no-cache-dir` shrinks the layer.
 RUN pip install --no-cache-dir ".[mcp]"
 
-FROM python:3.12-slim AS runtime
+FROM python:3.14-slim AS runtime
 WORKDIR /app
 
 # Copy the installed site-packages and console scripts from the build stage.
