@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Until 1.0, the capsule schema and tool surface may change in minor releases.
 
+## [0.3.0](https://github.com/irwin-r/consult-mcp-server/compare/v0.2.0...v0.3.0) (2026-06-02)
+
+
+### Features
+
+* add --watch streaming mode to the self-improve warden ([#36](https://github.com/irwin-r/consult-mcp-server/issues/36)) ([a2e2792](https://github.com/irwin-r/consult-mcp-server/commit/a2e2792751ac182e2db91df71ae31d804691ece0))
+* add consult-gc to prune old run artifacts ([31a0126](https://github.com/irwin-r/consult-mcp-server/commit/31a0126cd6fda7371a1cc0ad1959c510cdba36a6))
+* add self-improvement agent harness ([#31](https://github.com/irwin-r/consult-mcp-server/issues/31)) ([aed691d](https://github.com/irwin-r/consult-mcp-server/commit/aed691d0b03431e945945b84dee4bc097fb7c159))
+* route responses-API models through litellm aresponses ([#30](https://github.com/irwin-r/consult-mcp-server/issues/30)) ([ce40a71](https://github.com/irwin-r/consult-mcp-server/commit/ce40a7198183d3987c221d01f3624bef320721a9))
+
+
+### Bug Fixes
+
+* address iteration-1 panel-review findings (tiers, dropout, prune, docs) ([6ebdde0](https://github.com/irwin-r/consult-mcp-server/commit/6ebdde03f79ffb7fb78fedad3c2b24ba02e09e6a))
+* cap panel size so a huge model count can't OOM the process ([#35](https://github.com/irwin-r/consult-mcp-server/issues/35)) ([ca1ec55](https://github.com/irwin-r/consult-mcp-server/commit/ca1ec55f62d0ba92d6b3021ee6cd8f8303da73ef))
+* capsule-retry cost, synth-failure surfacing, and cancelled-task status ([#18](https://github.com/irwin-r/consult-mcp-server/issues/18)) ([7bfdbc6](https://github.com/irwin-r/consult-mcp-server/commit/7bfdbc6abacf908c57be1655fe50864e33706212))
+* **deps:** bump litellm onto the line that carries the proxy-auth fixes ([33d7fb0](https://github.com/irwin-r/consult-mcp-server/commit/33d7fb0f6c9edac7c4084aed72286dc3da7df252))
+* make consult-doctor --config resolve without an installed binary ([06e5581](https://github.com/irwin-r/consult-mcp-server/commit/06e55815f47d24462c27a5fbf8f422ea3b8b256f))
+* shield the fanout drain, drop dead code, add a parent-cancel drain test ([272213f](https://github.com/irwin-r/consult-mcp-server/commit/272213f200de24453edfa150c4758513c3b26c60))
+* surface truncated/empty decision and research panellists in run_summary ([#38](https://github.com/irwin-r/consult-mcp-server/issues/38)) ([6418cf6](https://github.com/irwin-r/consult-mcp-server/commit/6418cf6eb29b7fa97adec8a5a10026df9706b8f4))
+* warn when max_run_usd can't be enforced on unpriced panellists ([98b3696](https://github.com/irwin-r/consult-mcp-server/commit/98b369630652bf052544633feb5be695763f2e4a))
+
+
+### Documentation
+
+* document the otel extra, task mode, and the opt-in side-cars ([5d7cba0](https://github.com/irwin-r/consult-mcp-server/commit/5d7cba0e42c65838bee2379ab310058cc4005290))
+* fix the redaction wording and fill in the repo-layout map ([cf9a6ad](https://github.com/irwin-r/consult-mcp-server/commit/cf9a6ad1ecd24bd1f4e73d247c67919cd19201cc))
+* make the never-raised exception docstrings honest ([bdcf478](https://github.com/irwin-r/consult-mcp-server/commit/bdcf4780436ebd4c3d6865f6b7ccd2ad5471cdef))
+
 ## [Unreleased]
 
 ## [0.2.0] - 2026-05-21

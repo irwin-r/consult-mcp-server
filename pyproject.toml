@@ -1,6 +1,6 @@
 [project]
 name = "consult-mcp-server"
-version = "0.2.0"
+version = "0.3.0"
 description = "Multi-model panel orchestration engine with an MCP adapter. The engine (consult.*) is MCP-free and usable as a library; the MCP adapter (consult.mcp.*) is an optional extra."
 readme = "README.md"
 requires-python = ">=3.11"
