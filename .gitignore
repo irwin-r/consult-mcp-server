@@ -13,3 +13,4 @@ htmlcov/
 *.log
 .refine-loop/
 .claude/
+.self-improve/

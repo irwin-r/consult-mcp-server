@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd template for the self-improvement warden.
+
+  This is a TEMPLATE. Do not commit a filled-in copy (it carries absolute home
+  paths). To install:
+    1. Copy to ~/Library/LaunchAgents/com.consult.self-improve.plist
+    2. Replace ABS_REPO with the absolute repo path, and ABS_NODE_BIN with the
+       directory holding `node`/`claude` (e.g. ~/.nvm/versions/node/vXX/bin).
+    3. launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.consult.self-improve.plist
+    4. launchctl kickstart -k gui/$(id -u)/com.consult.self-improve   # optional immediate run
+
+  StartInterval 21600 = every 6 hours. RunAtLoad is false so loading the job does
+  not trigger an unvetted run; the warden's own min-interval guard is a backstop.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.consult.self-improve</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>ABS_REPO/scripts/self-improve.sh</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>ABS_REPO</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>ABS_HOME</string>
+    <key>PATH</key>
+    <string>ABS_NODE_BIN:ABS_HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+
+  <key>StartInterval</key>
+  <integer>21600</integer>
+
+  <key>RunAtLoad</key>
+  <false/>
+
+  <key>StandardOutPath</key>
+  <string>ABS_REPO/.self-improve/launchd.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>ABS_REPO/.self-improve/launchd.err.log</string>
+</dict>
+</plist>
