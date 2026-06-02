@@ -127,6 +127,29 @@ def test_expand_specs_rejects_too_many_bare_specs(monkeypatch):
         expand_specs(specs)
 
 
+def test_expand_specs_allows_aggregate_at_cap(monkeypatch):
+    """Specs summing to exactly the cap are admitted — the aggregate check
+    rejects only strictly over the cap, matching the single-spec boundary.
+    """
+    from consult.runner import expand_specs
+
+    monkeypatch.setenv("CONSULT_MAX_PANEL_SIZE", "4")
+    out = expand_specs([ModelSpec(model="claude-haiku:2"), ModelSpec(model="gpt-pro:2")])
+    assert len(out) == 4
+
+
+def test_expand_specs_zero_padded_count_is_magnitude_not_length():
+    """A zero-padded but legal count keeps expanding; the digit guard reads
+    magnitude, not raw string length, so ':0000005' is five, not too long.
+    """
+    from consult.runner import expand_specs
+
+    assert len(expand_specs([ModelSpec(model="claude-haiku:0000005")])) == 5
+    # All-zeros is still count 0, reported as the ≥1 typo, not "too large".
+    with pytest.raises(ValueError, match="must be ≥1"):
+        expand_specs([ModelSpec(model="claude-haiku:00000000000")])
+
+
 def test_expand_specs_rejects_implausible_digit_count():
     """A pathological 20-digit count is rejected by the digit guard before
     int() touches it (CVE-2020-10735 quadratic str->int defence).

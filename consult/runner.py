@@ -194,13 +194,17 @@ def expand_specs(specs: list[ModelSpec]) -> list[ModelSpec]:
             out.append(spec)
         else:
             base, count_str = m.group(1), m.group(2)
-            # Reject an implausibly long digit run before int() touches it,
-            # then reject a count over the cap before range() allocates it.
-            if len(count_str) > _MAX_COUNT_DIGITS:
-                raise ValueError(f"model:count is implausibly large (got {spec.model!r})")
-            count = int(count_str)
-            if count < 1:
+            # Strip leading zeros so the length check judges magnitude, not
+            # padding: a legal but zero-padded ":0000064" must not read as
+            # "implausibly large". After the strip an empty string is all
+            # zeros (count 0), and a too-long run is rejected before int()
+            # reaches the quadratic str->int path (CVE-2020-10735).
+            digits = count_str.lstrip("0")
+            if not digits:
                 raise ValueError(f"model:count must be ≥1 (got {spec.model!r})")
+            if len(digits) > _MAX_COUNT_DIGITS:
+                raise ValueError(f"model:count is implausibly large (got {spec.model!r})")
+            count = int(digits)  # ≥1: leading zeros stripped, non-empty
             if count > cap:
                 raise ValueError(
                     f"model:count {count} exceeds the {cap}-panellist cap "
