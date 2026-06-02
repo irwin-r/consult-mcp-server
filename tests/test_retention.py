@@ -6,6 +6,8 @@ import os
 import time
 from pathlib import Path
 
+import pytest
+
 from consult import artifacts
 
 
@@ -64,3 +66,38 @@ def test_prune_runs_ignores_non_run_dirs(tmp_path, monkeypatch):
     deleted = artifacts.prune_runs(max_age_days=1)
     assert deleted == ["20260101-000000-1000"]
     assert stray.exists()
+
+
+def test_prune_runs_rejects_nonpositive_bounds(tmp_path, monkeypatch):
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    for bad in (0, -1):
+        with pytest.raises(ValueError):
+            artifacts.prune_runs(max_count=bad)
+        with pytest.raises(ValueError):
+            artifacts.prune_runs(max_age_days=bad)
+
+
+def test_prune_runs_skips_symlinked_run_dirs(tmp_path, monkeypatch):
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    _make_run(tmp_path, "20260101-000000-1000", age_days=99)  # real run, doomed by age
+    target = tmp_path / "_target"  # non-run-id name, skipped on its own
+    target.mkdir()
+    link = tmp_path / "20260102-000000-2000"  # run-id-named symlink
+    link.symlink_to(target, target_is_directory=True)
+    deleted = artifacts.prune_runs(max_age_days=1)
+    assert deleted == ["20260101-000000-1000"]
+    assert link.is_symlink() and target.exists()  # symlink + its target untouched
+
+
+def test_env_helpers_warn_on_malformed(monkeypatch, caplog):
+    import logging
+
+    from consult import retention
+
+    monkeypatch.setenv("CONSULT_RUNS_MAX", "abc")
+    monkeypatch.setenv("CONSULT_RUNS_RETENTION_DAYS", "not-a-number")
+    with caplog.at_level(logging.WARNING, logger="consult.retention"):
+        assert retention._env_int("CONSULT_RUNS_MAX") is None
+        assert retention._env_float("CONSULT_RUNS_RETENTION_DAYS") is None
+    assert "CONSULT_RUNS_MAX" in caplog.text
+    assert "CONSULT_RUNS_RETENTION_DAYS" in caplog.text

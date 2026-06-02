@@ -21,9 +21,9 @@ WORKDIR /app
 # Copy the installed site-packages and console scripts from the build stage.
 # This keeps the runtime image free of pip's caches and intermediate state.
 COPY --from=build /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
-COPY --from=build /usr/local/bin/consult-mcp /usr/local/bin/consult-mcp
-COPY --from=build /usr/local/bin/consult-ledger /usr/local/bin/consult-ledger
-COPY --from=build /usr/local/bin/consult-view /usr/local/bin/consult-view
+# All consult-* console scripts (consult-mcp, -ledger, -view, -doctor, -gc).
+# Glob keeps this correct as scripts are added or renamed in pyproject.toml.
+COPY --from=build /usr/local/bin/consult-* /usr/local/bin/
 
 # Run directory: per-run artifacts land under /root/.consult/runs/. Mount a
 # host volume here if you want runs to survive container restarts.

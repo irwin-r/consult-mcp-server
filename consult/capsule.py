@@ -328,7 +328,10 @@ async def _extract_one(
     # A pricing miss on any call flips cost_known False but never discards a
     # successful capsule.
     cost: float | None = None
-    cost_known = True
+    # bool(billed_responses): an empty list (shouldn't happen on this path, but
+    # be defensive) means no priced call was made, so cost is unknown — not a
+    # silent "known $0".
+    cost_known = bool(billed_responses)
     for billed in billed_responses:
         try:
             c = litellm.completion_cost(completion_response=billed)
