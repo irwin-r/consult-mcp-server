@@ -49,12 +49,37 @@ _OK_STATUSES = ("OK", "TRUNCATED")
 _TRUNCATED_FINISHES = ("length", "max_tokens", "MAX_TOKENS")
 
 
+def _capsule_is_empty(cap: dict[str, Any] | None) -> bool:
+    """True when a capsule carries no content a synthesiser could use.
+
+    Keyed on `kind` because each shape stores its substance in different
+    fields. Supplementary or relational fields (caveats, unique_claims,
+    sources_cited, confidence, overall_verdict) don't count as value on their
+    own: a capsule with only those is a partial extraction, itself worth
+    flagging. Unknown or legacy kinds fall back to the decision check, which is
+    the conservative direction — a new shape reads as empty until the helper is
+    taught it, surfacing as a visible `no_value` entry rather than a silent pass.
+    """
+    if not isinstance(cap, dict):
+        return True
+    kind = cap.get("kind", "decision")
+    if kind == "review":
+        return not (cap.get("findings") or [])
+    if kind == "research":
+        return not (cap.get("claims") or []) and not (cap.get("evidence") or [])
+    return (
+        not (cap.get("position") or "").strip()
+        and not (cap.get("recommendation") or "").strip()
+        and not (cap.get("key_points") or [])
+    )
+
+
 def _summarise_manifest(manifest: list[dict[str, Any]]) -> dict[str, Any]:
     """Roll up per-panellist health so the invoking agent can see, from the
     result alone, which models contributed and which returned nothing usable —
     the "which models didn't return value?" question that otherwise needs a
     manual manifest dig. `no_value` lists each dud with a concrete reason
-    (errored, timed out, truncated before findings, or empty extraction).
+    (errored, timed out, truncated before a usable capsule, or empty extraction).
     """
     from collections import Counter
 
@@ -67,14 +92,20 @@ def _summarise_manifest(manifest: list[dict[str, Any]]) -> dict[str, Any]:
         status = e.get("status") or "?"
         status_counts[status] += 1
         cap = e.get("capsule") if isinstance(e.get("capsule"), dict) else None
-        has_findings_field = cap is not None and "findings" in cap
-        n_findings = len(cap.get("findings") or []) if has_findings_field else None
-        if n_findings is not None:
-            findings_total += n_findings
+        # findings_total stays a review-kind metric: count line-anchored
+        # findings across the panel.
+        if cap is not None and "findings" in cap:
+            findings_total += len(cap.get("findings") or [])
 
         finish = e.get("finish_reason")
         hard_fail = status not in _OK_STATUSES
-        empty = has_findings_field and n_findings == 0
+        # A panellist that returned OK/TRUNCATED but whose capsule has no usable
+        # content bought nothing. This was previously caught only for review
+        # capsules (via the findings count), so a truncated decision or research
+        # panellist looked healthy in the rollup. `cap is not None` gates the
+        # check: when extract_capsules=false every capsule is null, and those
+        # runs aren't dud panellists.
+        empty = cap is not None and _capsule_is_empty(cap)
         if not (hard_fail or empty):
             continue
         if e.get("error"):
@@ -82,9 +113,9 @@ def _summarise_manifest(manifest: list[dict[str, Any]]) -> dict[str, Any]:
         elif status == "TIMEOUT":
             reason = "timed out"
         elif empty and finish in _TRUNCATED_FINISHES:
-            reason = "truncated at token cap before emitting findings"
+            reason = "truncated at token cap before emitting a usable capsule"
         elif empty:
-            reason = "extractor returned no findings"
+            reason = "extractor returned an empty capsule"
         else:
             reason = status
         no_value.append(
