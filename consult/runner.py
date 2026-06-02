@@ -1317,7 +1317,6 @@ async def _gather_with_tail_dropout(
                 # A task may complete in the race between asyncio.wait returning
                 # and t.cancel(); keep its real result.
                 await t
-                completed_tasks.add(t)
                 continue
             except asyncio.CancelledError:
                 pass
@@ -1332,7 +1331,6 @@ async def _gather_with_tail_dropout(
             recovered = next((e for e in state.completed_entries if e.slug == slug), None)
             if recovered is not None:
                 drop_entries[t] = recovered
-                completed_tasks.add(t)
                 await safe_notify(
                     PanellistCompleted(
                         done=state.done,
@@ -1381,7 +1379,16 @@ async def _gather_with_tail_dropout(
         # into its children automatically; the explicit-task branch must do it.
         for t in task_list:
             t.cancel()
-        await asyncio.gather(*task_list, return_exceptions=True)
+        # Drain to completion before propagating, looping over shield so even a
+        # second cancel during cleanup can't abandon it — no child left running
+        # (and billing). The children were just cancelled, so the gather settles
+        # promptly and the loop can't spin.
+        drain = asyncio.gather(*task_list, return_exceptions=True)
+        while not drain.done():
+            try:
+                await asyncio.shield(drain)
+            except asyncio.CancelledError:
+                continue
         raise
 
 

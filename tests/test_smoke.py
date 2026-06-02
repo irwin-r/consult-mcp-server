@@ -7072,3 +7072,54 @@ async def test_fanout_dropout_recovers_panellist_completed_during_notify(tmp_pat
     racer = handle.manifest[3]
     assert racer.status is Status.OK, f"racer mis-reported as {racer.status} (cancel-race regression)"
     assert sum(1 for m in handle.manifest if m.status is Status.TIMEOUT) == 0
+
+
+@pytest.mark.asyncio
+async def test_fanout_cancel_drains_child_tasks(tmp_path, monkeypatch):
+    """Cancelling the fanout task must cancel and drain the dropout path's
+    child tasks — none left running (and billing). Exercises the gatherer's
+    `except BaseException` drain end-to-end.
+    """
+    import asyncio as _asyncio
+
+    from consult import runner
+    from consult.runner import fanout
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    monkeypatch.setattr(runner, "estimate_cost", lambda *a, **kw: (0.0, True))
+    monkeypatch.setenv("CONSULT_HEARTBEAT_INTERVAL_S", "0")
+
+    cancelled = {"n": 0}
+    first_started = _asyncio.Event()
+
+    async def fake_call(spec, slug, per_prompt, paths, provider_sems=None, **_):
+        first_started.set()
+        try:
+            await _asyncio.sleep(30)  # block until the parent cancel reaches us
+        except _asyncio.CancelledError:
+            cancelled["n"] += 1
+            raise
+        return ManifestEntry(
+            slug=slug,
+            model_id="x/y",
+            persona=None,
+            status=Status.OK,
+            finish_reason="stop",
+            resource_uri=paths.resource_uri(slug),
+            body_path=str(paths.response_text(slug)),
+            latency_ms=1,
+            cost_usd=0.0,
+            cost_known=True,
+        )
+
+    monkeypatch.setattr(runner, "_call_one", fake_call)
+
+    specs = [ModelSpec(model="claude-haiku", slug=f"m-{i}") for i in range(4)]  # dropout path
+    task = _asyncio.create_task(fanout("anything", specs))
+    await first_started.wait()
+    await _asyncio.sleep(0.02)  # let all four enter their sleep
+    task.cancel()
+    with pytest.raises(_asyncio.CancelledError):
+        await task
+
+    assert cancelled["n"] == 4  # every child cancelled and drained, no orphans
