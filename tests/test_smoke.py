@@ -81,6 +81,105 @@ def test_expand_specs_rejects_zero_count():
         expand_specs([ModelSpec(model="claude-haiku:0")])
 
 
+def test_expand_specs_allows_count_at_cap():
+    """A single `model:N` at exactly the cap expands fully — the boundary
+    is inclusive, so the default-64 cap admits a 64-instance panel.
+    """
+    from consult.runner import _DEFAULT_MAX_PANEL_SIZE, expand_specs
+
+    expanded = expand_specs([ModelSpec(model=f"claude-haiku:{_DEFAULT_MAX_PANEL_SIZE}")])
+    assert len(expanded) == _DEFAULT_MAX_PANEL_SIZE
+
+
+def test_expand_specs_rejects_count_over_cap():
+    """A single `model:N` one past the cap fails loudly, before the
+    oversized list is ever built (the real OOM-prevention path).
+    """
+    from consult.runner import _DEFAULT_MAX_PANEL_SIZE, expand_specs
+
+    over = _DEFAULT_MAX_PANEL_SIZE + 1
+    with pytest.raises(ValueError, match="exceeds the .* cap"):
+        expand_specs([ModelSpec(model=f"claude-haiku:{over}")])
+
+
+def test_expand_specs_rejects_multi_spec_inflation(monkeypatch):
+    """Several specs each under the per-spec cap can still sum past it.
+    The total-size check must fire, not just the per-spec one.
+    """
+    from consult.runner import expand_specs
+
+    monkeypatch.setenv("CONSULT_MAX_PANEL_SIZE", "4")
+    # Two specs of :3 each pass the per-spec check but total 6 > 4.
+    specs = [ModelSpec(model="claude-haiku:3"), ModelSpec(model="gpt-pro:3")]
+    with pytest.raises(ValueError, match="more than 4 panellists"):
+        expand_specs(specs)
+
+
+def test_expand_specs_rejects_too_many_bare_specs(monkeypatch):
+    """A flood of distinct bare specs (no `:N` at all) is still capped —
+    this is the MCP `models` array with no maxItems reaching the engine.
+    """
+    from consult.runner import expand_specs
+
+    monkeypatch.setenv("CONSULT_MAX_PANEL_SIZE", "4")
+    specs = [ModelSpec(model=f"m{i}") for i in range(5)]  # 5 bare specs
+    with pytest.raises(ValueError, match="more than 4 panellists"):
+        expand_specs(specs)
+
+
+def test_expand_specs_allows_aggregate_at_cap(monkeypatch):
+    """Specs summing to exactly the cap are admitted — the aggregate check
+    rejects only strictly over the cap, matching the single-spec boundary.
+    """
+    from consult.runner import expand_specs
+
+    monkeypatch.setenv("CONSULT_MAX_PANEL_SIZE", "4")
+    out = expand_specs([ModelSpec(model="claude-haiku:2"), ModelSpec(model="gpt-pro:2")])
+    assert len(out) == 4
+
+
+def test_expand_specs_zero_padded_count_is_magnitude_not_length():
+    """A zero-padded but legal count keeps expanding; the digit guard reads
+    magnitude, not raw string length, so ':0000005' is five, not too long.
+    """
+    from consult.runner import expand_specs
+
+    assert len(expand_specs([ModelSpec(model="claude-haiku:0000005")])) == 5
+    # All-zeros is still count 0, reported as the ≥1 typo, not "too large".
+    with pytest.raises(ValueError, match="must be ≥1"):
+        expand_specs([ModelSpec(model="claude-haiku:00000000000")])
+
+
+def test_expand_specs_rejects_implausible_digit_count():
+    """A pathological 20-digit count is rejected by the digit guard before
+    int() touches it (CVE-2020-10735 quadratic str->int defence).
+    """
+    from consult.runner import expand_specs
+
+    with pytest.raises(ValueError, match="implausibly large"):
+        expand_specs([ModelSpec(model="claude-haiku:99999999999999999999")])
+
+
+def test_expand_specs_env_override(monkeypatch):
+    """CONSULT_MAX_PANEL_SIZE raises (or lowers) the cap at call time."""
+    from consult.runner import expand_specs
+
+    monkeypatch.setenv("CONSULT_MAX_PANEL_SIZE", "2")
+    assert len(expand_specs([ModelSpec(model="claude-haiku:2")])) == 2
+    with pytest.raises(ValueError, match="exceeds the 2-panellist cap"):
+        expand_specs([ModelSpec(model="claude-haiku:3")])
+
+
+def test_expand_specs_invalid_env_falls_back(monkeypatch):
+    """An unparseable or non-positive override is ignored (with a warning)
+    rather than silently disabling the guard."""
+    from consult.runner import _DEFAULT_MAX_PANEL_SIZE, _max_panel_size
+
+    for bad in ("abc", "0", "-1", ""):
+        monkeypatch.setenv("CONSULT_MAX_PANEL_SIZE", bad)
+        assert _max_panel_size() == _DEFAULT_MAX_PANEL_SIZE
+
+
 def test_slug_and_prompt_assembly():
     spec = ModelSpec(model="claude-haiku", stance="security")
     assert _make_slug(spec, 0, blinded=False).startswith("claude-haiku")
