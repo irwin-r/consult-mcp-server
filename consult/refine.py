@@ -24,7 +24,7 @@ import litellm
 from . import artifacts, capsule, context, provider_caps, registry, runner, slugs, strategies, synth
 from . import progress as progress_mod
 from .jsonparse import extract_json
-from .redact import redact_exc
+from .redact import redact_exc, redact_secrets
 from .types import (
     ArbiterVerdict,
     Capsule,
@@ -442,7 +442,7 @@ async def _ask_arbiter(
                 cost_usd=cost,
                 cost_known=cost_known,
                 parsed_ok=False,
-                error=f"no_dimensions_or_score: {e!s:.100}",
+                error=redact_secrets(f"no_dimensions_or_score: {e}")[:100],
             )
 
     return ArbiterVerdict(

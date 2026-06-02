@@ -71,7 +71,7 @@ def redact_exc(exc: BaseException, *, limit: int | None = None) -> str:
     string, then cap.
     """
     text = redact_secrets(f"{type(exc).__name__}: {exc}")
-    if limit is not None and len(text) > limit:
+    if limit is not None and limit > 0 and len(text) > limit:
         text = text[: limit - 1] + "…"
     return text
 

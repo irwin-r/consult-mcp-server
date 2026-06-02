@@ -92,6 +92,14 @@ def test_redact_exc_limit_none_does_not_truncate():
     assert "…" not in out
 
 
+def test_redact_exc_non_positive_limit_does_not_truncate():
+    # No caller passes these, but a non-positive limit must not produce the
+    # nonsense `text[:-1]` slice — leave the (already redacted) string whole.
+    msg = ValueError("z" * 100)
+    assert redact_exc(msg, limit=0) == "ValueError: " + "z" * 100
+    assert redact_exc(msg, limit=-5) == "ValueError: " + "z" * 100
+
+
 # --- redact_traceback -----------------------------------------------------
 
 
