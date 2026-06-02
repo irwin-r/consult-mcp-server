@@ -439,6 +439,20 @@ def test_summary_flags_empty_research_capsule():
     assert "a" in by_slug
 
 
+def test_summary_research_with_claims_or_evidence_not_flagged():
+    """Research emptiness is claims AND evidence both empty; either one alone is
+    value. Pins the `and` against an accidental flip to `or`."""
+    claims_only = {"kind": "research", "claims": ["x"], "evidence": []}
+    evidence_only = {"kind": "research", "claims": [], "evidence": ["y"]}
+    _, by_slug = _no_value_by_slug(
+        [
+            _entry("claims", "TRUNCATED", claims_only, finish_reason="length"),
+            _entry("evidence", "OK", evidence_only, finish_reason="stop"),
+        ]
+    )
+    assert by_slug == {}
+
+
 def test_summary_review_empty_still_flagged_and_findings_counted():
     """Review-kind behaviour is preserved: zero findings is empty, and
     findings_total still sums line-anchored findings across the panel."""

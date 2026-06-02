@@ -7,6 +7,59 @@ describe the loop that writes this.
 
 ---
 
+## 2026-06-02 — Surface truncated/empty panellists in run_summary
+
+**Shipped.** `_summarise_manifest` (handlers.py) builds `run_summary.no_value`, the
+list the invoking agent reads to see which panellists returned nothing usable. Its
+emptiness check keyed on the presence of a `findings` field, which only review-kind
+capsules carry. So a decision-kind or research-kind panellist that truncated at the
+output-token cap before emitting anything looked like a healthy contributor, and its
+wasted spend was invisible.
+
+The fix adds a `_capsule_is_empty` helper keyed on `kind` (position/recommendation/
+key_points for decision, findings for review, claims/evidence for research) and uses
+it for the empty check across all kinds. The caller still gates on a present capsule
+so `extract_capsules=false` runs (every capsule null) aren't all flagged. Reason
+strings are now kind-agnostic. The rollup had zero tests; this adds ten.
+
+This was a dogfooding find from the plan review (closes #34). The plan-review call I
+made this cycle reproduced it live: 9 panellists, 6 TRUNCATED, 4 with empty capsules
+(one cost $0.61), and `no_value` came back `[]`. Running the fixed summariser over
+that real on-disk manifest flags exactly those 4 and leaves the 2 truncated-but-
+useful and 3 OK panellists alone.
+
+**Panel — plan (standard/consensus, $1.08):** endorsed detect-and-surface and talked
+me out of over-reaching. Convergence from the non-truncated responders (qwen-max
+0.95, claude-sonnet 0.92, llama 0.85, grok 0.85). Adopted its refinements: `.strip()`
+the decision string fields for whitespace-only extractions, default missing `kind` to
+decision, keep the helper defensive against None/non-dict, and add two edge tests
+(capsule=None lands via hard_fail not empty; truncated-but-non-empty stays unflagged).
+claude-sonnet's second-order point (truncated-empty entries inflate the `usable()`
+denominator) became issue #37, deferred until `no_value` data accumulates.
+
+**Panel — diff (code/code_review, $0.25):** 4/4 RISK low, MERGE yes, verdict SHIP, no
+blockers. Reviewers pinned off-family (gpt-codex, gpt-mini, gemini-pro, deepseek).
+Took its one cheap test suggestion (pin the research `and` so claims-only or
+evidence-only isn't flagged). Dismissed the rest: the uncertainties-only / verdict-
+only "policy" question is intentional and documented in the helper docstring (those
+are partial extractions, worth flagging); the non-dict guard is dead from the rollup
+caller but exercised directly and kept as defensive; `findings_total` keying on the
+field rather than the kind is equivalent in practice.
+
+**Panel spend this cycle:** ~$1.33 (known-priced portion; several OpenRouter
+panellists were unpriced).
+
+**Considered, not done this cycle:**
+- Raising `MAX_TOKENS_BY_KIND["decision"]` (2000) to stop verbose models truncating.
+  Rejected: raises cost for every decision run to fix a minority case, and wouldn't
+  surface the waste when it still happens.
+- A continuation/retry of a truncated-but-promising answer. Bigger and riskier;
+  revisit once `no_value` data shows how often it'd pay off.
+- Excluding truncated-empty entries from synth's usable set or the `usable()`
+  denominator. Filed as #37; gather data before changing the heuristic.
+
+---
+
 ## 2026-06-02 — Bound panel expansion against an OOM DoS
 
 **Shipped.** `expand_specs` turned caller-supplied `model:N` sugar into N specs
