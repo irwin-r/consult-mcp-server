@@ -7,6 +7,81 @@ describe the loop that writes this.
 
 ---
 
+## 2026-06-02 — Redact secrets at every boundary, not just the manifest
+
+**Shipped.** The secret-shaped-token redactor (`_redact_secrets` + the key-shape
+patterns) was applied at exactly one place: the manifest error field
+(`_format_error_message`). The same provider exception flowed UNREDACTED into every
+other place it can leave the process or hit disk: synth's failure text (returned as
+`SynthResult.text` AND written to `synthesis.md`), the refine arbiter verdict
+(`ArbiterVerdict.error`, returned in `RefineResult.verdicts` and persisted to
+`arbiters/round-N.json`), the MCP error envelope and task-failure string returned to
+the client, and three `logger.exception` sites that dump the full traceback (with the
+exception repr) to the server log. The code's own threat-model comment names disk and
+"a parent agent's transcript" as the things redaction must protect, so the control
+was right but inconsistently wired.
+
+The patterns and redactor moved into a new dependency-free `consult/redact.py` shared
+by every boundary (this also removed `doctor.py`'s reach into a private name in
+`runner.py`). Added `redact_exc` (redacts BEFORE truncating, so a key straddling the
+cut point can't survive as a sub-20-char fragment the pattern misses) and
+`redact_traceback` (formats the full chained traceback and redacts it, logged as a
+plain message rather than raw `exc_info`, which a handler's formatter would otherwise
+re-render unredacted). The redaction control had zero tests; this adds 15, including
+boundary tests that plant a fake key in a provider exception and assert it reaches
+none of `SynthResult.text`, `synthesis.md`, `ArbiterVerdict.error`, the MCP envelope,
+or the captured log.
+
+**Validation against reality.** Forced a real 401 from OpenAI, Anthropic, and
+OpenRouter with clearly-fake keys (no billing on auth failure). All three mask or omit
+the key provider-side (OpenAI prints `sk-…****…FFFF`, the others return a bare
+"invalid key" body), so the worst case (a full key verbatim in the exception) does NOT
+reproduce on plain auth errors for the current provider set. So this is honestly
+consistency + defense-in-depth hardening, not the closing of an actively-bleeding
+leak. It still matters: the redactor masks the verbatim `Authorization: Bearer <key>`
+form that litellm debug mode or a header-echoing proxy produces (unit-tested), and the
+real bug, the same exception being safe at one boundary and unsafe at four others, is
+fixed regardless of today's provider behaviour.
+
+**Panel — plan (standard/consensus, $2.14):** endorsed proceeding (5/6 non-truncated
+panellists; none said rethink). Adopted its amendments: `ArbiterVerdict.error` was a
+leak site I'd missed (flagged by claude-sonnet + glm); redact-before-truncate
+(the `{e!s:.300}` slice would leave a short fragment); confirmed the header patterns
+already carry `(?i)`. Deferred qwen-max's shift-left exception-attribute mutation
+(`e.body`/`e.response.text`) and the `LITELLM_LOG=DEBUG` concern to follow-up issues,
+since no current site reads those attributes and the mutation is fragile against
+litellm/httpx drift. The synth (claude-opus) asserted, with confidence, that a filter
+on a parent logger sees records propagated from child loggers ("This is correct
+Python") and that my reason for rejecting a logging.Filter was wrong. I checked it
+empirically: only the HANDLER filter ran, not the parent-logger filter. The synth
+over-trusted the highest-confidence panellist (qwen-max 0.95) on a verifiable fact.
+My original reasoning held, so the plan was unchanged.
+
+**Panel — diff (code/code_review, $0.29):** 4/4 RISK low, MERGE yes, verdict SHIP, no
+blockers. Reviewers pinned off the Claude family that wrote the code (gpt-codex,
+gpt-mini, gemini-pro, deepseek). Took its one real nit: guard `redact_exc` against a
+non-positive `limit` so a zero/negative cap can't produce a `text[:-1]` slice (no
+caller hits it, but cheap to enforce). Did the repo-wide egress grep it asked for: no
+remaining `logger.exception`/`exc_info` in source, and the one other
+`ArbiterVerdict.error` path (`no_dimensions_or_score`) now goes through the redactor
+too, so that field is uniformly safe. Dismissed the "redacting non-provider shape
+errors is over-broad" nit: three reviewers called it harmless, and the consistency is
+worth more than saving one regex pass.
+
+**Panel spend this cycle:** ~$2.43 (known-priced portion; several OpenRouter and qwen
+panellists were unpriced on the plan call).
+
+**Considered, not done this cycle:**
+- Shift-left mutation of `e.args`/`e.body`/`e.response.text` at the litellm call sites
+  (secure-by-construction). Deferred: fragile against SDK attribute drift, and no
+  current site reads those attributes. Filed as a follow-up issue.
+- A `RedactingFilter` / `LITELLM_LOG` default so litellm's own loggers (outside the
+  `consult` tree) can't echo headers under debug. Filed as a follow-up issue.
+- The unredacted `attachments.py` `ValueError(f"{type(e).__name__}: {e}")` paths: left
+  alone, those are file-read/parse errors, not provider exceptions.
+
+---
+
 ## 2026-06-02 — Surface truncated/empty panellists in run_summary
 
 **Shipped.** `_summarise_manifest` (handlers.py) builds `run_summary.no_value`, the
