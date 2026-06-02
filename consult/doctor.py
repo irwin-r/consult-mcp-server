@@ -173,11 +173,10 @@ async def _ping_provider(env_var: str, alias: str) -> tuple[bool, str]:
         )
         return True, "ok"
     except Exception as e:  # noqa: BLE001
-        # Redact secrets before surfacing — same risk as runner.py.
-        from .runner import _redact_secrets
+        # Redact secrets before surfacing — same risk as the runner paths.
+        from .redact import redact_exc
 
-        msg = _redact_secrets(f"{type(e).__name__}: {e}")
-        return False, msg[:200]
+        return False, redact_exc(e, limit=200)
 
 
 async def _check_pings() -> tuple[list[str], int]:

@@ -20,6 +20,7 @@ import litellm
 from . import artifacts, context, provider_caps, registry
 from .jsonparse import extract_json
 from .progress import CapsuleExtracted, PhaseStarted, ProgressCallback, append_progress_log
+from .redact import redact_exc
 from .types import AnyCapsule, Capsule, ManifestEntry, ResearchCapsule, ReviewCapsule, RunHandle, Status
 
 logger = logging.getLogger(__name__)
@@ -255,7 +256,7 @@ async def _extract_one(
             timeout=timeout,
         )
     except Exception as e:
-        logger.warning("capsule extractor call failed for extractor=%s: %s", extractor_id, e)
+        logger.warning("capsule extractor call failed for extractor=%s: %s", extractor_id, redact_exc(e))
         return capsule_cls(confidence=_body_confidence(body)), None, False
 
     # 2) Capsule build — failures here are JSON shape or Pydantic validation
@@ -322,7 +323,11 @@ async def _extract_one(
             if getattr(retry_capsule, "findings", None):
                 capsule = retry_capsule
         except Exception as e:
-            logger.warning("capsule empty-findings retry failed for extractor=%s: %s", extractor_id, e)
+            logger.warning(
+                "capsule empty-findings retry failed for extractor=%s: %s",
+                extractor_id,
+                redact_exc(e),
+            )
 
     # 3) Cost lookup — sum every extractor call we made (first + any retry).
     # A pricing miss on any call flips cost_known False but never discards a
@@ -336,7 +341,7 @@ async def _extract_one(
         try:
             c = litellm.completion_cost(completion_response=billed)
         except Exception as e:
-            logger.warning("capsule cost lookup failed for extractor=%s: %s", extractor_id, e)
+            logger.warning("capsule cost lookup failed for extractor=%s: %s", extractor_id, redact_exc(e))
             c = None
         if c is None:
             cost_known = False

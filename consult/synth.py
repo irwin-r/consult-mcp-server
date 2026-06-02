@@ -40,6 +40,7 @@ from typing import Any
 import litellm
 
 from . import artifacts, context, registry
+from .redact import redact_exc
 from .runner import build_messages
 from .types import Status
 
@@ -290,10 +291,10 @@ async def synthesise(
             timeout=timeout,
         )
     except Exception as e:
-        logger.warning("synth call failed (%s): %s", litellm_id, e)
+        logger.warning("synth call failed (%s): %s", litellm_id, redact_exc(e))
         text = (
             f"# Synthesis unavailable\n\n"
-            f"The synthesiser (`{litellm_id}`) failed: `{type(e).__name__}: {e!s:.300}`.\n\n"
+            f"The synthesiser (`{litellm_id}`) failed: `{redact_exc(e, limit=300)}`.\n\n"
             f"The panel manifest is still available at the run's artifacts. "
             f"Retry `synthesise(run_id, by_model=...)` with a different model."
         )
@@ -315,7 +316,7 @@ async def synthesise(
         cost_known = cost is not None
         cost_value = float(cost) if cost is not None else 0.0
     except Exception as ce:  # noqa: BLE001
-        logger.warning("synth cost lookup failed for %s: %s", litellm_id, ce)
+        logger.warning("synth cost lookup failed for %s: %s", litellm_id, redact_exc(ce))
         cost_value = 0.0
         cost_known = False
 
@@ -327,11 +328,11 @@ async def synthesise(
         content = resp.choices[0].message.content
         finish = getattr(resp.choices[0], "finish_reason", None)
     except (AttributeError, IndexError, KeyError, TypeError) as e:
-        logger.warning("synth response shape unexpected for %s: %s", litellm_id, e)
+        logger.warning("synth response shape unexpected for %s: %s", litellm_id, redact_exc(e))
         text = (
             f"# Synthesis unavailable\n\n"
             f"The synthesiser (`{litellm_id}`) returned an unexpected response "
-            f"shape: `{type(e).__name__}: {e!s:.200}`. "
+            f"shape: `{redact_exc(e, limit=200)}`. "
             f"Retry `synthesise(run_id, by_model=...)` with a different model."
         )
         (paths.root / "synthesis.md").write_text(text)
