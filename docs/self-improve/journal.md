@@ -7,6 +7,77 @@ describe the loop that writes this.
 
 ---
 
+## 2026-06-03 — Cover refine's cost-gate refusal branches
+
+**Shipped.** Three tests in `test_smoke.py` for cost-control branches in
+`refine.py` that had no effective coverage. The 80%-of-cap safety valve in
+`_round_cost_gate` (refine.py:606, refuse the next round when a panellist's
+pricing is unknown and spend is already past 80% of cap) had zero tests; the only
+cap test exercised the hard `cumulative + estimate > cap` branch. The partial-
+fanout cost roll-up (refine.py:830-832) was reached by an existing test that
+passed `cost_usd=0.0, cost_known=True`, so the accumulation line and the
+`cost_known` flip never ran with effect. The arbiter unknown-pricing propagation
+(refine.py:909-910, an unmapped-price arbiter must drag the result's `cost_known`
+False) was guarded only by the `RefineResult` pydantic invariant, never end to
+end through the loop. No behaviour change.
+
+**Validation.** Tests-only, so no provider contract is touched; the live
+validation this cycle was the plan panel call itself (a real fan-out). Coverage
+confirms 606, 830-832, and 909-910 are now hit and the hard-cap branch at 597
+stays uncovered, proving the valve test trips only the 80% branch. Mutation checks
+on the valve: flipping `cap * 0.8` to `cap * 0.99` and `not est_known` to
+`est_known` each make the test fail at the `fanout_calls == 1` assertion, so it is
+sensitive to both the threshold and the boolean. Full suite 335 passing, ruff
+clean.
+
+**Panel — plan (standard/consensus, ~$1.24):** endorsed proceeding (3 OK
+responders, qwen-max 0.95 / llama 0.9 / grok 0.85, plus the synth; 6 of 9
+TRUNCATED). It caught a real trap in my round-1 mock arithmetic: round-1 cumulative
+is fanout + capsule + arbiter, not fanout alone, so mocking only fanout at 0.82
+risked pushing cumulative over the cap and tripping the hard-cap branch instead of
+the valve. Adopted by controlling every cost source (noop annotate so no extractor
+cost, zero-cost known arbiter), leaving round-1 cumulative provably 0.82. It also
+endorsed rejecting the arbiter-budget-reservation alternative as architecturally
+correct (LLM APIs are post-paid, so the estimate-vs-actual gap is inherent and
+bounded by the arbiter's hardcoded 2000-token cap). claude-sonnet's freebie, the
+arbiter `cost_known` propagation, became the third test.
+
+**Panel — diff (code/code_review, $0.24):** 4/4 MERGE yes, verdict SHIP, no
+blockers. Reviewers pinned off the Claude family that wrote the tests (gpt-codex,
+gpt-mini, gemini-pro, deepseek); three RISK low, deepseek RISK medium for the
+`est_n` call-counter coupling but still merge-yes. Took its three strengthenings:
+assert round-1 `cost_usd == 0.82` to lock the valve's precondition against a hidden
+cost leak, relax test 2's brittle dict-equality to individual call-counter asserts
+(keeps the arbiter/synth short-circuit guarantee without coupling to the full set),
+and assert test 3's `cost_usd == 0.001` so a regression that nukes the total when
+the arbiter price is None is caught. Added a comment noting `est_n` encodes the
+gate's call order.
+
+**Panel spend this cycle:** ~$1.48 (known-priced portion; several OpenRouter and
+qwen panellists were unpriced on the plan call).
+
+**Considered, not done this cycle:**
+- Reserving the arbiter's estimated cost in the fanout's per-round cap (`cap -
+  cumulative - arbiter_est` rather than `cap - cumulative`). Rejected: the residual
+  overspend is the inherent estimate-vs-actual variance, bounded by the arbiter's
+  2000-token cap, and reserving wouldn't give a real guarantee since the arbiter
+  actual can also exceed its estimate. A behaviour change with heavy validation and
+  no clean correctness win.
+- The slow-tail dropout race-recovery path in `runner.py` (a panellist that
+  completes just before a cancel lands) only runs with `on_progress` set, and the
+  suite drives it with `on_progress=None`, so that recovery branch is untested.
+  Filed as a deferred issue.
+- Smaller test gaps: medoid lexicographic tiebreaker in `voting.py` and the
+  all-rankers-fail path in `peer_rank.py`. Filed as a deferred issue.
+
+**Consult behaviour seen this cycle.** 6 of 9 panellists TRUNCATED at the decision
+token cap on the standard-tier plan call (claude-sonnet, gpt-pro, gpt, gemini-pro,
+kimi, glm), and the one extra OK responder (qwen-max) returned an empty capsule.
+`run_summary.no_value` flagged all 7, so the #38 surfacing works. This is the same
+truncation-at-cap pattern already tracked around #34/#37, so not re-filing.
+
+---
+
 ## 2026-06-02 — Redact secrets at every boundary, not just the manifest
 
 **Shipped.** The secret-shaped-token redactor (`_redact_secrets` + the key-shape

@@ -7019,6 +7019,175 @@ async def test_refine_breaks_when_next_round_would_exceed_cap(tmp_path, monkeypa
 
 
 @pytest.mark.asyncio
+async def test_refine_refuses_further_rounds_when_pricing_unknown_past_80pct(tmp_path, monkeypatch):
+    """The 80%-of-cap safety valve in `_round_cost_gate` (refine.py:606): when a
+    panellist's pricing is unknown AND spend is already past 80% of the cap,
+    refine refuses the next round rather than risk an unbounded overspend. This
+    branch had no coverage; the only cap test exercises the hard
+    `cumulative + estimate > cap` branch. A flip of `not est_known`, the 0.8
+    threshold, or the `>` comparison would otherwise ship silently. The valve
+    was a FRICTION-pass fix for an asymmetric round-1-proceeds / round-2-refuses
+    surprise on mixed-provider panels, so it guards real behaviour.
+    """
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    fanout_calls: list = []
+
+    async def fake_arbiter(*args, **kwargs):
+        # Sub-threshold so the loop wants another round; zero-cost and known so
+        # round-1 cumulative is exactly the fanout spend.
+        return ArbiterVerdict(round=1, score=0.2, parsed_ok=True, cost_usd=0.0, cost_known=True)
+
+    # The counter encodes the gate's call order: each round's gate estimates
+    # the fanout then the arbiter, so calls 1-2 are round 1's gate and calls 3-4
+    # are round 2's.
+    est_n = {"n": 0}
+
+    async def fake_aestimate(*a, **kw):
+        # Round 1's gate (calls 1-2) is cheap and known, so it proceeds. Round
+        # 2's gate (calls 3-4) returns unknown pricing with a small estimate: the
+        # hard-cap branch must NOT fire (0.82 + 0.10 < 1.0), leaving only the 80%
+        # valve to trip.
+        est_n["n"] += 1
+        return (0.02, True) if est_n["n"] <= 2 else (0.05, False)
+
+    # Round-1 fanout spends 0.82 of the 1.00 cap — past the 80% floor but below
+    # the hard cap. annotate is a noop (adds no extractor cost), so round-1
+    # cumulative is exactly the fanout's 0.82 when round 2's gate runs.
+    monkeypatch.setattr("consult.refine.runner.fanout", _refine_fake_fanout(fanout_calls, cost=0.82))
+    monkeypatch.setattr("consult.refine.capsule.annotate", _refine_noop_annotate)
+    monkeypatch.setattr("consult.refine._ask_arbiter", fake_arbiter)
+    monkeypatch.setattr("consult.refine.synth.synthesise", _refine_fake_synth)
+    monkeypatch.setattr("consult.refine.runner.aestimate_cost", fake_aestimate)
+
+    result = await refine_mod.refine(
+        "q", [ModelSpec(model="claude-haiku")], threshold=0.85, max_rounds=3, max_run_usd=1.0
+    )
+
+    assert len(fanout_calls) == 1  # round 2 refused at the gate, before fanout
+    assert result.rounds_completed == 1
+    assert result.partial is True
+    assert result.partial_reason is not None
+    assert "refusing further rounds" in result.partial_reason
+    assert "80%" in result.partial_reason
+    assert result.final_manifest  # round-1 manifest preserved
+    assert result.synthesis == "final synth"  # synth still runs on the kept round
+    # Lock the precondition the valve fires against: round-1 spend is exactly the
+    # fanout's 0.82 (annotate noop, arbiter and synth zero-cost). A hidden round-1
+    # cost leak would shift the gate's input without changing which branch trips.
+    assert result.cost_usd == pytest.approx(0.82)
+
+
+@pytest.mark.asyncio
+async def test_refine_partial_fanout_rolls_unknown_cost_into_total(tmp_path, monkeypatch):
+    """A partial fanout carrying a non-zero, unknown-priced cost must roll that
+    cost into the result total and drag `cost_known` False (refine.py:830-832),
+    and must short-circuit before the capsule extractor, arbiter, and synth run.
+    The existing partial-fanout test returns cost_usd=0.0/cost_known=True, so the
+    accumulation and the cost_known flip are never exercised with effect. This
+    mirrors test_sequence_partial_fanout_rolls_cost_into_total for refine.
+    """
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+
+    calls = {"fanout": 0, "annotate": 0, "arbiter": 0, "synth": 0}
+
+    async def fake_fanout(prompt, specs, **kwargs):
+        calls["fanout"] += 1
+        paths = kwargs.get("existing_paths") or artifacts.create_run()
+        return RunHandle(
+            run_id=paths.run_id,
+            artifacts_dir=str(paths.root),
+            manifest=[],
+            cost_usd=0.42,
+            cost_known=False,
+            wall_ms=10,
+            partial=True,
+            partial_reason="zero usable panellists (1 returned: TIMEOUT)",
+        )
+
+    async def fake_annotate(handle, **kwargs):
+        calls["annotate"] += 1
+        return handle
+
+    async def fake_arbiter(*args, **kwargs):
+        calls["arbiter"] += 1
+        return ArbiterVerdict(round=1, score=1.0, parsed_ok=True, cost_usd=0.0, cost_known=True)
+
+    async def fake_synth(*args, **kwargs):
+        calls["synth"] += 1
+        from consult import synth as _synth_mod
+
+        return _synth_mod.SynthResult(text="should not be reached")
+
+    async def fake_aestimate(*a, **kw):
+        return (0.001, True)
+
+    monkeypatch.setattr("consult.refine.runner.fanout", fake_fanout)
+    monkeypatch.setattr("consult.refine.capsule.annotate", fake_annotate)
+    monkeypatch.setattr("consult.refine._ask_arbiter", fake_arbiter)
+    monkeypatch.setattr("consult.refine.synth.synthesise", fake_synth)
+    monkeypatch.setattr("consult.refine.runner.aestimate_cost", fake_aestimate)
+
+    result = await refine_mod.refine(
+        "q", [ModelSpec(model="claude-haiku")], threshold=0.85, max_rounds=3, max_run_usd=5.0
+    )
+
+    # The partial round must short-circuit before the arbiter and synth — both
+    # cost flagship $$, and the whole point of breaking on a partial fanout is to
+    # not burn them on a zero-usable panel. annotate (the extractor) is skipped
+    # for the same reason. Asserted individually rather than as one dict so a
+    # future benign call elsewhere doesn't trip a guarantee it isn't part of.
+    assert calls["fanout"] == 1
+    assert calls["annotate"] == 0
+    assert calls["arbiter"] == 0
+    assert calls["synth"] == 0
+    # The partial fanout's cost is not lost — it rolls into the total and drags
+    # cost_known False.
+    assert result.cost_usd == pytest.approx(0.42)
+    assert result.cost_known is False
+    assert result.partial is True
+    assert result.partial_reason and "fanout partial" in result.partial_reason
+    assert result.rounds_completed == 0  # arbiter never appended a verdict
+    assert result.converged is False
+    assert result.synthesis == "(no rounds completed — see partial_reason)"
+
+
+@pytest.mark.asyncio
+async def test_refine_arbiter_unknown_pricing_flips_result_cost_known(tmp_path, monkeypatch):
+    """An arbiter on an unmapped-price model returns cost_usd=None,
+    cost_known=False. refine.py:909-910 must drag the result's cost_known False
+    even though the fanout's own cost was known. This propagation regressed
+    silently once before (see the code's fix-history note at that line). The
+    RefineResult pydantic invariant only fires when propagation is *wrong*; this
+    proves the happy path returns a cost_known=False result rather than raising.
+    """
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    fanout_calls: list = []
+
+    async def fake_arbiter(*args, **kwargs):
+        # Converges immediately so the loop ends after one round; unknown
+        # pricing is the only thing under test.
+        return ArbiterVerdict(round=1, score=0.95, parsed_ok=True, cost_usd=None, cost_known=False)
+
+    async def fake_aestimate(*a, **kw):
+        return (0.001, True)
+
+    monkeypatch.setattr("consult.refine.runner.fanout", _refine_fake_fanout(fanout_calls))
+    monkeypatch.setattr("consult.refine.capsule.annotate", _refine_noop_annotate)
+    monkeypatch.setattr("consult.refine._ask_arbiter", fake_arbiter)
+    monkeypatch.setattr("consult.refine.synth.synthesise", _refine_fake_synth)
+    monkeypatch.setattr("consult.refine.runner.aestimate_cost", fake_aestimate)
+
+    result = await refine_mod.refine("q", [ModelSpec(model="claude-haiku")], threshold=0.85, max_rounds=3)
+
+    assert len(fanout_calls) == 1
+    assert result.converged is True
+    assert result.cost_known is False  # the arbiter's unknown price dragged it False
+    # A None arbiter cost is a zero-addition, not a reset: the fanout's own spend
+    # survives in the total. Guards against a regression that nukes cumulative.
+    assert result.cost_usd == pytest.approx(0.001)
+
+
+@pytest.mark.asyncio
 async def test_fanout_warns_when_cap_set_but_pricing_unknown(tmp_path, monkeypatch, caplog):
     """A cap with unknown panellist pricing can't be enforced (the estimate
     covers only known-priced models). fanout proceeds but warns, so the silent
