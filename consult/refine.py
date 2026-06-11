@@ -713,14 +713,20 @@ async def refine(
         registry.resolve_model(synth_alias)
 
     paths = artifacts.create_run()
-    paths.prompt_txt.write_text(prompt)
-    paths.registry_snapshot.write_text(json.dumps(registry.models_config(), indent=2))
+    # Threaded like fanout's run-init: a continuation prompt embeds the
+    # whole prior consultation and can be large.
+    await asyncio.to_thread(paths.prompt_txt.write_text, prompt)
+    await asyncio.to_thread(
+        paths.registry_snapshot.write_text, json.dumps(registry.models_config(), indent=2)
+    )
     # Per-run context bundle. Refine creates its own run dir then calls
     # `runner.fanout` with `existing_paths=` so we own the bundle write
     # here — runner skips it when given an existing path.
-    context.write(
-        paths,
-        context.build(prompt, blinded=blinded, capsule_kind=resolved_kind),
+    await asyncio.to_thread(
+        lambda: context.write(
+            paths,
+            context.build(prompt, blinded=blinded, capsule_kind=resolved_kind),
+        )
     )
     cap = max_run_usd if max_run_usd is not None else registry.default_max_run_usd()
 
@@ -900,7 +906,7 @@ async def refine(
                 if entry.status not in (Status.OK, Status.TRUNCATED):
                     continue
                 try:
-                    body_text = Path(entry.body_path).read_text()
+                    body_text = await asyncio.to_thread(Path(entry.body_path).read_text)
                 except OSError:
                     # Body file missing — skip this panellist's history
                     # update. The next round will fall back to a fresh

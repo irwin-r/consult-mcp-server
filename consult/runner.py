@@ -1602,18 +1602,25 @@ async def fanout(
     configure_litellm()
     if existing_paths is None:
         paths = artifacts.create_run()
-        paths.prompt_txt.write_text(prompt)
+        # Run-init writes are threaded: the prompt (and its scrubbed copy
+        # in the context bundle) can be megabytes once attachments are
+        # inlined, and these sync writes ran on the event loop.
+        await _write_text_async(paths.prompt_txt, prompt)
         # Snapshot the registry so replays are stable
-        paths.registry_snapshot.write_text(json.dumps(registry.models_config(), indent=2))
+        await _write_text_async(paths.registry_snapshot, json.dumps(registry.models_config(), indent=2))
         # Single immutable per-run context bundle. Downstream stages
         # (synth, capsule, arbiter) load this rather than re-receiving
         # the prompt — keeps the blinding scrub centralised and avoids
         # silent prompt-prompt skew across stages. `capsule_kind` is
         # persisted here so a `continuation_id` can inherit the prior
         # run's shape without the caller having to specify it again.
-        context.write(
-            paths,
-            context.build(prompt, blinded=blinded, capsule_kind=capsule_kind),
+        # build() runs the brand-scrub regex over the whole prompt, so it
+        # goes to the thread too.
+        await asyncio.to_thread(
+            lambda: context.write(
+                paths,
+                context.build(prompt, blinded=blinded, capsule_kind=capsule_kind),
+            )
         )
         # Split inlined attachments out to `paths.attachments/<name>` so
         # (a) the per-panellist trim stub can reference a resolvable
@@ -1622,7 +1629,7 @@ async def fanout(
         # failure leaves the panellist call unaffected — they still see
         # the inlined blocks in the prompt.
         try:
-            attachments_mod.persist_inlined_attachments(paths, prompt)
+            await asyncio.to_thread(attachments_mod.persist_inlined_attachments, paths, prompt)
         except Exception as e:  # noqa: BLE001
             logger.warning("persist_inlined_attachments failed: %s", e)
     else:
