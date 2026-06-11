@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Until 1.0, the capsule schema and tool surface may change in minor releases.
 
+## [0.4.1](https://github.com/irwin-r/consult-mcp-server/compare/v0.4.0...v0.4.1) (2026-06-11)
+
+
+### Bug Fixes
+
+* bound caller-supplied arrays in the MCP schemas ([31899d1](https://github.com/irwin-r/consult-mcp-server/commit/31899d1274556e316ff9e94d8ce178a3c40614c4))
+* clear the open-issue backlog ([f2ec732](https://github.com/irwin-r/consult-mcp-server/commit/f2ec7325be6f7465f62b7c71a76096b9d6f3d2c6))
+* count substantive truncated entries in RunHandle.usable() ([f86eb15](https://github.com/irwin-r/consult-mcp-server/commit/f86eb15a18d5a7f2fdb8c3b4b6930e64b1d34e91))
+* redact secrets on litellm loggers and exception objects ([38b0ee0](https://github.com/irwin-r/consult-mcp-server/commit/38b0ee08050e70f120748a5530f037797c78991e))
+
 ## [0.4.0](https://github.com/irwin-r/consult-mcp-server/compare/v0.3.0...v0.4.0) (2026-06-11)
 
 
