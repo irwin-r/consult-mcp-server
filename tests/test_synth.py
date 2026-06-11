@@ -422,7 +422,66 @@ async def test_synth_persists_cost_to_manifest(tmp_path, monkeypatch):
     assert result.status is synth_mod.SynthStatus.OK
     assert abs(result.cost_usd - 0.05) < 1e-9
 
-    # Manifest on disk now reflects the synth spend + synthesiser badge.
+    # Manifest on disk now carries panel spend + synth spend, not the synth
+    # call alone — a re-synthesis must not erase the panel's cost from the
+    # ledger.
     on_disk = json.loads(paths.manifest_json.read_text())
-    assert abs(on_disk["cost_usd"] - 0.05) < 1e-9
+    assert abs(on_disk["cost_usd"] - 0.055) < 1e-9
     assert "synthesiser" in on_disk
+
+
+@pytest.mark.asyncio
+async def test_synth_resynthesis_accumulates_cost_and_keeps_unknown_flag(tmp_path, monkeypatch):
+    """A re-synthesis adds its spend to the run's recorded total and an
+    unknown-priced run stays unknown, however well-priced the synth call.
+    Regression for the ledger clobber found dogfooding on 2026-06-11: a
+    $1.26 run dropped to $0.09 after one `synthesise(run_id)` call.
+    """
+    from consult import synth as synth_mod
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+
+    paths = artifacts.create_run()
+    entry = ManifestEntry(
+        slug="alpha",
+        model_id="anthropic/x",
+        status=Status.OK,
+        resource_uri=paths.resource_uri("alpha"),
+        body_path=str(paths.response_text("alpha")),
+        latency_ms=10,
+        cost_usd=1.26,
+        cost_known=False,
+    )
+    paths.response_text("alpha").write_text("Some response.")
+    handle = RunHandle(
+        run_id=paths.run_id,
+        artifacts_dir=str(paths.root),
+        manifest=[entry],
+        cost_usd=1.26,
+        cost_known=False,
+        wall_ms=10,
+    )
+    artifacts.write_manifest(paths, handle.model_dump())
+
+    class FakeMsg:
+        content = "synth body"
+
+    class FakeChoice:
+        message = FakeMsg()
+        finish_reason = "stop"
+
+    class FakeResp:
+        choices = [FakeChoice()]
+
+    async def fake_acompletion(**kwargs):
+        return FakeResp()
+
+    monkeypatch.setattr(synth_mod.litellm, "acompletion", fake_acompletion)
+    monkeypatch.setattr(synth_mod.litellm, "completion_cost", lambda **kw: 0.05)
+
+    result = await synth_mod.synthesise(paths.run_id)
+    assert result.status is synth_mod.SynthStatus.OK
+
+    on_disk = json.loads(paths.manifest_json.read_text())
+    assert abs(on_disk["cost_usd"] - 1.31) < 1e-9
+    assert on_disk["cost_known"] is False

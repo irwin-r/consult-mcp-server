@@ -381,15 +381,22 @@ async def synthesise(
     # `synthesise` tool's cost reaches `consult-ledger`. `orchestrate.consult`,
     # `refine`, and `sequence` already roll their cumulative cost into the
     # manifest themselves (they need to combine fanout + capsule + synth);
-    # the direct-synth path was the missing one. Best-effort: a partial
-    # manifest or failed lookup silently no-ops (matches augment_manifest's
-    # contract) so a re-synth of a legacy run doesn't surface a new error.
+    # the direct-synth path was the missing one. The spend ACCUMULATES onto
+    # the run's existing total: a re-synthesis must not clobber the panel's
+    # recorded cost, and an unknown-priced panel stays unknown no matter how
+    # well-priced the synth call is (dogfood find, FRICTION 2026-06-11: a
+    # $1.26 run dropped to $0.09 in the ledger after one re-synth).
+    # Best-effort: a partial manifest or failed lookup silently no-ops
+    # (matches augment_manifest's contract) so a re-synth of a legacy run
+    # doesn't surface a new error.
+    prior_cost = float(manifest_payload.get("cost_usd") or 0.0)
+    prior_known = bool(manifest_payload.get("cost_known", True))
     try:
         await artifacts.aaugment_manifest(
             paths,
             synthesiser=synth_alias,
-            cost_usd=cost_value,
-            cost_known=cost_known,
+            cost_usd=prior_cost + cost_value,
+            cost_known=prior_known and cost_known,
         )
     except Exception as e:  # noqa: BLE001 — augment is best-effort, never load-bearing
         logger.debug("augment_manifest skipped on direct synth: %s", e)
