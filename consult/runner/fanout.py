@@ -111,12 +111,20 @@ async def _call_one(
     # Use `litellm_id` when present, otherwise fall back to the spec's
     # alias for logging/diagnostics so error messages stay attributable.
     litellm_id = entry.get("litellm_id") or spec.model
-    # Output budget is sized by what we're asking for (the capsule_kind),
-    # not by which model is answering. A "review" needs ~8K tokens of
-    # body to enumerate findings regardless of whether haiku or opus is
-    # writing it; previously the per-model default_budget_tokens (4K on
-    # haiku) silently truncated reviews on small models.
-    budget = MAX_TOKENS_BY_KIND.get(capsule_kind, MAX_TOKENS_BY_KIND["decision"])
+    # Output budget: the larger of the per-kind cap (what the TASK needs —
+    # a review must fit ~20-30 findings whether haiku or opus writes it)
+    # and the model's own default_budget_tokens (what the MODEL needs —
+    # reasoning models burn thousands of completion tokens before any text
+    # lands, and verbose flagships stop naturally past the decision cap).
+    # Issue #55: the kind cap alone bound below reasoning burn, so e.g.
+    # gpt-pro spent its whole 2000/4000-token budget thinking and returned
+    # zero text. Same max(model, floor) idiom as the synthesiser
+    # (synth.py / orchestrate.py); estimate_cost mirrors it so the
+    # max_run_usd gate prices the same ceiling actually granted here.
+    budget = max(
+        MAX_TOKENS_BY_KIND.get(capsule_kind, MAX_TOKENS_BY_KIND["decision"]),
+        entry.get("default_budget_tokens", 0),
+    )
     timeout = entry.get("default_timeout_s", 180)
     provider = entry.get("provider", "")
     # mode=responses models (e.g. gpt-pro, gpt-codex) use the OpenAI Responses
@@ -726,6 +734,20 @@ async def fanout(
         # portion; the actual run could cost more. Surface that so the cap
         # message isn't misleading low. Mirrors the dry_run branch below.
         suffix = "" if all_known else " (known-priced portion only; some unknown)"
+        # Name the panellists driving the estimate so the rejection is
+        # actionable (raise the cap, or drop the named models) rather than
+        # a bare number. Best-effort: enrichment must never turn a clean
+        # rejection into a crash.
+        drivers_note = ""
+        try:
+            drivers = await asyncio.to_thread(
+                _facade.estimate_drivers, specs, cost_input, capsule_kind=capsule_kind
+            )
+            if drivers:
+                named = ", ".join(f"{m} ~${c:.2f}" for m, c in drivers)
+                drivers_note = f"; top estimate drivers: {named}"
+        except Exception as e:  # noqa: BLE001
+            logger.debug("estimate_drivers enrichment failed: %s", e)
         handle = RunHandle(
             run_id=paths.run_id,
             artifacts_dir=str(paths.root),
@@ -734,7 +756,7 @@ async def fanout(
             cost_known=all_known,
             wall_ms=0,
             partial=True,
-            partial_reason=(f"estimated cost ${estimate:.2f}{suffix} exceeds cap ${cap:.2f}"),
+            partial_reason=(f"estimated cost ${estimate:.2f}{suffix} exceeds cap ${cap:.2f}{drivers_note}"),
             blinded=blinded,
         )
         _persist_partial_handle(handle)

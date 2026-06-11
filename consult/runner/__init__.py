@@ -24,7 +24,7 @@ import litellm  # noqa: F401 — tests patch `consult.runner.litellm.<fn>` direc
 
 from ..progress import ProgressCallback  # noqa: F401
 from ..status import classify  # noqa: F401
-from .costs import aestimate_cost, estimate_cost  # noqa: F401
+from .costs import aestimate_cost, estimate_cost, estimate_drivers  # noqa: F401
 from .fanout import (  # noqa: F401
     _call_one,
     _dropout_entry,
