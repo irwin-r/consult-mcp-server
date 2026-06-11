@@ -173,8 +173,8 @@ async def handle_list_tools() -> list[Tool]:
         Tool(
             name="sequence",
             description=(
-                "Run an ordered list of prompts where each step's synthesis is prepended "
-                "as context for the next step. "
+                "Run an ordered list of prompts where every prior step's synthesis is "
+                "prepended as context for the next step. "
                 "Use when: a question is too large for a single prompt (decompose → "
                 "per-subquestion → meta-synth), or for plan-then-execute workflows where "
                 "step N depends on step N-1's conclusion. "

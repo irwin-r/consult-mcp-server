@@ -113,6 +113,16 @@ PANEL_SCHEMA = {
                 "review. 'research' = claims/evidence/uncertainties for research."
             ),
         },
+        "peer_rank": {
+            "type": "boolean",
+            "default": False,
+            "description": (
+                "After the panel, have each panellist rank the others' "
+                "anonymised answers; Borda-count aggregate lands in the "
+                "result as `peer_ranking`. Costs roughly one extra call "
+                "per panellist."
+            ),
+        },
     },
 }
 
@@ -244,8 +254,9 @@ SEQUENCE_SCHEMA = {
             "description": (
                 "Ordered list of prompts. Each entry is either a string (uses "
                 "the top-level `attachments`) or an object `{prompt, attachments?}` "
-                "with per-step attachments. Each step's synthesis is prepended to "
-                "the next step's prompt as 'prior synthesis' context."
+                "with per-step attachments. Every prior step's synthesis is "
+                "prepended to each subsequent step's prompt as 'prior synthesis' "
+                "context."
             ),
         },
         "models": {
@@ -338,6 +349,11 @@ def consult_schema() -> dict[str, Any]:
             },
             "blinded": {"type": "boolean", "default": False},
             "max_run_usd": {"type": "number"},
+            "dry_run": {
+                "type": "boolean",
+                "default": False,
+                "description": "Estimate the panel cost without calling any model.",
+            },
             "gate_synth_at_agreement": {
                 "type": "number",
                 "minimum": 0.0,

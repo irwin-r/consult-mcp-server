@@ -165,7 +165,6 @@ _STATUS_TONE = {
     "RATE_LIMITED": "warn",
     "TIMEOUT": "warn",
     "ERROR": "err",
-    "SKIPPED": "muted",
 }
 
 
@@ -581,9 +580,8 @@ def _cite_pill(
     anchor_slug: str | None = None,
 ) -> str:
     """Render a single slug as a coloured citation pill — brand badge +
-    humanised model name + optional `rN` round chip. Shared between
-    `_decorate_citations` (for synthesis/arbiter prose) and the capsule
-    block's agrees_with/disagrees_with rows.
+    humanised model name + optional `rN` round chip. Used by
+    `_decorate_citations` for synthesis/arbiter prose.
 
     `anchor_slug` overrides the href/round-chip when the cited slug is a
     bare alias (e.g. `claude-haiku-2`) and we want the pill to jump to the
@@ -1483,21 +1481,13 @@ def _section_arbiters(
     """
 
 
-def _capsule_block(
-    capsule: dict | None,
-    slug_to_model: dict[str, str | None],
-    bare_resolution: dict[str, str] | None = None,
-) -> str:
+def _capsule_block(capsule: dict | None) -> str:
     """Render the structured capsule fields with visual hierarchy:
 
     - position is the headline (no label, larger weight)
     - recommendation gets an accent-tinted callout
     - key_points / unique_claims / caveats are labelled bullet lists, with
       caveats tinted warn so hedges read as hedges at a glance
-    - agrees_with / disagrees_with are rendered as cite pills since they
-      reference panellist slugs — the same pill the synthesis decorator
-      uses, so the inter-panellist relationships read consistently
-      regardless of where they show up in the page.
     """
     if not capsule:
         return ""
@@ -1533,22 +1523,6 @@ def _capsule_block(
     parts.append(_list_section("Key points", capsule.get("key_points") or []))
     parts.append(_list_section("Unique claims", capsule.get("unique_claims") or [], "unique"))
     parts.append(_list_section("Caveats", capsule.get("caveats") or [], "caveat"))
-
-    resolution = bare_resolution or {}
-
-    def _cite_row(label: str, slugs: list[str], variant: str) -> str:
-        if not slugs:
-            return ""
-        pills = " ".join(_cite_pill(s, slug_to_model.get(s), resolution.get(s)) for s in slugs)
-        return (
-            f'<div class="cap-cites cap-cites-{variant}">'
-            f'<span class="cap-list-label">{html.escape(label)}</span>'
-            f"{pills}"
-            f"</div>"
-        )
-
-    parts.append(_cite_row("Agrees with", capsule.get("agrees_with") or [], "agree"))
-    parts.append(_cite_row("Disagrees with", capsule.get("disagrees_with") or [], "disagree"))
 
     body = "".join(p for p in parts if p)
     if not body:
@@ -1593,7 +1567,7 @@ def _panellist_card(
 
     err_block = f'<div class="error-msg">{html.escape(error)}</div>' if error else ""
     note_block = f'<div class="note-msg">{html.escape(note)}</div>' if note else ""
-    cap_block = _capsule_block(capsule, slug_to_model, bare_resolution)
+    cap_block = _capsule_block(capsule)
     recon_tag = (
         '<span class="recon-badge" title="Reconstructed from on-disk artifacts '
         "(refine's manifest.json only carries the final round)\">reconstructed</span>"

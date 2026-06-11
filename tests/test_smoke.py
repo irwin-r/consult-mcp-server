@@ -1683,7 +1683,7 @@ def test_sequence_step_prompt_threads_prior_synth():
     p1 = _step_prompt(1, 3, None, "What is X?")
     assert p1 == "What is X?"  # first step: no prior context
 
-    p2 = _step_prompt(2, 3, "X is foo.", "Given X is foo, what about Y?")
+    p2 = _step_prompt(2, 3, ["X is foo."], "Given X is foo, what about Y?")
     assert "Step 1 of 3 — prior synthesis" in p2
     assert "X is foo." in p2
     assert "Step 2 of 3 prompt" in p2

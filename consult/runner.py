@@ -713,8 +713,6 @@ async def _fit_prompt_to_context(
     user/assistant boundary the model relies on. If they alone exceed the
     budget the caller should re-prompt without continuation.
     """
-    from . import context
-
     prior_text = concat_turn_text(prior_turns) if prior_turns else ""
     target_input = max_input_tokens - max_output_tokens
     if target_input <= 0:
@@ -1320,13 +1318,15 @@ def estimate_cost(
             # Match _call_one: estimate output by capsule_kind, not per-model
             # default. Keeps the cap-check honest after the dimension flip.
             tout = MAX_TOKENS_BY_KIND.get(capsule_kind, MAX_TOKENS_BY_KIND["decision"])
-            in_per_tok, out_per_tok = litellm.cost_per_token(
+            # cost_per_token returns the TOTAL prompt/completion cost for
+            # the given token counts, not per-token rates.
+            prompt_cost, completion_cost = litellm.cost_per_token(
                 model=litellm_id, prompt_tokens=tin, completion_tokens=tout
             )
-            if in_per_tok is None or out_per_tok is None:
+            if prompt_cost is None or completion_cost is None:
                 all_known = False
                 continue
-            total += in_per_tok + out_per_tok
+            total += prompt_cost + completion_cost
         except Exception as e:  # noqa: BLE001
             logger.warning("estimate_cost: no price for %s (%s)", litellm_id, redact_exc(e))
             all_known = False
@@ -1703,16 +1703,17 @@ async def fanout(
             estimate,
         )
 
-    # Build slugs + prompts
-    slugs = _make_slugs(specs, blinded)
+    # Build slugs + prompts. (`panel_slugs`, not `slugs` — that would
+    # shadow the `slugs` module imported at the top of this file.)
+    panel_slugs = _make_slugs(specs, blinded)
     # Duplicate slugs ⇒ multiple panellists racing to write to the same
     # `responses/<slug>.txt`; the second writer silently overwrites the
     # first. `expand_specs` fixes the model:N case but a caller passing
     # two literal `{slug: "foo"}` specs falls through. Fail fast here
     # before the artifact dance starts.
-    if len(set(slugs)) != len(slugs):
+    if len(set(panel_slugs)) != len(panel_slugs):
         seen: dict[str, int] = {}
-        for s in slugs:
+        for s in panel_slugs:
             seen[s] = seen.get(s, 0) + 1
         dupes = sorted(slug for slug, n in seen.items() if n > 1)
         raise ValueError(
@@ -1746,7 +1747,7 @@ async def fanout(
     total = len(specs)
     # Live counters shared by `_run_one`, the heartbeat, and the gatherer.
     # Single event loop, so atomicity between awaits is enough; no lock.
-    state = _PanelProgress(total=total, pending_slugs=set(slugs))
+    state = _PanelProgress(total=total, pending_slugs=set(panel_slugs))
 
     async def _safe_notify(event: ProgressEvent) -> None:
         """Wrapper that swallows callback exceptions. Progress is best-effort:
@@ -1873,7 +1874,7 @@ async def fanout(
         manifest = await _gather_with_tail_dropout(
             run_one=_run_one,
             specs=specs,
-            panel_slugs=slugs,
+            panel_slugs=panel_slugs,
             per_prompts=per_prompts,
             state=state,
             paths=paths,

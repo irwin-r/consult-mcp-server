@@ -1,10 +1,14 @@
 """Sequential multi-step consultation.
 
 Runs an ordered list of prompts where each step is a full
-fanout → capsule → synth cycle, and step N's synthesis is prepended as
-context for step N+1. Each step gets its own run_id; the SequenceResult
-collects them all with the final synth (= last step's synth) exposed
-directly for callers that don't need per-step detail.
+fanout → capsule → synth cycle, and EVERY prior step's synthesis is
+prepended as context for step N+1. (Only the immediately-prior synthesis
+used to be threaded, so a final "synthesise across the prior steps"
+prompt silently saw one step; the per-call context fit still trims if a
+long chain outgrows a model's window.) Each step gets its own run_id;
+the SequenceResult collects them all with the final synth (= last
+step's synth) exposed directly for callers that don't need per-step
+detail.
 
 Stops early on cost-cap violation; returns a partial SequenceResult so
 the caller can see how far the chain got.
@@ -66,14 +70,16 @@ class SequenceResult(StrictModel):
         return self
 
 
-def _step_prompt(step_num: int, total: int, prior_synth: str | None, body: str) -> str:
-    if prior_synth is None:
+def _step_prompt(step_num: int, total: int, prior_syntheses: list[str] | None, body: str) -> str:
+    """Assemble step N's prompt with every prior step's synthesis ahead of it."""
+    if not prior_syntheses:
         return body
-    return (
-        f"## Step {step_num - 1} of {total} — prior synthesis\n\n"
-        f"{prior_synth}\n\n---\n\n"
-        f"## Step {step_num} of {total} prompt\n\n{body}"
-    )
+    sections = [
+        f"## Step {i} of {total} — prior synthesis\n\n{synth_text}"
+        for i, synth_text in enumerate(prior_syntheses, start=1)
+    ]
+    sections.append(f"## Step {step_num} of {total} prompt\n\n{body}")
+    return "\n\n---\n\n".join(sections)
 
 
 async def sequence(
@@ -87,7 +93,7 @@ async def sequence(
     rubric: str | None = None,
     on_progress: runner.ProgressCallback | None = None,
 ) -> SequenceResult:
-    """Run `prompts` as a chain where step i sees step i-1's synthesis."""
+    """Run `prompts` as a chain where step i sees every prior step's synthesis."""
     if not prompts:
         raise ValueError("sequence requires at least one prompt")
     if not specs:
@@ -108,7 +114,7 @@ async def sequence(
     steps: list[SequenceStep] = []
     meter = CostMeter()
     partial_reason: str | None = None
-    prior_synth: str | None = None
+    prior_syntheses: list[str] = []
     total = len(prompts)
 
     # Bucketed progress: roughly 2N+1 ticks per step (fanout panellists +
@@ -130,7 +136,7 @@ async def sequence(
 
     for i, body in enumerate(prompts, start=1):
         step_base = (i - 1) * (panel_n * 2 + 1)
-        full_prompt = _step_prompt(i, total, prior_synth, body)
+        full_prompt = _step_prompt(i, total, prior_syntheses, body)
 
         estimate, est_known = await runner.aestimate_cost(
             specs,
@@ -250,7 +256,7 @@ async def sequence(
                 step=i,
             )
         )
-        prior_synth = synth_result.text
+        prior_syntheses.append(synth_result.text)
 
     wall_ms = int((time.time() - start) * 1000)
     final = steps[-1].synthesis if steps else "(no steps completed — see partial_reason)"

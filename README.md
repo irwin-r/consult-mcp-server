@@ -116,7 +116,7 @@ your shell rc will be visible.
 ```sh
 docker run -i --rm \
   -e ANTHROPIC_API_KEY -e OPENAI_API_KEY -e GEMINI_API_KEY -e OPENROUTER_API_KEY \
-  -v ~/.consult:/root/.consult \
+  -v ~/.consult:/home/consult/.consult \
   ghcr.io/irwin-r/consult-mcp-server:latest
 ```
 

@@ -36,15 +36,12 @@ Extract a structured capsule. Return EXACTLY a JSON object with these keys:
   "key_points": ["...", "...", "..."],
   "unique_claims": ["claims this panellist made that others might not"],
   "caveats": ["assumptions or conditions the recommendation depends on"],
-  "agrees_with": [],
-  "disagrees_with": [],
   "confidence": 0.0
 }
 
 Rules:
 - key_points: 2-5 entries, each ≤ 20 words
 - unique_claims and caveats: 0-3 entries each
-- agrees_with / disagrees_with: leave empty here (filled later by the orchestrator)
 - confidence: parse from a "CONFIDENCE:" line in the body if present, else null
 - Output JSON only, no commentary, no markdown fences.
 

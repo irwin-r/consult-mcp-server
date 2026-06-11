@@ -185,8 +185,48 @@ async def panel(args: dict[str, Any], *, on_progress: ProgressCallback | None = 
     if args.get("extract_capsules", True) and not handle.partial and handle.manifest:
         handle = await capsule.annotate(handle, on_progress=on_progress, kind=kind)
     result = handle.model_dump()
+    if args.get("peer_rank", False) and not handle.partial and handle.manifest:
+        await _attach_peer_ranking(result, handle, question=args["prompt"])
     # Dry runs have no artifacts to render or summarise.
     return result if args.get("dry_run", False) else await _augment_result(result)
+
+
+async def _attach_peer_ranking(result: dict[str, Any], handle: Any, *, question: str) -> None:
+    """Run the opt-in llm-council peer-rank pass and attach it to the result.
+
+    Mutates `result` in place: adds `peer_ranking` (Borda ranks plus the
+    per-ranker forensics) and rolls the ranking calls' spend into
+    `cost_usd`/`cost_known`, on disk too so the ledger sees the true run
+    total. Best-effort: a ranking failure logs and leaves the panel
+    result untouched — the user paid for the panel, not the side-car.
+    """
+    import asyncio as _asyncio
+
+    from .. import artifacts, peer_rank
+    from ..types import Status
+
+    try:
+        paths = artifacts.load_run(handle.run_id)
+        usable = [m for m in handle.manifest if m.status in (Status.OK, Status.TRUNCATED)]
+        body_texts = await _asyncio.gather(
+            *(_asyncio.to_thread(paths.response_text(m.slug).read_text) for m in usable)
+        )
+        bodies = {m.slug: text for m, text in zip(usable, body_texts, strict=True)}
+        ranking = await peer_rank.peer_rank_run(handle.manifest, bodies, question=question)
+        result["peer_ranking"] = {
+            "ranks": [[slug, points] for slug, points in ranking.ranks],
+            "per_ranker": [
+                [ranker, [[pos, slug] for pos, slug in pairs]] for ranker, pairs in ranking.per_ranker
+            ],
+        }
+        result["cost_usd"] = float(result.get("cost_usd") or 0.0) + ranking.cost_usd
+        if not ranking.cost_known:
+            result["cost_known"] = False
+        await artifacts.aaugment_manifest(
+            paths, cost_usd=result["cost_usd"], cost_known=result.get("cost_known", True)
+        )
+    except Exception as e:  # noqa: BLE001 — side-car must not sink the panel
+        logger.warning("peer_rank pass failed for run %s: %s", result.get("run_id"), e)
 
 
 async def synthesise(args: dict[str, Any], *, on_progress: ProgressCallback | None = None) -> str:
@@ -231,10 +271,13 @@ async def consult(args: dict[str, Any], *, on_progress: ProgressCallback | None 
         capsule_kind=args.get("capsule_kind", "decision"),
         rubric=args.get("rubric"),
         attachments=args.get("attachments"),
+        dry_run=args.get("dry_run", False),
         gate_synth_at_agreement=args.get("gate_synth_at_agreement"),
         on_progress=on_progress,
     )
-    return await _augment_result(result.model_dump())
+    payload = result.model_dump()
+    # Dry runs have no artifacts to render or summarise (parity with panel).
+    return payload if args.get("dry_run", False) else await _augment_result(payload)
 
 
 async def sequence(args: dict[str, Any], *, on_progress: ProgressCallback | None = None) -> dict[str, Any]:

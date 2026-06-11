@@ -25,8 +25,13 @@ COPY --from=build /usr/local/lib/python3.12/site-packages /usr/local/lib/python3
 # Glob keeps this correct as scripts are added or renamed in pyproject.toml.
 COPY --from=build /usr/local/bin/consult-* /usr/local/bin/
 
-# Run directory: per-run artifacts land under /root/.consult/runs/. Mount a
-# host volume here if you want runs to survive container restarts.
-VOLUME ["/root/.consult"]
+# Drop root: the server needs nothing privileged — it talks stdio and
+# writes run artifacts under its own home.
+RUN useradd --create-home --uid 1000 consult
+USER consult
+
+# Run directory: per-run artifacts land under /home/consult/.consult/runs/.
+# Mount a host volume here if you want runs to survive container restarts.
+VOLUME ["/home/consult/.consult"]
 
 ENTRYPOINT ["consult-mcp"]
