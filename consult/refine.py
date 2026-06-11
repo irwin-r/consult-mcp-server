@@ -117,6 +117,15 @@ Notes:
 - The engine derives the overall sufficiency score from your dimensions (normalised average). Do NOT output an overall score yourself.
 """
 
+# Appended to the arbiter prompt on the single parse-failure retry. Issue
+# #53: round 1 of run 20260611-043229 died on a non-JSON verdict with no
+# second chance, aborting the loop at score 0.0.
+_ARBITER_RETRY_NUDGE = (
+    "\n\nIMPORTANT: your previous reply could not be parsed as JSON. "
+    "Return ONLY the JSON object specified above — no prose, no markdown "
+    "fences, no commentary before or after it."
+)
+
 _REFINEMENT_PROMPT_TEMPLATE = """\
 This is round {round_num} of a multi-round consultation. \
 You are refining your answer based on the prior round.
@@ -345,59 +354,117 @@ async def _ask_arbiter(
         health_breakdown=health_breakdown,
     )
 
-    # 1) Call — exception here means we never got text back.
-    # `temperature` is only set on providers that accept it. claude-opus-4-7
-    # and Gemini both reject the kwarg; falling back to the provider default
-    # is fine for an arbiter call that's just producing a JSON verdict.
-    call_kwargs: dict[str, Any] = {
-        "model": litellm_id,
-        "messages": [{"role": "user", "content": prompt}],
-        "max_completion_tokens": 2000,
-    }
-    provider_caps.apply_temperature(call_kwargs, litellm_id, 0.0)
-    try:
-        resp = cast(
-            Any,
-            await asyncio.wait_for(
-                litellm.acompletion(**call_kwargs),
-                timeout=timeout,
-            ),
-        )
-    except Exception as e:
-        scrub_exception_attrs(e)
-        logger.warning("arbiter call failed: %s", redact_exc(e))
+    # Output budget gets the same per-model floor as panellist calls
+    # (issue #55): the default arbiter is a thinking model whose reasoning
+    # burn inside a flat 2000-token cap can cut the verdict JSON
+    # mid-stream — the likely mechanism behind 043229's json_parse_failed.
+    budget = max(2000, entry.get("default_budget_tokens", 0))
+
+    # Cost accrues across BOTH attempts when the parse-failure retry fires;
+    # the provider bills the first call whether or not we could parse it.
+    cost: float | None = None
+    cost_known = True
+
+    async def _attempt(attempt_prompt: str) -> tuple[dict[str, Any] | None, str | None]:
+        """One arbiter call. Returns (parsed_json, error_label).
+
+        (None, label) covers both a failed call and unparseable text;
+        the caller decides whether a retry is worth it. Cost accounting
+        happens here so every billed attempt is counted.
+        """
+        nonlocal cost, cost_known
+        # `temperature` is only set on providers that accept it.
+        # claude-opus-4-7 and Gemini both reject the kwarg; falling back to
+        # the provider default is fine for a JSON-verdict call.
+        # `response_format: json_object` asks for native JSON mode where
+        # the provider supports it (OpenAI, Gemini via responseMimeType);
+        # litellm.drop_params clears it elsewhere. JSON mode rather than a
+        # full schema because the dimensions map doesn't survive every
+        # provider's schema subset, and a schema rejection would fail the
+        # whole call — worse than the parse failure it prevents.
+        call_kwargs: dict[str, Any] = {
+            "model": litellm_id,
+            "messages": [{"role": "user", "content": attempt_prompt}],
+            "max_completion_tokens": budget,
+            "response_format": {"type": "json_object"},
+        }
+        provider_caps.apply_temperature(call_kwargs, litellm_id, 0.0)
+        try:
+            resp = cast(
+                Any,
+                await asyncio.wait_for(
+                    litellm.acompletion(**call_kwargs),
+                    timeout=timeout,
+                ),
+            )
+        except Exception as e:
+            scrub_exception_attrs(e)
+            logger.warning("arbiter call failed: %s", redact_exc(e))
+            cost_known = False  # the provider may have billed a partial call
+            return None, redact_exc(e, limit=150)
+
+        try:
+            c = litellm.completion_cost(completion_response=resp)
+        except Exception as e:
+            logger.warning("arbiter cost lookup failed: %s", redact_exc(e))
+            c = None
+        if c is None:
+            cost_known = False
+        else:
+            cost = (cost or 0.0) + c
+
+        text = resp.choices[0].message.content or ""
+        data = extract_json(text)
+        if data is None:
+            logger.warning("arbiter returned non-JSON; sample=%r", text[:120].replace("\n", " "))
+            return None, "json_parse_failed"
+        return data, None
+
+    def _scoreable(data: dict[str, Any]) -> bool:
+        """True when the payload carries something the derivation below can
+        turn into a score: at least one numeric dimension, or a v1 `score`
+        in [0,1]."""
+        dims = data.get("dimensions")
+        if isinstance(dims, dict):
+            for v in dims.values():
+                try:
+                    float(v)
+                    return True
+                except (TypeError, ValueError):
+                    continue
+        try:
+            return 0.0 <= float(data.get("score", "")) <= 1.0
+        except (TypeError, ValueError):
+            return False
+
+    # 1) First attempt, then one retry on any parse failure (issue #53).
+    # A call exception on the first attempt is terminal as before — that's
+    # a transport problem, not a formatting one, and the runner-level
+    # retry semantics don't belong here.
+    data, err = await _attempt(prompt)
+    if err is not None and err != "json_parse_failed":
         return ArbiterVerdict(
             round=round_num,
             score=0.0,
             gaps=[],
             reasoning="arbiter call failed; refine must abort or retry",
-            cost_usd=None,
-            cost_known=False,
+            cost_usd=cost,
+            cost_known=cost_known,
             parsed_ok=False,
-            error=redact_exc(e, limit=150),
+            error=err,
         )
-
-    text = resp.choices[0].message.content or ""
-
-    # 2) Cost — independent of parsing
-    try:
-        cost = litellm.completion_cost(completion_response=resp)
-        cost_known = cost is not None
-    except Exception as e:
-        logger.warning("arbiter cost lookup failed: %s", redact_exc(e))
-        cost = None
-        cost_known = False
-
-    # 3) JSON parse — failure here is real signal (don't pollute gaps with an
-    # exception string; the next round's prompt would silently include it)
-    data = extract_json(text)
+    if data is None or not _scoreable(data):
+        retry_data, _retry_err = await _attempt(prompt + _ARBITER_RETRY_NUDGE)
+        if retry_data is not None and _scoreable(retry_data):
+            data = retry_data
+        elif data is None:
+            data = retry_data  # an unscoreable parse still beats nothing
     if data is None:
-        logger.warning("arbiter returned non-JSON; sample=%r", text[:120].replace("\n", " "))
         return ArbiterVerdict(
             round=round_num,
             score=0.0,
             gaps=[],
-            reasoning="arbiter returned non-JSON output",
+            reasoning="arbiter returned non-JSON output (retried once)",
             cost_usd=cost,
             cost_known=cost_known,
             parsed_ok=False,
@@ -432,9 +499,13 @@ async def _ask_arbiter(
     if dimensions_normalised:
         score = sum(dimensions_normalised.values()) / len(dimensions_normalised)
     else:
-        # v1 fallback: legacy `score` 0..1
+        # v1 fallback: legacy `score` 0..1. A MISSING score is a parse
+        # failure, not a free 0.0 — a verdict with neither numeric
+        # dimensions nor a score carries no signal, and treating it as a
+        # valid zero made refine spend another round on a broken arbiter
+        # (float("") raises so the except path below reports it).
         try:
-            score = float(data.get("score", 0.0))
+            score = float(data.get("score", ""))
             if not 0.0 <= score <= 1.0:
                 raise ValueError(f"out of range: {score}")
         except (TypeError, ValueError) as e:
