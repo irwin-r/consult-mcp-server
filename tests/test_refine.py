@@ -1756,3 +1756,148 @@ async def test_refine_arbiter_unknown_pricing_flips_result_cost_known(tmp_path, 
     # A None arbiter cost is a zero-addition, not a reset: the fanout's own spend
     # survives in the total. Guards against a regression that nukes cumulative.
     assert result.cost_usd == pytest.approx(0.001)
+
+
+# --- issue #53: arbiter hardening (budget floor, JSON mode, parse retry) -----
+
+
+def _arbiter_resp(text):
+    class _Choice:
+        def __init__(self, t):
+            self.message = type("M", (), {"content": t})()
+
+    class _Resp:
+        choices = [_Choice(text)]
+
+    return _Resp()
+
+
+_VALID_ARBITER_JSON = json.dumps(
+    {
+        "dimensions": {"coverage": 4, "agreement": 4, "depth": 4, "calibration": 4, "actionability": 4},
+        "dimension_notes": {},
+        "gaps": [],
+        "next_round_focus": "f",
+        "reasoning": "fine",
+    }
+)
+
+
+def test_arbiter_budget_floors_at_model_budget_and_requests_json_mode(monkeypatch):
+    """The arbiter call gets the same per-model budget floor as panellists
+    (a thinking arbiter at a flat 2000 cap can cut its own JSON mid-stream)
+    and asks for native JSON mode where the provider supports it."""
+    import asyncio
+
+    from consult.refine import _ask_arbiter
+
+    captured: dict = {}
+
+    async def fake_acompletion(**kw):
+        captured.update(kw)
+        return _arbiter_resp(_VALID_ARBITER_JSON)
+
+    monkeypatch.setattr("consult.refine.litellm.acompletion", fake_acompletion)
+    monkeypatch.setattr("consult.refine.litellm.completion_cost", lambda completion_response=None: 0.001)
+
+    verdict = asyncio.run(_ask_arbiter("Q?", round_num=1, manifest=[], arbiter_alias="gemini-pro"))
+    assert verdict.parsed_ok is True
+    assert captured["max_completion_tokens"] == 16000  # gemini-pro default_budget_tokens
+    assert captured["response_format"] == {"type": "json_object"}
+
+
+def test_arbiter_retries_once_on_non_json_and_sums_cost(monkeypatch):
+    """A non-JSON first verdict gets exactly one re-ask with the corrective
+    nudge; the recovered verdict parses and BOTH calls are billed. Run
+    20260611-043229 died here with no second chance."""
+    import asyncio
+
+    from consult.refine import _ask_arbiter
+
+    calls = {"n": 0, "prompts": []}
+
+    async def fake_acompletion(**kw):
+        calls["n"] += 1
+        calls["prompts"].append(kw["messages"][0]["content"])
+        if calls["n"] == 1:
+            return _arbiter_resp("I think the panel did quite well overall, no JSON for you.")
+        return _arbiter_resp(_VALID_ARBITER_JSON)
+
+    monkeypatch.setattr("consult.refine.litellm.acompletion", fake_acompletion)
+    monkeypatch.setattr("consult.refine.litellm.completion_cost", lambda completion_response=None: 0.001)
+
+    verdict = asyncio.run(_ask_arbiter("Q?", round_num=1, manifest=[], arbiter_alias="claude-haiku"))
+    assert calls["n"] == 2
+    assert "could not be parsed" in calls["prompts"][1]
+    assert verdict.parsed_ok is True
+    assert verdict.score == pytest.approx(0.75)
+    assert verdict.cost_usd == pytest.approx(0.002)  # both attempts billed
+
+
+def test_arbiter_double_parse_failure_aborts_with_both_costs(monkeypatch):
+    """Two unparseable replies keep the existing abort semantics (score 0.0,
+    json_parse_failed) while still accounting for both billed calls."""
+    import asyncio
+
+    from consult.refine import _ask_arbiter
+
+    calls = {"n": 0}
+
+    async def fake_acompletion(**kw):
+        calls["n"] += 1
+        return _arbiter_resp("still chatting, still not JSON")
+
+    monkeypatch.setattr("consult.refine.litellm.acompletion", fake_acompletion)
+    monkeypatch.setattr("consult.refine.litellm.completion_cost", lambda completion_response=None: 0.001)
+
+    verdict = asyncio.run(_ask_arbiter("Q?", round_num=1, manifest=[], arbiter_alias="claude-haiku"))
+    assert calls["n"] == 2
+    assert verdict.parsed_ok is False
+    assert verdict.error == "json_parse_failed"
+    assert verdict.score == 0.0
+    assert verdict.cost_usd == pytest.approx(0.002)
+
+
+def test_arbiter_call_exception_does_not_retry(monkeypatch):
+    """A transport-level failure on the first attempt stays terminal — the
+    parse retry is for formatting, not for outages."""
+    import asyncio
+
+    from consult.refine import _ask_arbiter
+
+    calls = {"n": 0}
+
+    async def fake_acompletion(**kw):
+        calls["n"] += 1
+        raise RuntimeError("socket exploded")
+
+    monkeypatch.setattr("consult.refine.litellm.acompletion", fake_acompletion)
+
+    verdict = asyncio.run(_ask_arbiter("Q?", round_num=1, manifest=[], arbiter_alias="claude-haiku"))
+    assert calls["n"] == 1
+    assert verdict.parsed_ok is False
+    assert verdict.score == 0.0
+    assert verdict.cost_known is False
+
+
+def test_arbiter_unscoreable_json_retries_then_reports_no_score(monkeypatch):
+    """Valid JSON with neither numeric dimensions nor a score triggers the
+    retry; if the retry is no better, the no_dimensions_or_score path
+    reports parse failure rather than inventing a verdict."""
+    import asyncio
+
+    from consult.refine import _ask_arbiter
+
+    calls = {"n": 0}
+
+    async def fake_acompletion(**kw):
+        calls["n"] += 1
+        return _arbiter_resp('{"dimensions": {"coverage": "great"}, "reasoning": "vibes"}')
+
+    monkeypatch.setattr("consult.refine.litellm.acompletion", fake_acompletion)
+    monkeypatch.setattr("consult.refine.litellm.completion_cost", lambda completion_response=None: 0.001)
+
+    verdict = asyncio.run(_ask_arbiter("Q?", round_num=1, manifest=[], arbiter_alias="claude-haiku"))
+    assert calls["n"] == 2
+    assert verdict.parsed_ok is False
+    assert verdict.score == 0.0

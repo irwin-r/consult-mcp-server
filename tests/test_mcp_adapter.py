@@ -525,3 +525,71 @@ def test_capsule_is_empty_defensive_inputs():
     assert _capsule_is_empty({"kind": "future", "position": "y"}) is False
     # Missing kind defaults to decision.
     assert _capsule_is_empty({"position": "y"}) is False
+
+
+# --- issue #55: cost_per_usable_capsule in run_summary -----------------------
+
+
+def test_summary_cost_per_usable_capsule():
+    """With cost_usd given, the summary prices each usable capsule: total run
+    cost (synth and extractor included) over non-dud panellists."""
+    from consult.mcp.handlers import _summarise_manifest
+
+    good = {"kind": "decision", "position": "yes", "recommendation": "do", "key_points": ["x"]}
+    empty = {"kind": "decision", "position": "", "recommendation": "", "key_points": []}
+    summary = _summarise_manifest(
+        [
+            _entry("a", "OK", good),
+            _entry("b", "OK", dict(good)),
+            _entry("c", "TRUNCATED", empty, finish_reason="length"),
+        ],
+        cost_usd=0.30,
+    )
+    assert summary["usable_capsules"] == 2
+    assert summary["cost_per_usable_capsule"] == pytest.approx(0.15)
+
+
+def test_summary_cost_metric_none_when_no_usable_capsules():
+    """An all-dud run has no usable capsule to price — the metric is None,
+    not a division crash."""
+    from consult.mcp.handlers import _summarise_manifest
+
+    summary = _summarise_manifest(
+        [_entry("a", "TIMEOUT", None, error="timed out")],
+        cost_usd=0.50,
+    )
+    assert summary["usable_capsules"] == 0
+    assert summary["cost_per_usable_capsule"] is None
+
+
+def test_summary_without_cost_omits_metric_but_counts_usable():
+    """Callers that don't pass cost_usd (direct _summarise_manifest use) get
+    no cost metric, but usable_capsules is always present."""
+    from consult.mcp.handlers import _summarise_manifest
+
+    good = {"kind": "decision", "position": "yes", "recommendation": "do", "key_points": ["x"]}
+    summary = _summarise_manifest([_entry("a", "OK", good)])
+    assert summary["usable_capsules"] == 1
+    assert "cost_per_usable_capsule" not in summary
+
+
+@pytest.mark.asyncio
+async def test_augment_result_summarises_refine_final_manifest():
+    """Refine results carry final_manifest, not manifest; the rollup must
+    still appear so a dud panellist is visible without digging run dirs."""
+    from consult.mcp.handlers import _augment_result
+
+    good = {"kind": "decision", "position": "yes", "recommendation": "do", "key_points": ["x"]}
+    result = await _augment_result(
+        {
+            "run_id": "nonexistent-run-for-render",
+            "cost_usd": 0.2,
+            "final_manifest": [
+                _entry("a", "OK", good),
+                _entry("b", "TIMEOUT", None, error="timed out"),
+            ],
+        }
+    )
+    assert result["run_summary"]["usable_capsules"] == 1
+    assert result["run_summary"]["cost_per_usable_capsule"] == pytest.approx(0.2)
+    assert result["run_summary"]["no_value"][0]["slug"] == "b"

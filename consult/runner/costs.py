@@ -82,9 +82,14 @@ def estimate_cost(
             continue
         try:
             tin = litellm.token_counter(model=litellm_id, text=prompt)
-            # Match _call_one: estimate output by capsule_kind, not per-model
-            # default. Keeps the cap-check honest after the dimension flip.
-            tout = MAX_TOKENS_BY_KIND.get(capsule_kind, MAX_TOKENS_BY_KIND["decision"])
+            # Match _call_one: the granted budget is max(kind cap, the
+            # model's default_budget_tokens), so the estimate prices that
+            # same ceiling. Conservative by design — the gate must hold
+            # even if the model fills its whole budget.
+            tout = max(
+                MAX_TOKENS_BY_KIND.get(capsule_kind, MAX_TOKENS_BY_KIND["decision"]),
+                entry.get("default_budget_tokens", 0),
+            )
             # cost_per_token returns the TOTAL prompt/completion cost for
             # the given token counts, not per-token rates.
             prompt_cost, completion_cost = litellm.cost_per_token(
@@ -99,3 +104,45 @@ def estimate_cost(
             all_known = False
             continue
     return total, all_known
+
+
+def estimate_drivers(
+    specs: list[ModelSpec],
+    prompt: str,
+    *,
+    capsule_kind: str = "decision",
+    top_n: int = 3,
+) -> list[tuple[str, float]]:
+    """Per-spec cost estimates, highest first, for the over-cap message.
+
+    With per-model output budgets, one expensive flagship can dominate the
+    panel estimate; a bare "estimated cost exceeds cap" rejection gives the
+    caller nothing to act on. Naming the drivers turns the block into a
+    choice: raise the cap, or drop/replace the named models.
+
+    Only known-priced specs appear (an unpriced spec can't drive the
+    estimate the gate sees). Best-effort: any per-spec failure just omits
+    that spec.
+    """
+    per_spec: list[tuple[str, float]] = []
+    for spec in specs:
+        try:
+            entry = registry.resolve_model(spec.model)
+            litellm_id = entry.get("litellm_id")
+            if not litellm_id or entry.get("provider") == "cli":
+                continue
+            tin = litellm.token_counter(model=litellm_id, text=prompt)
+            tout = max(
+                MAX_TOKENS_BY_KIND.get(capsule_kind, MAX_TOKENS_BY_KIND["decision"]),
+                entry.get("default_budget_tokens", 0),
+            )
+            prompt_cost, completion_cost = litellm.cost_per_token(
+                model=litellm_id, prompt_tokens=tin, completion_tokens=tout
+            )
+            if prompt_cost is None or completion_cost is None:
+                continue
+            per_spec.append((spec.model, prompt_cost + completion_cost))
+        except Exception:  # noqa: BLE001 — message enrichment only
+            continue
+    per_spec.sort(key=lambda kv: kv[1], reverse=True)
+    return per_spec[:top_n]

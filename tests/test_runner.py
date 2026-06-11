@@ -1364,3 +1364,178 @@ async def test_dropout_cancel_recovers_completed_entry_with_on_progress(tmp_path
     completions = [e for e in events if isinstance(e, PanellistCompleted) and e.slug == "m-3"]
     assert len(completions) == 2  # the eaten emit plus the recovery re-emit
     assert completions[-1].status == "OK"
+
+
+# --- issue #55: reasoning-aware per-model output budgets ---------------------
+#
+# The per-kind cap alone bound below what reasoning models burn before any
+# text lands (gpt-pro filled 2000 AND 4000-token budgets with pure reasoning
+# on the 2026-06-11 probes). The granted budget is now max(kind cap,
+# model default_budget_tokens), and estimate_cost prices the same ceiling.
+
+
+@pytest.mark.asyncio
+async def test_call_one_budget_uses_model_floor_for_reasoning_models(tmp_path, monkeypatch):
+    """A model whose default_budget_tokens exceeds the kind cap gets its own
+    budget: kimi (12000) on a decision panel must not be capped at 2000."""
+    import litellm
+
+    from consult.runner import _call_one
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    paths = artifacts.create_run()
+    captured: dict = {}
+
+    async def fake_acompletion(**kwargs):
+        captured.update(kwargs)
+
+        class _Resp:
+            choices = [
+                type(
+                    "C",
+                    (),
+                    {
+                        "message": type("M", (), {"content": "fine answer"})(),
+                        "finish_reason": "stop",
+                    },
+                )()
+            ]
+            usage = None
+
+            def model_dump(self):
+                return {}
+
+        return _Resp()
+
+    monkeypatch.setattr(litellm, "acompletion", fake_acompletion)
+    monkeypatch.setattr(litellm, "completion_cost", lambda completion_response: 0.0)
+
+    entry = await _call_one(ModelSpec(model="kimi"), "kimi", "q", paths, capsule_kind="decision")
+    assert entry.status is Status.OK
+    assert captured["max_completion_tokens"] == 12000  # model floor, not the 2000 kind cap
+
+
+@pytest.mark.asyncio
+async def test_call_one_budget_keeps_kind_floor_for_small_models(tmp_path, monkeypatch):
+    """The kind cap still wins when it is the larger side: claude-haiku
+    (default_budget_tokens 4000) on a review panel keeps the 16000 review
+    floor — the FRICTION #16 fix must not regress."""
+    import litellm
+
+    from consult.runner import _call_one
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    paths = artifacts.create_run()
+    captured: dict = {}
+
+    async def fake_acompletion(**kwargs):
+        captured.update(kwargs)
+
+        class _Resp:
+            choices = [
+                type(
+                    "C",
+                    (),
+                    {
+                        "message": type("M", (), {"content": "LGTM"})(),
+                        "finish_reason": "stop",
+                    },
+                )()
+            ]
+            usage = None
+
+            def model_dump(self):
+                return {}
+
+        return _Resp()
+
+    monkeypatch.setattr(litellm, "acompletion", fake_acompletion)
+    monkeypatch.setattr(litellm, "completion_cost", lambda completion_response: 0.0)
+
+    await _call_one(ModelSpec(model="claude-haiku"), "haiku", "q", paths, capsule_kind="review")
+    assert captured["max_completion_tokens"] == 16000
+
+
+def test_estimate_cost_prices_the_model_floor(monkeypatch):
+    """estimate_cost must price the same ceiling _call_one grants — a
+    12000-budget model on a decision panel is estimated at 12000 output
+    tokens, keeping the max_run_usd gate conservative and consistent."""
+    import litellm
+
+    seen: dict = {}
+
+    monkeypatch.setattr(litellm, "token_counter", lambda model, text: 100)
+
+    def fake_cost_per_token(model, prompt_tokens, completion_tokens):
+        seen[model] = completion_tokens
+        return (0.0001, 0.0002)
+
+    monkeypatch.setattr(litellm, "cost_per_token", fake_cost_per_token)
+    total, all_known = estimate_cost([ModelSpec(model="kimi")], "q", capsule_kind="decision")
+    assert all_known is True
+    assert seen["openrouter/moonshotai/kimi-k2.6"] == 12000
+
+
+def test_estimate_drivers_sorts_and_skips_unpriced(monkeypatch):
+    """estimate_drivers returns known-priced specs, highest estimate first,
+    omitting models whose pricing lookup fails."""
+    import litellm
+
+    from consult.runner import estimate_drivers
+
+    monkeypatch.setattr(litellm, "token_counter", lambda model, text: 100)
+
+    def fake_cost_per_token(model, prompt_tokens, completion_tokens):
+        if "kimi" in model:
+            raise ValueError("no price")
+        if "haiku" in model:
+            return (0.001, 0.002)
+        return (0.01, 0.05)  # claude-opus: the big driver
+
+    monkeypatch.setattr(litellm, "cost_per_token", fake_cost_per_token)
+    drivers = estimate_drivers(
+        [ModelSpec(model="claude-haiku"), ModelSpec(model="kimi"), ModelSpec(model="claude-opus")],
+        "q",
+    )
+    assert [m for m, _ in drivers] == ["claude-opus", "claude-haiku"]
+    assert drivers[0][1] == pytest.approx(0.06)
+
+
+@pytest.mark.asyncio
+async def test_fanout_cost_cap_message_names_estimate_drivers(monkeypatch):
+    """The over-cap rejection names the panellists driving the estimate so
+    the caller can act (raise the cap or drop the named models) instead of
+    staring at a bare number."""
+    from consult import runner
+    from consult.runner import fanout
+
+    monkeypatch.setattr(runner, "estimate_cost", lambda *a, **kw: (3.10, True))
+    monkeypatch.setattr(
+        runner,
+        "estimate_drivers",
+        lambda *a, **kw: [("gpt-pro", 1.44), ("claude-opus", 0.61)],
+    )
+    handle = await fanout("p", [ModelSpec(model="claude-haiku")], max_run_usd=1.0)
+    assert handle.partial is True
+    assert handle.partial_reason is not None
+    assert "top estimate drivers: gpt-pro ~$1.44, claude-opus ~$0.61" in handle.partial_reason
+
+
+@pytest.mark.asyncio
+async def test_fanout_cost_cap_survives_driver_enrichment_failure(monkeypatch):
+    """Driver naming is best-effort message enrichment: when it raises, the
+    clean rejection must still come back."""
+    from consult import runner
+    from consult.runner import fanout
+
+    monkeypatch.setattr(runner, "estimate_cost", lambda *a, **kw: (3.10, True))
+
+    def boom(*a, **kw):
+        raise RuntimeError("enrichment broke")
+
+    monkeypatch.setattr(runner, "estimate_drivers", boom)
+    handle = await fanout("p", [ModelSpec(model="claude-haiku")], max_run_usd=1.0)
+    assert handle.partial is True
+    assert handle.partial_reason is not None
+    assert "exceeds cap" in handle.partial_reason
+    assert "drivers" not in handle.partial_reason

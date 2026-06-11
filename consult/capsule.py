@@ -192,13 +192,34 @@ def _body_confidence(body: str) -> float | None:
 
 
 def _body_has_findings(body: str) -> bool:
-    # Gate for the empty-findings retry: only re-ask when the body is substantial
-    # and looks like it enumerates issues, so we don't burn a retry on a model
-    # that genuinely abstained or returned a short non-answer.
+    # Gate for the empty-extraction retry: only re-ask when the body is substantial
+    # and looks like it carries extractable structure, so we don't burn a retry on
+    # a model that genuinely abstained or returned a short non-answer.
     if len(body.strip()) < 300:
         return False
     low = body.lower()
     return any(m in low for m in ("severity", "finding", "fix:", "issue", "\n- ", "\n1.", "\n* ", "\n#"))
+
+
+def _capsule_lacks_content(capsule: AnyCapsule, kind: str) -> bool:
+    """True when the capsule carries nothing a synthesiser could use.
+
+    Kind-aware, mirroring the `no_value` check in mcp/handlers: review
+    substance is findings, research substance is claims/evidence, decision
+    substance is position/recommendation/key_points. The old retry gate
+    checked `findings` for research too — a field ResearchCapsule doesn't
+    have — so the retry fired on every substantial research body and its
+    result was never adopted (one wasted extractor call per panellist).
+    """
+    if kind == "review":
+        return not getattr(capsule, "findings", None)
+    if kind == "research":
+        return not getattr(capsule, "claims", None) and not getattr(capsule, "evidence", None)
+    return (
+        not getattr(capsule, "position", "").strip()
+        and not getattr(capsule, "recommendation", "").strip()
+        and not getattr(capsule, "key_points", None)
+    )
 
 
 async def _extract_one(
@@ -287,11 +308,14 @@ async def _extract_one(
             )
             capsule = capsule_cls()
 
-    # 2b) Retry once when the extractor returned an empty findings list on a
-    # body that clearly enumerates findings. The cheap extractor occasionally
-    # emits a verdict + confidence but zero findings (a stochastic miss — seen
-    # with well-formatted grok/llama review bodies); a single sharper re-ask
-    # usually recovers them. Only fires for the finding-bearing kinds.
+    # 2b) Retry once when the extractor returned a content-free capsule from a
+    # body that clearly carries structure. The cheap extractor occasionally
+    # emits a verdict + confidence but no substance (a stochastic miss — seen
+    # with well-formatted grok/llama review bodies, and with claude-opus /
+    # gpt-codex decision bodies on the 2026-06-11 design panel); a single
+    # sharper re-ask usually recovers it. Kind-aware on both the fire and
+    # adopt sides — the old `findings` check fired for every research body
+    # and could never adopt the result (ResearchCapsule has no findings).
     # `billed_responses` accrues every extractor call we actually made so the
     # cost lookup below prices all of them. The retry call is billed by the
     # provider whether or not we end up adopting its capsule, so it must be
@@ -299,14 +323,14 @@ async def _extract_one(
     # first call's cost.
     billed_responses = [resp]
 
-    if kind in ("review", "research") and not getattr(capsule, "findings", None) and _body_has_findings(body):
+    if _capsule_lacks_content(capsule, kind) and _body_has_findings(body):
         retry_kwargs = dict(kwargs)
         retry_kwargs["messages"] = [
             {
                 "role": "user",
                 "content": prompt + "\n\nIMPORTANT: the panellist response above DOES "
-                "contain findings. Enumerate every one as a separate object — "
-                "returning an empty findings list is incorrect.",
+                "contain extractable content. Populate the substantive fields — "
+                "returning them empty is incorrect.",
             }
         ]
         try:
@@ -322,11 +346,11 @@ async def _extract_one(
             retry_capsule = capsule_cls(
                 **{k: v for k, v in retry_data.items() if k in capsule_cls.model_fields}
             )
-            if getattr(retry_capsule, "findings", None):
+            if not _capsule_lacks_content(retry_capsule, kind):
                 capsule = retry_capsule
         except Exception as e:
             logger.warning(
-                "capsule empty-findings retry failed for extractor=%s: %s",
+                "capsule empty-extraction retry failed for extractor=%s: %s",
                 extractor_id,
                 redact_exc(e),
             )

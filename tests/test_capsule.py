@@ -369,3 +369,136 @@ async def test_capsule_retry_counts_both_extractor_calls_cost(monkeypatch):
     assert [f.summary for f in capsule.findings] == ["real bug"]  # retry capsule adopted
     assert cost_known is True
     assert cost == pytest.approx(0.002)  # both calls counted, not just the retry
+
+
+# --- issue #55: kind-aware empty-extraction retry ----------------------------
+#
+# The retry gate used to check `findings` for review AND research — a field
+# ResearchCapsule doesn't have — so the retry fired on every substantial
+# research body and its result could never be adopted (one wasted extractor
+# call per research panellist). Decision kind had no retry at all, so a
+# stochastic extractor miss (seen live: OK claude-opus/gpt-codex bodies,
+# empty capsules, run 20260611-053100-32268) became a no_value dud.
+
+
+def _fake_resp_factory(contents: list[str], calls: dict):
+    """An acompletion fake that returns `contents[n]` on the n-th call."""
+
+    async def fake_acompletion(**kwargs):
+        idx = min(calls["n"], len(contents) - 1)
+        calls["n"] += 1
+        content = contents[idx]
+
+        class _Resp:
+            choices = [type("C", (), {"message": type("M", (), {"content": content})()})()]
+
+            def model_dump(self):
+                return {}
+
+        return _Resp()
+
+    return fake_acompletion
+
+
+@pytest.mark.asyncio
+async def test_research_capsule_with_claims_does_not_retry(monkeypatch):
+    """Regression: a research extraction that already carries claims must be
+    a single extractor call. The old `findings`-keyed gate re-asked every
+    time and threw the answer away."""
+    import litellm
+
+    from consult import capsule as capsule_mod
+
+    body = "Claims:\n1. Strong claim here.\n- evidence item " + ("Evidence and reasoning follow. " * 20)
+    calls = {"n": 0}
+    monkeypatch.setattr(
+        litellm,
+        "acompletion",
+        _fake_resp_factory(['{"kind":"research","claims":["x"],"evidence":["y"]}'], calls),
+    )
+    monkeypatch.setattr(litellm, "completion_cost", lambda completion_response: 0.001)
+
+    capsule, cost, _ = await capsule_mod._extract_one(body, "anthropic/claude-haiku-4-5", 30, kind="research")
+    assert calls["n"] == 1  # no second call
+    assert capsule.claims == ["x"]
+    assert cost == pytest.approx(0.001)
+
+
+@pytest.mark.asyncio
+async def test_research_empty_capsule_retry_fires_and_adopts(monkeypatch):
+    """When the first research extraction is content-free, the re-ask fires
+    and its claims-bearing capsule is adopted — the old gate could fire but
+    never adopt for research."""
+    import litellm
+
+    from consult import capsule as capsule_mod
+
+    body = "Claims:\n1. Strong claim here.\n- evidence item " + ("Evidence and reasoning follow. " * 20)
+    calls = {"n": 0}
+    monkeypatch.setattr(
+        litellm,
+        "acompletion",
+        _fake_resp_factory(
+            [
+                '{"kind":"research","claims":[],"evidence":[]}',
+                '{"kind":"research","claims":["recovered"],"evidence":["source"]}',
+            ],
+            calls,
+        ),
+    )
+    monkeypatch.setattr(litellm, "completion_cost", lambda completion_response: 0.001)
+
+    capsule, cost, _ = await capsule_mod._extract_one(body, "anthropic/claude-haiku-4-5", 30, kind="research")
+    assert calls["n"] == 2
+    assert capsule.claims == ["recovered"]
+    assert cost == pytest.approx(0.002)  # both calls billed
+
+
+@pytest.mark.asyncio
+async def test_decision_empty_capsule_retry_fires_and_adopts(monkeypatch):
+    """Decision kind now gets the same stochastic-miss recovery as review:
+    an empty position/recommendation/key_points capsule from a substantial
+    body triggers one sharper re-ask."""
+    import litellm
+
+    from consult import capsule as capsule_mod
+
+    body = "Recommendation: ship it.\n- reason one\n- reason two " + ("More reasoning. " * 20)
+    calls = {"n": 0}
+    monkeypatch.setattr(
+        litellm,
+        "acompletion",
+        _fake_resp_factory(
+            [
+                '{"kind":"decision","position":"","recommendation":"","key_points":[]}',
+                '{"kind":"decision","position":"ship","recommendation":"merge","key_points":["ok"]}',
+            ],
+            calls,
+        ),
+    )
+    monkeypatch.setattr(litellm, "completion_cost", lambda completion_response: 0.001)
+
+    capsule, cost, _ = await capsule_mod._extract_one(body, "anthropic/claude-haiku-4-5", 30, kind="decision")
+    assert calls["n"] == 2
+    assert capsule.position == "ship"
+    assert cost == pytest.approx(0.002)
+
+
+@pytest.mark.asyncio
+async def test_decision_short_body_does_not_retry(monkeypatch):
+    """A short body (model genuinely abstained) must not burn a retry even
+    when the capsule is empty."""
+    import litellm
+
+    from consult import capsule as capsule_mod
+
+    calls = {"n": 0}
+    monkeypatch.setattr(
+        litellm,
+        "acompletion",
+        _fake_resp_factory(['{"kind":"decision","position":"","recommendation":""}'], calls),
+    )
+    monkeypatch.setattr(litellm, "completion_cost", lambda completion_response: 0.001)
+
+    await capsule_mod._extract_one("No comment.", "anthropic/claude-haiku-4-5", 30, kind="decision")
+    assert calls["n"] == 1

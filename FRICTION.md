@@ -217,3 +217,47 @@ refine (blinded, stances), sequence (3 steps, per-step attachments), panel
   this very session ran 271s and 493s tool calls in Claude Code without
   incident. Only 1 of 14 deep panellists had web access. Good calibration
   case for the research tier and for weighting web-grounded panellists.
+
+## 2026-06-11 — issue #55 fix pass (5 runs, ~$2.4 known spend)
+
+Shipped the truncation-economics fix with live before/after probes
+(baselines 052420/052638, design check 053100, after-fix 054539/054753).
+
+- [bug] **Research-kind extractor retry could never adopt its result**.
+  The empty-extraction retry gate checked `findings` for research bodies,
+  a field ResearchCapsule does not have, so the re-ask fired on every
+  substantial research body and the recovered capsule was discarded
+  unconditionally. One wasted haiku call per research panellist since the
+  retry shipped. Found by code-reading during #55; fixed in this PR with
+  a kind-aware substance check on both the fire and adopt sides.
+- [meta] **The design-check panel demonstrated the bug class it was
+  convened to fix**. Run 053100 (code tier) returned two no_value entries
+  on OK bodies: the extractor stochastically missed claude-opus and
+  gpt-codex decision capsules, and decision kind had no retry. The same
+  PR extends the retry to decision capsules.
+- [env] **OpenAI quota died mid-session and split by model class**.
+  gpt-5.5-pro and gpt-5.5 both returned "exceeded your current quota" on
+  the P1 rerun at 05:45; gpt-5.5 recovered by the P2 rerun two minutes
+  later while gpt-5.5-pro stayed blocked through a direct bounded probe.
+  The baselines' own gpt-pro burn (about a dollar across two probes for
+  zero usable text) plausibly drained the shared key. Consequence: the
+  worst truncation offender could not be validated live; the fix's claim
+  for gpt-pro rests on budget arithmetic (8000 floor vs observed 4000
+  full-reasoning burn) plus the validated rescue of gpt-5.5, kimi, glm.
+- [env] **gpt-5.5-pro rejects reasoning_effort=low**: the API answers
+  400 with "Supported values are: 'medium', 'high', and 'xhigh'". Fix
+  variant (d) from the design debate was dead on arrival for the one
+  model it targeted, and nothing in the registry validates per-model
+  effort values against the live API. Worth folding into #57's
+  registry-canary scope.
+- [meta] **Weighting now tracks substance, not cap luck**. Baseline P1
+  synthesis: "Responses glm, gpt-pro, and kimi were heavily down-weighted
+  due to being TRUNCATED". After-fix P1: zero truncations, kimi authors
+  the minority report it previously could not enter, and the only
+  down-weight is grok for low confidence and brevity.
+- [meta] **Arbiter hardening validated live** (run 20260611-055844-23863,
+  3-model panel, 2 rounds, $0.11). Both verdicts parsed first try through
+  the gemini-pro thinking arbiter at its new 16000 budget with JSON mode
+  (scores 0.60 then 0.95, converged). The same run exposed that refine
+  results carried no run_summary at all — the rollup keyed on `manifest`
+  while refine returns `final_manifest`. Fixed in this PR.
