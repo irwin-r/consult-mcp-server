@@ -83,6 +83,12 @@ journal and add its cost to your running spend tally.
 ### 4. Build
 - Branch first: `feat/si-<slug>` or `fix/si-<slug>`. Never commit to `main`.
 - Write the change and its tests together. Match the style around it.
+- Tests live in per-module files (`tests/test_runner.py`, `tests/test_refine.py`,
+  `tests/test_mcp_server.py`, ...). Add new tests to the file that matches the
+  module under test; create a new per-module file if none fits. NEVER append to
+  a catch-all file or create one — the old 7,400-line test_smoke.py grew one
+  appended "iteration" section at a time, and that monolith is exactly what the
+  per-module split removed. Shared builders belong in `tests/smoke_helpers.py`.
 - Conventional-commit messages, subject under 72 characters, imperative mood.
 - Run the full suite, `ruff check`, and `ruff format` before committing.
 
