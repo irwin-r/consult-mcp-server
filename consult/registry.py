@@ -21,6 +21,8 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+from .exceptions import UnknownModelError
+
 _PKG_CONFIG = Path(__file__).parent / "config"
 _USER_CONFIG = Path(os.path.expanduser("~/.consult"))
 
@@ -70,8 +72,9 @@ def resolve_model(alias_or_id: str) -> dict[str, Any]:
     """Look up by registry alias first, then accept a raw LiteLLM ID.
 
     Returns a dict with at least {alias, litellm_id, default_budget_tokens,
-    default_timeout_s, provider}. Raises KeyError if neither matches and the
-    string doesn't look like a LiteLLM ID.
+    default_timeout_s, provider}. Raises `UnknownModelError` (a `KeyError`
+    subclass, so legacy `except KeyError` sites still catch it) if neither
+    matches and the string doesn't look like a LiteLLM ID.
     """
     cfg = models_config()
     models = cfg["models"]
@@ -88,7 +91,7 @@ def resolve_model(alias_or_id: str) -> dict[str, Any]:
             "default_timeout_s": 180,
             "provider": _infer_provider(alias_or_id),
         }
-    raise KeyError(f"Unknown model: {alias_or_id}")
+    raise UnknownModelError(f"Unknown model: {alias_or_id}")
 
 
 def _infer_provider(litellm_id: str) -> str:
@@ -117,7 +120,7 @@ def resolve_tier(tier: str) -> list[str]:
     cfg = models_config()
     tiers = cfg.get("tiers", {})
     if tier not in tiers:
-        raise KeyError(f"Unknown tier: {tier}. Available: {list(tiers)}")
+        raise UnknownModelError(f"Unknown tier: {tier}. Available: {list(tiers)}")
     return list(tiers[tier])
 
 

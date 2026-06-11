@@ -40,7 +40,12 @@ class ErrorCode(StrEnum):
     """Catch-all for unexpected exceptions. Implies a bug in this server."""
 
 
-class ConsultError(BaseModel):
+class ErrorDetail(BaseModel):
+    """Wire-shape error payload. Named to avoid colliding with the engine's
+    `consult.ConsultError` exception type, which is a different thing (this
+    is the JSON the client sees; that is what library callers catch).
+    """
+
     code: ErrorCode
     message: str
     run_id: str | None = Field(
@@ -59,7 +64,7 @@ class ErrorEnvelope(BaseModel):
     """
 
     ok: bool = Field(False, description="Always False on this type")
-    error: ConsultError
+    error: ErrorDetail
 
 
 def envelope(code: ErrorCode, message: str, run_id: str | None = None) -> dict:
@@ -72,5 +77,5 @@ def envelope(code: ErrorCode, message: str, run_id: str | None = None) -> dict:
     without parsing the text body.
     """
     return ErrorEnvelope(
-        error=ConsultError(code=code, message=message, run_id=run_id),
+        error=ErrorDetail(code=code, message=message, run_id=run_id),
     ).model_dump()

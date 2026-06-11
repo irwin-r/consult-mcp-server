@@ -796,10 +796,10 @@ def test_error_envelope_shape_round_trips():
     """The structured-error envelope must round-trip through JSON with the
     exact shape agents pattern-match against. Locks in the wire contract.
     """
-    from consult.mcp.errors import ConsultError, ErrorCode, ErrorEnvelope
+    from consult.mcp.errors import ErrorCode, ErrorDetail, ErrorEnvelope
 
     env = ErrorEnvelope(
-        error=ConsultError(
+        error=ErrorDetail(
             code=ErrorCode.INVALID_INPUT,
             message="continuation_id not found: bogus",
             run_id=None,
@@ -817,7 +817,7 @@ def test_error_envelope_shape_round_trips():
 
     # run_id-carrying variant for mid-failure partial runs
     env2 = ErrorEnvelope(
-        error=ConsultError(
+        error=ErrorDetail(
             code=ErrorCode.INTERNAL_ERROR,
             message="boom",
             run_id="20260520-010203-1234",

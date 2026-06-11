@@ -37,6 +37,8 @@ import shutil
 import subprocess
 from pathlib import Path
 
+from .exceptions import PathTrustError
+
 logger = logging.getLogger(__name__)
 
 # Allows `~` and `^` for relative refs like `HEAD~1` / `HEAD^`. Neither is
@@ -89,7 +91,8 @@ def validate_under_trusted_roots(path: str | Path, *, strict: bool = False) -> P
       access via its own tools; refusing to read files the agent
       explicitly attached is friction without much added security.
 
-    Raises `ValueError` on containment failure or missing/unreadable path.
+    Raises `PathTrustError` (a `ValueError` subclass) on containment
+    failure, `ValueError` on a missing/unreadable path.
     """
     p = Path(path).expanduser()
     try:
@@ -109,7 +112,7 @@ def validate_under_trusted_roots(path: str | Path, *, strict: bool = False) -> P
             continue
         if common == str(trusted):
             return resolved
-    raise ValueError(
+    raise PathTrustError(
         f"path {str(path)!r} is not under any CONSULT_TRUSTED_REPO_ROOTS entry "
         f"(trusted: {[str(p) for p in roots]})"
     )
