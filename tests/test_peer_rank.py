@@ -224,3 +224,46 @@ async def test_peer_rank_filters_failed_panellists(monkeypatch):
     # Only a and b appear (c was filtered)
     slugs_in_result = {s for s, _ in result.ranks}
     assert slugs_in_result == {"a", "b"}
+
+
+@pytest.mark.asyncio
+async def test_peer_rank_all_rankers_fail_returns_zeroed_ranking(monkeypatch):
+    """(issue #44) Every ranker returning garbage must yield a zero-point
+    Borda board with empty per-ranker contributions, not an exception."""
+    from types import SimpleNamespace
+
+    from consult import peer_rank
+    from consult.types import Capsule, ManifestEntry, Status
+
+    async def garbage(*a, **kw):
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content="definitely not json"),
+                    finish_reason="stop",
+                )
+            ]
+        )
+
+    monkeypatch.setattr(peer_rank.litellm, "acompletion", garbage)
+    monkeypatch.setattr(peer_rank.litellm, "completion_cost", lambda **kw: 0.001)
+
+    def entry(slug):
+        return ManifestEntry(
+            slug=slug,
+            model_id=f"x/{slug}",
+            status=Status.OK,
+            resource_uri=f"consult://x/{slug}",
+            body_path=f"/x/{slug}",
+            capsule=Capsule(position=f"{slug} position"),
+        )
+
+    ranking = await peer_rank.peer_rank_run(
+        [entry("a-0"), entry("b-1")],
+        {"a-0": "body a", "b-1": "body b"},
+        question="q",
+    )
+    assert ranking.ranks == [("a-0", 0), ("b-1", 0)]
+    assert all(pairs == [] for _ranker, pairs in ranking.per_ranker)
+    assert ranking.cost_usd == pytest.approx(0.002)
+    assert ranking.cost_known is True

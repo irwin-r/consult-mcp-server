@@ -150,3 +150,22 @@ def test_eviction_bounds_no_ttl_records(monkeypatch):
     assert oldest.task_id not in ids
     assert worker.task_id in ids
     assert newest.task_id in ids
+
+
+def test_complete_does_not_resurrect_cancelled_task():
+    """(issue #33) A cancel can land while the background coroutine is past
+    its last await; the late complete() must not flip the record back."""
+    rec = task_store.create()
+    task_store.cancel(rec.task_id)
+    task_store.complete(rec.task_id, {"late": True})
+    assert rec.status == task_store.STATUS_CANCELLED
+    assert rec.result is None
+
+
+def test_fail_does_not_overwrite_completed_task():
+    """(issue #33) Same terminal guard for the failure callback."""
+    rec = task_store.create()
+    task_store.complete(rec.task_id, {"ok": True})
+    task_store.fail(rec.task_id, "late failure")
+    assert rec.status == task_store.STATUS_COMPLETED
+    assert rec.error is None
