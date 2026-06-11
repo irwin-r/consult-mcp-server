@@ -17,6 +17,7 @@ import json
 import logging
 import random
 import time
+from pathlib import Path
 from typing import Any
 
 import litellm
@@ -459,18 +460,43 @@ async def _ask_arbiter(
     )
 
 
-def _suffix_specs(specs: list[ModelSpec], round_num: int) -> list[ModelSpec]:
-    """Suffix slugs with `.r<n>` so each round writes to distinct artifact files
-    within the same run directory.
+def _assign_stable_slugs(specs: list[ModelSpec]) -> list[ModelSpec]:
+    """Give every spec a unique slug derived from its ORIGINAL panel index.
+
+    Refine identity must be stable across rounds: artifact slugs, the
+    per-panellist conversation history, and the elimination strategy's
+    worst-spec mapping all key on it. The old per-round enumeration in
+    `_suffix_specs` re-indexed whatever subset the strategy returned, so
+    a dropped panellist shifted every later panellist's identity — the
+    elimination strategy then removed the wrong model from round 3 on,
+    and shifted panellists silently lost their conversation history.
+
+    Model-derived bases are sanitised: a raw LiteLLM ID like
+    `openrouter/meta-llama/llama-3.1-8b:free` would otherwise carry the
+    `:` into the slug and trip ModelSpec's safe-id field validator.
     """
     out = []
     for i, s in enumerate(specs):
-        # Sanitise model-derived bases — a raw LiteLLM ID like
-        # `openrouter/meta-llama/llama-3.1-8b:free` would otherwise carry
-        # the `:` straight into the slug and trip ModelSpec's safe-id
-        # field validator. User-supplied slugs are already constrained.
         base = s.slug or runner.sanitise_derived_slug(s.model.split("/")[-1].lower())
-        out.append(ModelSpec(model=s.model, stance=s.stance, slug=f"{base}-{i}.r{round_num}"))
+        out.append(ModelSpec(model=s.model, stance=s.stance, slug=f"{base}-{i}"))
+    return out
+
+
+def _suffix_specs(specs: list[ModelSpec], round_num: int) -> list[ModelSpec]:
+    """Suffix slugs with `.r<n>` so each round writes to distinct artifact files
+    within the same run directory.
+
+    Specs that already carry a slug (refine pre-assigns stable unique ones
+    via `_assign_stable_slugs`) keep it as the base, so identity stays
+    constant across rounds even when a strategy shrinks the panel.
+    Slug-less specs (direct library callers) fall back to the legacy
+    `<derived>-<i>` enumeration, which is positional and only stable for
+    a panel that never shrinks.
+    """
+    out = []
+    for i, s in enumerate(specs):
+        base = s.slug or f"{runner.sanitise_derived_slug(s.model.split('/')[-1].lower())}-{i}"
+        out.append(ModelSpec(model=s.model, stance=s.stance, slug=f"{base}.r{round_num}"))
     return out
 
 
@@ -664,8 +690,12 @@ async def refine(
     followup_only = prompt
     prompt, prior_turns = _apply_continuation(prompt, continuation_id)
     # Resolve `model:N` sugar here too so `estimate_cost` (called before
-    # `fanout` in each round) sees the real expanded panel.
+    # `fanout` in each round) sees the real expanded panel. Then pin each
+    # spec's identity to its original index — rounds, history, and the
+    # elimination strategy all key on the slug, and a per-round re-index
+    # would shift identities whenever a strategy shrinks the panel.
     specs = runner.expand_specs(specs)
+    specs = _assign_stable_slugs(specs)
     arbiter_alias = arbiter or registry.default_synthesiser()
     synth_alias = synthesiser or arbiter_alias
     # Fail fast on a typo'd arbiter/synthesiser alias BEFORE we spend on
@@ -726,13 +756,14 @@ async def refine(
     round_prompt = followup_only if prior_turns else prompt
     prior_manifest: list[ManifestEntry] | None = None
 
-    # Per-panellist conversation history across rounds. Keyed by *base*
-    # slug (the part before `.r<n>`) so a panellist's slug-suffixed
-    # round-N spec maps to its base's accumulated history. Round 1's
-    # answer becomes round 2's assistant turn; round 2's refinement
-    # prompt + answer become rounds 3+'s context. The first-turn prefix
-    # stays byte-identical across rounds, which is what Anthropic's
-    # prompt cache keys on — round-2 and round-3 calls reuse the cached
+    # Per-panellist conversation history across rounds. Keyed by the
+    # spec's stable slug (assigned once from the original panel index)
+    # so a panellist keeps its history even when a strategy drops a
+    # sibling and the round's positional order shifts. Round 1's answer
+    # becomes round 2's assistant turn; round 2's refinement prompt +
+    # answer become rounds 3+'s context. The first-turn prefix stays
+    # byte-identical across rounds, which is what Anthropic's prompt
+    # cache keys on — round-2 and round-3 calls reuse the cached
     # round-1 prefix for a ~50% input-token discount + faster TTFT.
     #
     # Seeded with the continuation `prior_turns` (if any) so a refine
@@ -742,12 +773,10 @@ async def refine(
     # accumulated per-slug history exclusively.
     panel_conversations: dict[str, list[dict[str, Any]]] = {}
 
-    def _base_for_slug(slug: str) -> str:
-        return _base_slug(slug)
-
     if prior_turns:
-        for s in _suffix_specs(specs, 1):
-            panel_conversations[_base_for_slug(s.slug)] = list(prior_turns)
+        for s in specs:
+            assert s.slug is not None  # _assign_stable_slugs guarantees it
+            panel_conversations[s.slug] = list(prior_turns)
 
     for round_num in range(1, max_rounds + 1):
         # Strategy decides which panellists run this round. The default
@@ -781,19 +810,24 @@ async def refine(
 
         round_base = (round_num - 1) * (panel_n * 2 + 1)
         round_specs = _suffix_specs(round_base_specs, round_num)
-        # Per-panellist conversation history for round 2+. Map each
-        # round-N slug to its base's accumulated turns. Round 1 falls
-        # back to the global `prior_turns` (continuation context) since
+        # Per-panellist conversation history for round 2+. Keys must be
+        # the slugs FANOUT will actually assign — under `blinded=True`
+        # fanout renames every panellist to `panelist-<greek>.r<n>`, and
+        # keying by our own round slug meant blinded rounds never found
+        # their history. `_make_slugs` is the same derivation fanout
+        # uses, so the prediction is exact. Round 1 falls back to the
+        # global `prior_turns` (continuation context) since
         # `panel_conversations` only has continuation seeds at this point.
         round_prior_by_slug: dict[str, list[dict[str, Any]]] | None
         if round_num == 1:
             round_prior_by_slug = None
         else:
             round_prior_by_slug = {}
-            for rspec in round_specs:
-                base = _base_for_slug(rspec.slug)
+            fanout_slugs = runner._make_slugs(round_specs, blinded)
+            for rspec, fanout_slug in zip(round_specs, fanout_slugs, strict=True):
+                base = _base_slug(rspec.slug or "")
                 if base in panel_conversations:
-                    round_prior_by_slug[rspec.slug] = panel_conversations[base]
+                    round_prior_by_slug[fanout_slug] = panel_conversations[base]
         # Pass the remaining budget so fanout's internal cap matches the
         # refine cap — without this the nested call falls back to
         # `registry.default_max_run_usd()` and a caller's higher refine
@@ -841,21 +875,34 @@ async def refine(
         # rather than receiving the question fresh. The round-1 user
         # turn (`round_prompt`) is byte-stable across rounds 2+'s
         # prefix — that's what Anthropic's prompt cache keys on.
-        for entry in handle.manifest:
-            if entry.status not in (Status.OK, Status.TRUNCATED):
-                continue
-            try:
-                body_text = (paths.root / "responses" / f"{entry.slug}.txt").read_text()
-            except OSError:
-                # Body file missing — skip this panellist's history
-                # update. The next round will fall back to a fresh
-                # turn for this slug (no per-slug entry in the dict).
-                logger.debug("could not read body for %s; skipping history", entry.slug)
-                continue
-            base = _base_for_slug(entry.slug)
-            history = panel_conversations.setdefault(base, [])
-            history.append({"role": "user", "content": round_prompt})
-            history.append({"role": "assistant", "content": body_text})
+        #
+        # Identity comes from ORDER (fanout assembles the manifest in
+        # spec order), not from the manifest slug — under blinded mode
+        # the manifest carries greek slugs that say nothing about which
+        # spec produced them.
+        if len(handle.manifest) != len(round_specs):
+            logger.warning(
+                "round %d manifest has %d entries for %d specs; skipping history update",
+                round_num,
+                len(handle.manifest),
+                len(round_specs),
+            )
+        else:
+            for rspec, entry in zip(round_specs, handle.manifest, strict=True):
+                if entry.status not in (Status.OK, Status.TRUNCATED):
+                    continue
+                try:
+                    body_text = Path(entry.body_path).read_text()
+                except OSError:
+                    # Body file missing — skip this panellist's history
+                    # update. The next round will fall back to a fresh
+                    # turn for this slug (no per-slug entry in the dict).
+                    logger.debug("could not read body for %s; skipping history", entry.slug)
+                    continue
+                base = _base_slug(rspec.slug or "")
+                history = panel_conversations.setdefault(base, [])
+                history.append({"role": "user", "content": round_prompt})
+                history.append({"role": "assistant", "content": body_text})
 
         handle = await capsule.annotate(
             handle,
