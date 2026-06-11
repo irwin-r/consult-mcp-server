@@ -7,8 +7,8 @@ receives security fixes; older versions do not.
 
 | Version | Supported |
 |---------|-----------|
-| 0.2.x   | Yes       |
-| < 0.2   | No        |
+| 0.3.x   | Yes       |
+| < 0.3   | No        |
 
 ## Reporting a Vulnerability
 
@@ -57,10 +57,11 @@ and writes per-run artefacts to disk.
 
 - All run artefacts under `~/.consult/runs/<id>/` (or the XDG-spec location)
   are created with mode `0o700`.
-- `git_diff` attachments always require trusted-roots enforcement. When the
-  caller passes `repo_path`, `CONSULT_TRUSTED_REPO_ROOTS` must be set —
-  otherwise the call is rejected. This is the highest-impact attack surface
-  because `git diff` spawns a subprocess.
+- `git_diff` attachments always enforce trusted-roots containment. A
+  `repo_path` must resolve under one of the `CONSULT_TRUSTED_REPO_ROOTS`
+  directories; when that variable is unset, the only trusted root is the
+  server's CWD, so any repo path outside CWD is rejected. This is the
+  highest-impact attack surface because `git diff` spawns a subprocess.
 - File attachments (`{path}` and bare-string forms) verify the path exists
   and is readable. When `CONSULT_TRUSTED_REPO_ROOTS` is set, they
   additionally enforce containment under one of those roots. When it's

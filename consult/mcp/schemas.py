@@ -15,9 +15,10 @@ definitions, and per-tool orchestration). Splitting them out:
 fragment and a renderer concern, and putting it next to `render_attachment`
 keeps the two from drifting.
 
-`consult_schema()` is a function (not a constant) because its `tier` enum
-is derived from the live registry — adding a tier to models.json must take
-effect on the next call without a server restart.
+`consult_schema()` is a function (not a constant) so test monkeypatching
+of the registry config is honoured. Note the registry caches models.json
+for the process lifetime (`lru_cache`), so editing the file still needs a
+server restart to show up here.
 """
 
 from __future__ import annotations
@@ -295,9 +296,10 @@ def _tier_names() -> list[str]:
 def consult_schema() -> dict[str, Any]:
     """Build the `consult` schema at call time.
 
-    The `tier` enum is derived from the live registry so adding a tier to
-    models.json doesn't require a restart to expose it through MCP. Kept
-    as a function (rather than a constant) for that reason.
+    The `tier` enum is read from the registry config on each call, which
+    keeps test monkeypatching honest. The registry itself caches
+    models.json for the process lifetime, so a config edit still needs a
+    server restart to appear here.
     """
     tier_names = _tier_names()
     default_tier = "standard" if "standard" in tier_names else (tier_names[0] if tier_names else "standard")

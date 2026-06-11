@@ -405,9 +405,16 @@ the CLI flags override them.
 
 Read [`SECURITY.md`](SECURITY.md) for the full threat model. Short version:
 
-- **File attachments and `git_diff`** must resolve under
-  `CONSULT_TRUSTED_REPO_ROOTS` (defaults to CWD). Symlinks resolved with
-  `strict=True`; escape attempts fail closed.
+- **`git_diff` attachments** must resolve under `CONSULT_TRUSTED_REPO_ROOTS`
+  (defaults to the server's CWD). Symlinks are resolved before the check;
+  escape attempts fail closed.
+- **File attachments** are containment-checked only when
+  `CONSULT_TRUSTED_REPO_ROOTS` is set. When it's unset, any path the server
+  process can read is accepted, on the reasoning that the calling agent
+  already has filesystem access of its own. If the server runs with broader
+  filesystem access than the calling agent (Docker, a shared host, a
+  remote deployment), set `CONSULT_TRUSTED_REPO_ROOTS` so attachments are
+  confined to the directories you intend.
 - **Run artefacts are `chmod 0o700`** — per-run prompts (often containing
   pasted credentials or code) are not world-readable on shared hosts.
 - **`git diff` runs with global/system git config neutralised** so a
