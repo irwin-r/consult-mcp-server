@@ -213,3 +213,100 @@ async def test_server_envelope_and_log_redact_secret(monkeypatch, caplog):
     assert secret not in json.dumps(env)
     assert "[REDACTED]" in env["error"]["message"]
     assert secret not in caplog.text
+
+
+def test_secret_filter_redacts_message_and_args():
+    """(issue #40) The logging filter must scrub the RENDERED message, args
+    included — a key carried in an arg slips past msg-only redaction."""
+    import io
+    import logging
+
+    from consult.redact import SecretRedactingFilter
+
+    key = "sk-" + "a" * 24
+    logger = logging.getLogger("redact-test-filter")
+    logger.propagate = False
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    logger.addHandler(handler)
+    logger.addFilter(SecretRedactingFilter())
+    try:
+        logger.warning("auth failed for key %s", key)
+        handler.flush()
+        out = stream.getvalue()
+        assert key not in out
+        assert "[REDACTED]" in out
+    finally:
+        logger.removeHandler(handler)
+
+
+def test_install_redaction_filter_is_idempotent_and_covers_handlers():
+    """(issue #40) Repeat installs must not stack filters, and handlers get
+    one too — handler filters are what catch records propagating up from
+    child loggers."""
+    import logging
+
+    from consult.redact import SecretRedactingFilter, install_redaction_filter
+
+    name = "redact-test-install"
+    lg = logging.getLogger(name)
+    h = logging.NullHandler()
+    lg.addHandler(h)
+    try:
+        install_redaction_filter(name)
+        install_redaction_filter(name)
+        assert sum(isinstance(f, SecretRedactingFilter) for f in lg.filters) == 1
+        assert sum(isinstance(f, SecretRedactingFilter) for f in h.filters) == 1
+    finally:
+        lg.removeHandler(h)
+
+
+def test_scrub_exception_attrs_cleans_object_surfaces():
+    """(issue #39) The exception OBJECT keeps raw message/body/args after our
+    string boundaries redact; scrubbing in place protects later consumers
+    (OTel record_exception, host logging) that format the object."""
+    from consult.redact import scrub_exception_attrs
+
+    key = "sk-" + "b" * 24
+
+    class FakeProviderError(Exception):
+        pass
+
+    e = FakeProviderError(f"boom {key}")
+    e.message = f"Authorization: Bearer {key}"
+    e.body = {"error": f"bad key {key}", "code": 401}
+    scrub_exception_attrs(e)
+    assert key not in str(e)
+    assert key not in e.message
+    assert key not in e.body["error"]
+    assert e.body["code"] == 401  # non-string values untouched
+
+
+def test_scrub_exception_attrs_tolerates_readonly_attrs():
+    """(issue #39) httpx-style read-only properties must not break the scrub;
+    args still get cleaned so str(exc) is safe."""
+    from consult.redact import scrub_exception_attrs
+
+    key = "sk-" + "c" * 24
+
+    class Stubborn(Exception):
+        @property
+        def message(self):
+            return "Bearer " + key
+
+    e = Stubborn(key)
+    scrub_exception_attrs(e)  # must not raise on the read-only property
+    assert key not in str(e)
+
+
+def test_configure_litellm_installs_filter_on_litellm_logger():
+    """(issue #40) LITELLM_LOG=DEBUG output goes through LiteLLM's own
+    logger; configure_litellm must hang the redaction filter there."""
+    import logging
+
+    from consult.redact import SecretRedactingFilter
+    from consult.runner import configure_litellm
+
+    configure_litellm()
+    lg = logging.getLogger("LiteLLM")
+    assert any(isinstance(f, SecretRedactingFilter) for f in lg.filters)

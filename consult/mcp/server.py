@@ -55,7 +55,7 @@ from pydantic import AnyUrl
 
 from .. import __version__, artifacts, task_store
 from ..progress import ProgressEvent, event_message
-from ..redact import redact_exc, redact_traceback
+from ..redact import install_redaction_filter, redact_exc, redact_traceback, scrub_exception_attrs
 from . import errors, handlers, schemas
 
 logger = logging.getLogger("consult")
@@ -286,6 +286,7 @@ async def _run_handler_with_envelopes(
     except Exception as e:  # noqa: BLE001
         # Redact: a provider exception can carry the auth header, and both the
         # log traceback and the returned envelope reach outside the process.
+        scrub_exception_attrs(e)
         logger.error("unhandled exception in tool %s\n%s", name, redact_traceback(e))
         return errors.envelope(errors.ErrorCode.INTERNAL_ERROR, redact_exc(e))
     if name in _TEXT_RESULT_TOOLS and isinstance(result, str):
@@ -556,6 +557,10 @@ async def main() -> None:
         level=os.environ.get("CONSULT_LOG_LEVEL", "INFO"),
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     )
+    # Root-handler redaction: every record that propagates here — the whole
+    # consult.* tree and any chatty dependency — gets key-shaped tokens
+    # scrubbed before the formatter renders them (issue #40).
+    install_redaction_filter("")
     async with stdio_server() as (read, write):
         await server.run(
             read,

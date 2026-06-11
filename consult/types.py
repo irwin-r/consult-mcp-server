@@ -263,6 +263,15 @@ class RunHandle(StrictModel):
 
         Defaults: min_ok = max(2, ceil(len(manifest) * 0.6)); min_providers = min(2, panel_size).
 
+        Counting decision (issue #37): the denominator stays the full
+        panel — a panellist that died is still a slot you paid for and
+        wanted signal from, so it drags viability down. The numerator is
+        OK entries plus TRUNCATED entries that produced a capsule with
+        content: a truncated-but-substantive answer is real signal (synth
+        and refine already consume it), while a truncated-empty entry
+        counts the same as a hard failure. Pre-annotation TRUNCATED
+        entries (capsule=None) stay excluded, the conservative reading.
+
         Blinded panels strip `model_id` from every entry by design, so the
         provider-diversity check is skipped under `blinded=True` — otherwise
         a fully-OK blinded panel would always fail `usable()`. The diversity
@@ -274,7 +283,17 @@ class RunHandle(StrictModel):
             min_ok = max(2, ceil(n * 0.6))
         if min_providers is None:
             min_providers = min(2, n)
-        ok_entries = [m for m in self.manifest if m.status == Status.OK]
+
+        def _truncated_with_signal(m: ManifestEntry) -> bool:
+            if m.status is not Status.TRUNCATED or m.capsule is None:
+                return False
+            cap = m.capsule
+            return any(
+                getattr(cap, field, None)
+                for field in ("position", "recommendation", "key_points", "findings", "claims", "evidence")
+            )
+
+        ok_entries = [m for m in self.manifest if m.status == Status.OK or _truncated_with_signal(m)]
         if len(ok_entries) < min_ok:
             return False
         if self.blinded:

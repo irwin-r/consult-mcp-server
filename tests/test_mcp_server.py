@@ -508,3 +508,20 @@ async def test_fanout_cancel_drains_child_tasks(tmp_path, monkeypatch):
         await task
 
     assert cancelled["n"] == 4  # every child cancelled and drained, no orphans
+
+
+def test_schemas_declare_wire_level_bounds():
+    """(issue #32) maxItems on every caller-supplied array: the engine's
+    panel cap fires after parsing; these stop oversized payloads at schema
+    validation."""
+    from consult.mcp import schemas
+
+    assert schemas.PANEL_SCHEMA["properties"]["models"]["maxItems"] == 64
+    assert schemas.REFINE_SCHEMA["properties"]["models"]["maxItems"] == 64
+    assert schemas.SEQUENCE_SCHEMA["properties"]["models"]["maxItems"] == 64
+    assert schemas.SEQUENCE_SCHEMA["properties"]["prompts"]["maxItems"] == 25
+    for schema in (schemas.PANEL_SCHEMA, schemas.REFINE_SCHEMA, schemas.SEQUENCE_SCHEMA):
+        assert schema["properties"]["attachments"]["maxItems"] == 32
+    assert schemas.consult_schema()["properties"]["attachments"]["maxItems"] == 32
+    per_step = schemas.SEQUENCE_SCHEMA["properties"]["prompts"]["items"]["anyOf"][1]
+    assert per_step["properties"]["attachments"]["maxItems"] == 32

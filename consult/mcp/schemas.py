@@ -36,6 +36,15 @@ _ATTACHMENTS_FIELD_DESC = (
     '`{source: "git_diff", base, head, repo_path?, label?}`.'
 )
 
+# Wire-level bounds (defense-in-depth, issue #32). The engine enforces the
+# real panel cap (CONSULT_MAX_PANEL_SIZE, default 64) after `model:N`
+# expansion; these stop an oversized payload at schema validation before
+# any parsing happens. Attachments and prompts get generous but finite
+# ceilings for the same reason.
+_MAX_MODELS_ITEMS = 64
+_MAX_ATTACHMENT_ITEMS = 32
+_MAX_SEQUENCE_PROMPTS = 25
+
 _MODEL_SPEC_ITEM = {
     "type": "object",
     "required": ["model"],
@@ -78,6 +87,7 @@ PANEL_SCHEMA = {
         "models": {
             "type": "array",
             "minItems": 1,
+            "maxItems": _MAX_MODELS_ITEMS,
             "items": _MODEL_SPEC_ITEM,
             "description": "Panellists. Each entry: {model, stance?, slug?}.",
         },
@@ -88,6 +98,7 @@ PANEL_SCHEMA = {
         },
         "attachments": {
             "type": "array",
+            "maxItems": _MAX_ATTACHMENT_ITEMS,
             "items": ATTACHMENT_SCHEMA_ITEMS,
             "description": _ATTACHMENTS_FIELD_DESC,
         },
@@ -164,6 +175,7 @@ REFINE_SCHEMA = {
         "models": {
             "type": "array",
             "minItems": 1,
+            "maxItems": _MAX_MODELS_ITEMS,
             "items": _MODEL_SPEC_ITEM,
         },
         "arbiter": {
@@ -187,6 +199,7 @@ REFINE_SCHEMA = {
         "blinded": {"type": "boolean", "default": False},
         "attachments": {
             "type": "array",
+            "maxItems": _MAX_ATTACHMENT_ITEMS,
             "items": ATTACHMENT_SCHEMA_ITEMS,
             "description": _ATTACHMENTS_FIELD_DESC,
         },
@@ -228,6 +241,7 @@ SEQUENCE_SCHEMA = {
         "prompts": {
             "type": "array",
             "minItems": 1,
+            "maxItems": _MAX_SEQUENCE_PROMPTS,
             "items": {
                 "anyOf": [
                     {"type": "string"},
@@ -238,6 +252,7 @@ SEQUENCE_SCHEMA = {
                             "prompt": {"type": "string"},
                             "attachments": {
                                 "type": "array",
+                                "maxItems": _MAX_ATTACHMENT_ITEMS,
                                 "items": ATTACHMENT_SCHEMA_ITEMS,
                                 "description": (
                                     "Per-step attachments. When set, override the "
@@ -262,12 +277,14 @@ SEQUENCE_SCHEMA = {
         "models": {
             "type": "array",
             "minItems": 1,
+            "maxItems": _MAX_MODELS_ITEMS,
             "items": _MODEL_SPEC_ITEM,
         },
         "synthesiser": {"type": "string", "description": "Per-step synth model."},
         "blinded": {"type": "boolean", "default": False},
         "attachments": {
             "type": "array",
+            "maxItems": _MAX_ATTACHMENT_ITEMS,
             "items": ATTACHMENT_SCHEMA_ITEMS,
             "description": (
                 "Default attachments for every step. Each entry is a string path, "
@@ -331,6 +348,7 @@ def consult_schema() -> dict[str, Any]:
             },
             "attachments": {
                 "type": "array",
+                "maxItems": _MAX_ATTACHMENT_ITEMS,
                 "items": ATTACHMENT_SCHEMA_ITEMS,
                 "description": _ATTACHMENTS_FIELD_DESC,
             },

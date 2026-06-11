@@ -39,7 +39,7 @@ from ..progress import (
     ProgressEvent,
     append_progress_log,
 )
-from ..redact import redact_exc, redact_traceback
+from ..redact import redact_exc, redact_traceback, scrub_exception_attrs
 from ..status import classify
 from ..types import ManifestEntry, ModelSpec, RunHandle, Status
 from .fit import _fit_prompt_to_context, concat_turn_text
@@ -327,6 +327,10 @@ async def _call_one(
             telemetry.record_exception(tspan, te)
             telemetry.set_attribute(tspan, "app.consult.status", status.value)
         except Exception as e:  # noqa: BLE001 — LiteLLM raises many concrete types
+            # Scrub the object first: `telemetry.record_exception` hands it
+            # to the OTel exporter, which formats message + traceback
+            # outside consult's string-redaction boundaries (issue #39).
+            scrub_exception_attrs(e)
             status, finish, body = classify(None, exception=e)
             error = _format_error_message(e)
             # Same logic: most provider exceptions imply no billable

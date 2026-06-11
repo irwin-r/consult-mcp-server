@@ -287,3 +287,23 @@ def test_medoid_handles_review_capsules():
     # The two security-flagging reviews are far closer to each other than
     # to the empty-findings ship verdict — medoid lives in {r-0, r-1}.
     assert chosen in {"r-0", "r-1"}
+
+
+def test_medoid_tiebreak_prefers_lexicographically_smaller_slug():
+    """(issue #44) Identical capsules tie on cumulative similarity; the
+    documented lex-order tiebreaker must pick deterministically."""
+    from consult.types import Capsule, ManifestEntry, Status
+    from consult.voting import medoid_slugs
+
+    def entry(slug):
+        return ManifestEntry(
+            slug=slug,
+            model_id="x/same",
+            status=Status.OK,
+            resource_uri=f"consult://x/{slug}",
+            body_path=f"/x/{slug}",
+            capsule=Capsule(position="identical stance", recommendation="identical rec"),
+        )
+
+    out = medoid_slugs([entry("bbb"), entry("aaa")])
+    assert out[(0, "x/same")] == "aaa"

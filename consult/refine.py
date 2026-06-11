@@ -26,7 +26,7 @@ from . import artifacts, capsule, context, provider_caps, registry, runner, slug
 from . import progress as progress_mod
 from .cost import CostMeter
 from .jsonparse import extract_json
-from .redact import redact_exc, redact_secrets
+from .redact import redact_exc, redact_secrets, scrub_exception_attrs
 from .types import (
     ArbiterVerdict,
     Capsule,
@@ -364,6 +364,7 @@ async def _ask_arbiter(
             ),
         )
     except Exception as e:
+        scrub_exception_attrs(e)
         logger.warning("arbiter call failed: %s", redact_exc(e))
         return ArbiterVerdict(
             round=round_num,

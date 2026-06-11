@@ -23,7 +23,7 @@ from consult import runner as _facade
 
 from .. import registry
 from ..envutil import env_float, env_int
-from ..redact import redact_secrets
+from ..redact import install_redaction_filter, redact_secrets, scrub_exception_attrs
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +56,10 @@ def configure_litellm() -> None:
     litellm.drop_params = True
     litellm.suppress_debug_info = True
     logging.getLogger("LiteLLM").propagate = False
+    # LITELLM_LOG=DEBUG makes LiteLLM's logger print request kwargs, headers
+    # included; their handler renders it before any consult code sees the
+    # text, so the redaction has to live on the logger itself (issue #40).
+    install_redaction_filter("LiteLLM")
     _LITELLM_CONFIGURED = True
 
 
@@ -204,11 +208,16 @@ async def _acompletion_with_retry(*, timeout: float, **kwargs: Any) -> Any:
             return await asyncio.wait_for(litellm.acompletion(**kwargs), timeout=remaining)
         except retriable as e:
             # Rate-limit or known transient subclass.
-            last_exc = e
+            last_exc = scrub_exception_attrs(e)
         except Exception as e:
             # Bare `APIError` (not a subclass) is the OpenRouter
             # "Unable to get json response" failure mode — retriable.
             # Any subclass (auth/bad-request/content-policy) is terminal.
+            # Scrub the OBJECT before it escapes: its message/body attrs
+            # can carry the Authorization header, and downstream consumers
+            # (OTel record_exception, host logging) format the object, not
+            # consult's redacted strings (issue #39).
+            scrub_exception_attrs(e)
             if bare_api_cls is None or type(e) is not bare_api_cls:
                 raise
             last_exc = e
@@ -219,7 +228,7 @@ async def _acompletion_with_retry(*, timeout: float, **kwargs: Any) -> Any:
         # Leave a 0.5s margin so the next attempt has time to start.
         sleep_for = min(delay, remaining_after - 0.5)
         if sleep_for <= 0:
-            raise last_exc
+            raise last_exc  # already scrubbed at capture
         kind = "rate-limited" if isinstance(last_exc, rate_cls) else "transient API error"
         logger.warning(
             "%s on %s attempt %d/%d (%s); retry in %.2fs",

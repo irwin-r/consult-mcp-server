@@ -29,6 +29,8 @@ it.
 
 from __future__ import annotations
 
+import contextlib
+import logging
 import re
 import traceback
 
@@ -86,3 +88,88 @@ def redact_traceback(exc: BaseException) -> str:
     """
     tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
     return redact_secrets(tb)
+
+
+# Exception attributes that LiteLLM (and the openai exceptions it wraps)
+# populate with upstream HTTP material. `message` and `body` regularly echo
+# the request's Authorization header on auth-failure paths;
+# `litellm_debug_info` carries the provider/request summary LiteLLM builds
+# for its "Give Feedback" footer.
+_EXC_TEXT_ATTRS = ("message", "body", "litellm_debug_info")
+
+
+def scrub_exception_attrs(exc: BaseException) -> BaseException:
+    """Redact secret-shaped tokens on the exception OBJECT, in place.
+
+    `redact_exc` / `redact_traceback` scrub the strings consult itself
+    produces, but the exception object keeps its raw attributes, and any
+    later consumer that formats the object — the OTel exporter via
+    `record_exception`, a crash reporter, the host application's own
+    logging — gets the unscrubbed text. Scrubbing `args` also makes plain
+    `str(exc)` safe at the source.
+
+    Best-effort by design: read-only attributes (e.g. an `httpx.Response`
+    under `exc.response`, whose `.text` is a property) are left alone and
+    remain covered by the string-boundary redaction. Returns `exc` for
+    chaining.
+    """
+    for attr in _EXC_TEXT_ATTRS:
+        value = getattr(exc, attr, None)
+        if isinstance(value, str):
+            redacted: object = redact_secrets(value)
+        elif isinstance(value, dict):
+            redacted = {k: redact_secrets(v) if isinstance(v, str) else v for k, v in value.items()}
+        else:
+            continue
+        try:
+            setattr(exc, attr, redacted)
+        except Exception:  # noqa: BLE001 — read-only attribute; string boundaries still apply
+            continue
+    with contextlib.suppress(Exception):  # exotic args tuples; string boundaries still apply
+        exc.args = tuple(redact_secrets(a) if isinstance(a, str) else a for a in exc.args)
+    return exc
+
+
+class SecretRedactingFilter(logging.Filter):
+    """Logging filter that redacts key-shaped tokens in every record.
+
+    Covers loggers this package doesn't own. With `LITELLM_LOG=DEBUG`,
+    LiteLLM's own logger interpolates request kwargs — headers included —
+    into its messages, and consult's redact-at-the-call-site discipline
+    can't reach those. Attached to a logger (and its handlers), the
+    rendered message is scrubbed before any formatter sees it.
+
+    The record's args are collapsed into the formatted message first:
+    redacting `msg` alone would miss a key carried in an arg, and editing
+    `msg` while keeping `args` would break the next %-format.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            message = record.getMessage()
+        except Exception:  # noqa: BLE001 — a broken record must not kill logging
+            return True
+        redacted = redact_secrets(message)
+        if redacted != message:
+            record.msg = redacted
+            record.args = ()
+        return True
+
+
+def install_redaction_filter(*logger_names: str) -> None:
+    """Attach `SecretRedactingFilter` to each named logger and its handlers.
+
+    Idempotent per logger/handler. Handler-level attachment matters:
+    logger-level filters only apply to records emitted through that exact
+    logger, not to records propagating up from children, while the
+    handlers see both. Pass `""` for the root logger — with the root's
+    handlers filtered, everything that propagates (the whole `consult.*`
+    tree included) is covered centrally.
+    """
+    for name in logger_names:
+        target = logging.getLogger(name) if name else logging.getLogger()
+        if not any(isinstance(f, SecretRedactingFilter) for f in target.filters):
+            target.addFilter(SecretRedactingFilter())
+        for handler in target.handlers:
+            if not any(isinstance(f, SecretRedactingFilter) for f in handler.filters):
+                handler.addFilter(SecretRedactingFilter())

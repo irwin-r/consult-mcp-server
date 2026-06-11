@@ -1307,3 +1307,60 @@ async def test_fanout_dropout_preserves_manifest_order(tmp_path, monkeypatch):
     dropped = handle.manifest[1]
     assert dropped.status is Status.TIMEOUT
     assert dropped.cost_known is False
+
+
+async def test_dropout_cancel_recovers_completed_entry_with_on_progress(tmp_path, monkeypatch):
+    """(issue #43) The race-recovery branch in _gather_with_tail_dropout:
+    a panellist can finish _call_one and record its entry, then get
+    cancelled while blocked in its post-completion progress await (only
+    reachable with on_progress set). The gatherer must keep the real OK
+    entry instead of writing a synthetic TIMEOUT, and re-emit the
+    completion event the cancel ate."""
+    import asyncio as _asyncio
+
+    from consult import runner
+    from consult.progress import PanellistCompleted, ProgressEvent
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    monkeypatch.setenv("CONSULT_HEARTBEAT_INTERVAL_S", "0")
+    monkeypatch.setenv("CONSULT_TAIL_DROPOUT_S", "0.2")
+    monkeypatch.setenv("CONSULT_TAIL_K_FRAC", "0.25")
+    monkeypatch.setattr(runner, "estimate_cost", lambda *a, **kw: (0.0, True))
+
+    async def fake_call(spec, slug, per_prompt, paths, provider_sems=None, **_):
+        return ManifestEntry(
+            slug=slug,
+            model_id="x/y",
+            status=Status.OK,
+            finish_reason="stop",
+            resource_uri=paths.resource_uri(slug),
+            body_path=str(paths.response_text(slug)),
+            latency_ms=1,
+            cost_usd=0.0,
+            cost_known=True,
+        )
+
+    monkeypatch.setattr(runner, "_call_one", fake_call)
+
+    hang_once = {"armed": True}
+    events: list[ProgressEvent] = []
+
+    async def on_progress(event):
+        events.append(event)
+        # Hang exactly once, inside m-3's post-completion notify: its entry
+        # is already in completed_entries, so the dropout cancel lands in
+        # this await and the recovery branch must keep the real result.
+        if isinstance(event, PanellistCompleted) and event.slug == "m-3" and hang_once["armed"]:
+            hang_once["armed"] = False
+            await _asyncio.sleep(60)  # cancelled by the dropout path
+
+    specs = [ModelSpec(model="claude-haiku", slug=f"m-{i}") for i in range(4)]
+    handle = await runner.fanout("q", specs, on_progress=on_progress)
+
+    entry = next(m for m in handle.manifest if m.slug == "m-3")
+    assert entry.status == Status.OK  # the real result, not a synthetic TIMEOUT
+    assert entry.error is None
+    assert handle.partial is False
+    completions = [e for e in events if isinstance(e, PanellistCompleted) and e.slug == "m-3"]
+    assert len(completions) == 2  # the eaten emit plus the recovery re-emit
+    assert completions[-1].status == "OK"
