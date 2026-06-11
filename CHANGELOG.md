@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Until 1.0, the capsule schema and tool surface may change in minor releases.
 
+## [0.4.0](https://github.com/irwin-r/consult-mcp-server/compare/v0.3.0...v0.4.0) (2026-06-11)
+
+
+### ⚠ BREAKING CHANGES
+
+* a user config that relied on full replacement now inherits packaged entries it omitted; set unwanted entries to null to remove them.
+
+### Features
+
+* complete SEP-1686 task mode with tasks/result and tasks/cancel ([ac9b786](https://github.com/irwin-r/consult-mcp-server/commit/ac9b786a9d66aff5a42fbd0a91fef88da57cc379))
+* deep-merge user registry overrides over the packaged config ([c0e2881](https://github.com/irwin-r/consult-mcp-server/commit/c0e288192665b0ff9ebe65b70c4c260dec06ef10))
+* expose peer ranking and consult dry_run; retire dead surface area ([26c404d](https://github.com/irwin-r/consult-mcp-server/commit/26c404ddf276001dd6b7bd23f0fe7ccc0a6a4672))
+
+
+### Bug Fixes
+
+* **deps:** bump aiohttp, pyjwt, and pip past their advisories ([5beaf03](https://github.com/irwin-r/consult-mcp-server/commit/5beaf0301c8659ca574b9069697b5191de1f0bdc))
+* enforce the cost cap across the whole consult pipeline ([18cb94c](https://github.com/irwin-r/consult-mcp-server/commit/18cb94cd7a61f6fc1d6108b334db53206e86f468))
+* keep panellist identity stable across refine rounds ([06f1dd1](https://github.com/irwin-r/consult-mcp-server/commit/06f1dd12230bfa927c786e59b485c655adc4ca18))
+* land the full-codebase review findings ([ebfbefe](https://github.com/irwin-r/consult-mcp-server/commit/ebfbefebed8e25b78b61c9d66ac125c6a31ceaf5))
+* raise the documented typed exceptions from the engine ([bf793e3](https://github.com/irwin-r/consult-mcp-server/commit/bf793e381a42544f6a2d5bd5ca968d6a26ecbd3f))
+* redact secrets at log, result, and disk boundaries ([#41](https://github.com/irwin-r/consult-mcp-server/issues/41)) ([4858c28](https://github.com/irwin-r/consult-mcp-server/commit/4858c2839f89c58346549fb8142bca94636c344b))
+* tolerate malformed numeric env vars instead of crashing mid-run ([797e8e7](https://github.com/irwin-r/consult-mcp-server/commit/797e8e73a67d7a7cebd3c35df9f528da89a90851))
+
+
+### Performance Improvements
+
+* move heavy disk and render work off the event loop ([b7758df](https://github.com/irwin-r/consult-mcp-server/commit/b7758dfcc46b0d9695554993a8dcb7c0c597ad44))
+
+
+### Documentation
+
+* align security and registry docs with actual behaviour ([a13c603](https://github.com/irwin-r/consult-mcp-server/commit/a13c60345aa705daaccfe5826c0b1a15969c7206))
+* refresh repo layout, test commands, and Docker volume ownership ([6f8ca37](https://github.com/irwin-r/consult-mcp-server/commit/6f8ca37d0c32f530bb67403995014fec7cb571bb))
+
 ## [0.3.0](https://github.com/irwin-r/consult-mcp-server/compare/v0.2.0...v0.3.0) (2026-06-02)
 
 
