@@ -188,6 +188,24 @@ to the current best model; the resolved LiteLLM ID is captured per run in
 A per-run cap (`max_run_usd`, default `$5.00`) refuses panels whose estimated
 cost exceeds the limit before any provider is called.
 
+### Custom models and overrides
+
+Drop a `~/.consult/models.json` (and/or `stances.json`) containing only what
+differs; it deep-merges over the packaged config. Add a model by declaring
+just its entry, override a single field of a packaged model by naming only
+that field, or remove a packaged entry by setting it to JSON `null`:
+
+```json
+{
+  "models": {
+    "my-local": { "litellm_id": "ollama/llama3", "provider": "ollama" },
+    "deepseek": null
+  }
+}
+```
+
+Config is cached for the process lifetime; restart the server after edits.
+
 ---
 
 ## The manifest capsule

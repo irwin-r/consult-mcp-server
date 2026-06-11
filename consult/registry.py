@@ -1,6 +1,16 @@
 """Model + stance registry loader. Sources from config/*.json next to the
 package, with optional overrides at ~/.consult/models.json and
 ~/.consult/stances.json.
+
+Override semantics: the user file is deep-merged OVER the packaged config,
+so it only needs to contain what differs. A user file with one new model
+keeps every packaged model, tier, and default; a user entry whose alias
+matches a packaged model overrides just the fields it names. A JSON `null`
+value deletes the corresponding packaged key (e.g. `"deepseek": null` under
+`models` removes that alias entirely).
+
+Configs are cached for the process lifetime (`lru_cache`); a long-lived MCP
+server needs a restart to pick up file edits.
 """
 
 from __future__ import annotations
@@ -15,12 +25,35 @@ _PKG_CONFIG = Path(__file__).parent / "config"
 _USER_CONFIG = Path(os.path.expanduser("~/.consult"))
 
 
+def _deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
+    """Recursive dict merge: overlay wins, nested dicts merge key-by-key,
+    a `None` (JSON null) in the overlay deletes the key, and lists/scalars
+    replace wholesale. Returns a new dict; neither input is mutated.
+    """
+    out = dict(base)
+    for key, value in overlay.items():
+        if value is None:
+            out.pop(key, None)
+        elif isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = _deep_merge(out[key], value)
+        else:
+            out[key] = value
+    return out
+
+
 def _load_json(name: str) -> dict[str, Any]:
+    pkg = json.loads((_PKG_CONFIG / name).read_text())
     user = _USER_CONFIG / name
-    if user.exists():
-        return json.loads(user.read_text())
-    pkg = _PKG_CONFIG / name
-    return json.loads(pkg.read_text())
+    if not user.exists():
+        return pkg
+    # The user file used to REPLACE the packaged config wholesale, which
+    # meant a one-model override silently dropped every built-in model,
+    # tier, and default. Merging keeps the packaged config as the base;
+    # users who want a packaged entry gone set it to JSON null.
+    overlay = json.loads(user.read_text())
+    if not isinstance(overlay, dict):
+        raise ValueError(f"{user} must contain a JSON object at the top level")
+    return _deep_merge(pkg, overlay)
 
 
 @lru_cache(maxsize=1)
