@@ -17,12 +17,14 @@ import json
 import logging
 import random
 import time
-from typing import Any
+from pathlib import Path
+from typing import Any, cast
 
 import litellm
 
 from . import artifacts, capsule, context, provider_caps, registry, runner, slugs, strategies, synth
 from . import progress as progress_mod
+from .cost import CostMeter
 from .jsonparse import extract_json
 from .redact import redact_exc, redact_secrets
 from .types import (
@@ -322,7 +324,9 @@ async def _ask_arbiter(
     prior_manifest: list[ManifestEntry] | None = None,
 ) -> ArbiterVerdict:
     entry = registry.resolve_model(arbiter_alias)
-    litellm_id = entry["litellm_id"]
+    litellm_id = entry.get("litellm_id")
+    if not litellm_id:
+        raise ValueError(f"arbiter {arbiter_alias!r} must be an API model, not a CLI panellist")
     timeout = entry.get("default_timeout_s", 180)
 
     usable_count = sum(1 for m in manifest if m.status in (Status.OK, Status.TRUNCATED))
@@ -352,9 +356,12 @@ async def _ask_arbiter(
     }
     provider_caps.apply_temperature(call_kwargs, litellm_id, 0.0)
     try:
-        resp = await asyncio.wait_for(
-            litellm.acompletion(**call_kwargs),
-            timeout=timeout,
+        resp = cast(
+            Any,
+            await asyncio.wait_for(
+                litellm.acompletion(**call_kwargs),
+                timeout=timeout,
+            ),
         )
     except Exception as e:
         logger.warning("arbiter call failed: %s", redact_exc(e))
@@ -459,18 +466,43 @@ async def _ask_arbiter(
     )
 
 
-def _suffix_specs(specs: list[ModelSpec], round_num: int) -> list[ModelSpec]:
-    """Suffix slugs with `.r<n>` so each round writes to distinct artifact files
-    within the same run directory.
+def _assign_stable_slugs(specs: list[ModelSpec]) -> list[ModelSpec]:
+    """Give every spec a unique slug derived from its ORIGINAL panel index.
+
+    Refine identity must be stable across rounds: artifact slugs, the
+    per-panellist conversation history, and the elimination strategy's
+    worst-spec mapping all key on it. The old per-round enumeration in
+    `_suffix_specs` re-indexed whatever subset the strategy returned, so
+    a dropped panellist shifted every later panellist's identity — the
+    elimination strategy then removed the wrong model from round 3 on,
+    and shifted panellists silently lost their conversation history.
+
+    Model-derived bases are sanitised: a raw LiteLLM ID like
+    `openrouter/meta-llama/llama-3.1-8b:free` would otherwise carry the
+    `:` into the slug and trip ModelSpec's safe-id field validator.
     """
     out = []
     for i, s in enumerate(specs):
-        # Sanitise model-derived bases — a raw LiteLLM ID like
-        # `openrouter/meta-llama/llama-3.1-8b:free` would otherwise carry
-        # the `:` straight into the slug and trip ModelSpec's safe-id
-        # field validator. User-supplied slugs are already constrained.
         base = s.slug or runner.sanitise_derived_slug(s.model.split("/")[-1].lower())
-        out.append(ModelSpec(model=s.model, stance=s.stance, slug=f"{base}-{i}.r{round_num}"))
+        out.append(ModelSpec(model=s.model, stance=s.stance, slug=f"{base}-{i}"))
+    return out
+
+
+def _suffix_specs(specs: list[ModelSpec], round_num: int) -> list[ModelSpec]:
+    """Suffix slugs with `.r<n>` so each round writes to distinct artifact files
+    within the same run directory.
+
+    Specs that already carry a slug (refine pre-assigns stable unique ones
+    via `_assign_stable_slugs`) keep it as the base, so identity stays
+    constant across rounds even when a strategy shrinks the panel.
+    Slug-less specs (direct library callers) fall back to the legacy
+    `<derived>-<i>` enumeration, which is positional and only stable for
+    a panel that never shrinks.
+    """
+    out = []
+    for i, s in enumerate(specs):
+        base = s.slug or f"{runner.sanitise_derived_slug(s.model.split('/')[-1].lower())}-{i}"
+        out.append(ModelSpec(model=s.model, stance=s.stance, slug=f"{base}.r{round_num}"))
     return out
 
 
@@ -560,32 +592,36 @@ def _apply_continuation(prompt: str, continuation_id: str | None) -> tuple[str, 
 
 async def _round_cost_gate(
     *,
-    round_base_specs: list[ModelSpec],
+    round_inputs: list[tuple[ModelSpec, str]],
     round_prompt: str,
-    prior_turns: list[dict[str, Any]] | None,
     resolved_kind: str,
     arbiter_spec: ModelSpec,
-    cumulative_cost: float,
+    spent_usd: float,
     cap: float,
 ) -> str | None:
     """Estimate the next refine round's cost (fanout + arbiter) and decide
     whether to proceed. Returns a `partial_reason` when the round should be
     refused, or None to proceed.
 
+    `round_inputs` pairs each panellist with the input text it will
+    actually send: its accumulated conversation history plus the round
+    prompt. Per-panellist pricing matters from round 2 on — histories
+    grow per slug, and a single shared-text estimate ignored them, waving
+    through rounds whose real input was much larger. Mispricing here is
+    worse than elsewhere: a round that fanout then rejects as
+    cap-exceeded clobbers the prior round's manifest (shared `paths`).
+
     Two refusals: the estimate would push cumulative spend past the cap, or
     pricing is unknown and spend is already past 80% of the cap (a conservative
     floor that still leaves headroom for one bounded round).
     """
-    # Mirror runner.fanout's view: when a continuation is active, the
-    # prior_turns text is part of every panellist call's input. Omitting it
-    # here would wave through a round that fanout then rejects as cap-exceeded,
-    # whose early return clobbers the prior round's manifest (shared `paths`).
-    fanout_cost_input = round_prompt
-    if prior_turns:
-        fanout_cost_input = runner.concat_turn_text(prior_turns) + "\n" + round_prompt
-    fanout_est, fanout_known = await runner.aestimate_cost(
-        round_base_specs, fanout_cost_input, capsule_kind=resolved_kind
-    )
+    fanout_est = 0.0
+    fanout_known = True
+    for spec, cost_input in round_inputs:
+        est, known = await runner.aestimate_cost([spec], cost_input, capsule_kind=resolved_kind)
+        fanout_est += est
+        if not known:
+            fanout_known = False
     # The arbiter call has its own hardcoded max_completion_tokens=2000 (see
     # _ask_arbiter); "decision" matches that budget so the estimate is honest.
     arbiter_est, arbiter_known = await runner.aestimate_cost(
@@ -593,9 +629,9 @@ async def _round_cost_gate(
     )
     estimate = fanout_est + arbiter_est
     est_known = fanout_known and arbiter_known
-    if cumulative_cost + estimate > cap:
+    if spent_usd + estimate > cap:
         return (
-            f"would exceed cap: spent ${cumulative_cost:.2f}, next round estimate "
+            f"would exceed cap: spent ${spent_usd:.2f}, next round estimate "
             f"${estimate:.2f} (fanout ${fanout_est:.2f} + arbiter ${arbiter_est:.2f}), "
             f"cap ${cap:.2f}"
         )
@@ -603,11 +639,11 @@ async def _round_cost_gate(
     # most of the way to the cap. FRICTION pass #14 saw an asymmetric
     # round-1-proceeds / round-2-refuses surprise callers with mixed-provider
     # panels; the 80% floor leaves headroom for one more bounded round.
-    if not est_known and cumulative_cost > cap * 0.8:
+    if not est_known and spent_usd > cap * 0.8:
         return (
             f"refusing further rounds: per-model pricing unknown for at least one "
             f"panellist and spend is past 80% of cap "
-            f"(${cumulative_cost:.2f} spent / ${cap:.2f} cap)"
+            f"(${spent_usd:.2f} spent / ${cap:.2f} cap)"
         )
     return None
 
@@ -664,8 +700,12 @@ async def refine(
     followup_only = prompt
     prompt, prior_turns = _apply_continuation(prompt, continuation_id)
     # Resolve `model:N` sugar here too so `estimate_cost` (called before
-    # `fanout` in each round) sees the real expanded panel.
+    # `fanout` in each round) sees the real expanded panel. Then pin each
+    # spec's identity to its original index — rounds, history, and the
+    # elimination strategy all key on the slug, and a per-round re-index
+    # would shift identities whenever a strategy shrinks the panel.
     specs = runner.expand_specs(specs)
+    specs = _assign_stable_slugs(specs)
     arbiter_alias = arbiter or registry.default_synthesiser()
     synth_alias = synthesiser or arbiter_alias
     # Fail fast on a typo'd arbiter/synthesiser alias BEFORE we spend on
@@ -678,22 +718,27 @@ async def refine(
         registry.resolve_model(synth_alias)
 
     paths = artifacts.create_run()
-    paths.prompt_txt.write_text(prompt)
-    paths.registry_snapshot.write_text(json.dumps(registry.models_config(), indent=2))
+    # Threaded like fanout's run-init: a continuation prompt embeds the
+    # whole prior consultation and can be large.
+    await asyncio.to_thread(paths.prompt_txt.write_text, prompt)
+    await asyncio.to_thread(
+        paths.registry_snapshot.write_text, json.dumps(registry.models_config(), indent=2)
+    )
     # Per-run context bundle. Refine creates its own run dir then calls
     # `runner.fanout` with `existing_paths=` so we own the bundle write
     # here — runner skips it when given an existing path.
-    context.write(
-        paths,
-        context.build(prompt, blinded=blinded, capsule_kind=resolved_kind),
+    await asyncio.to_thread(
+        lambda: context.write(
+            paths,
+            context.build(prompt, blinded=blinded, capsule_kind=resolved_kind),
+        )
     )
     cap = max_run_usd if max_run_usd is not None else registry.default_max_run_usd()
 
     start = time.time()
     verdicts: list[ArbiterVerdict] = []
     final_manifest: list[ManifestEntry] = []
-    cumulative_cost = 0.0
-    cost_all_known = True
+    meter = CostMeter()
     converged = False
     partial_reason: str | None = None
 
@@ -726,13 +771,14 @@ async def refine(
     round_prompt = followup_only if prior_turns else prompt
     prior_manifest: list[ManifestEntry] | None = None
 
-    # Per-panellist conversation history across rounds. Keyed by *base*
-    # slug (the part before `.r<n>`) so a panellist's slug-suffixed
-    # round-N spec maps to its base's accumulated history. Round 1's
-    # answer becomes round 2's assistant turn; round 2's refinement
-    # prompt + answer become rounds 3+'s context. The first-turn prefix
-    # stays byte-identical across rounds, which is what Anthropic's
-    # prompt cache keys on — round-2 and round-3 calls reuse the cached
+    # Per-panellist conversation history across rounds. Keyed by the
+    # spec's stable slug (assigned once from the original panel index)
+    # so a panellist keeps its history even when a strategy drops a
+    # sibling and the round's positional order shifts. Round 1's answer
+    # becomes round 2's assistant turn; round 2's refinement prompt +
+    # answer become rounds 3+'s context. The first-turn prefix stays
+    # byte-identical across rounds, which is what Anthropic's prompt
+    # cache keys on — round-2 and round-3 calls reuse the cached
     # round-1 prefix for a ~50% input-token discount + faster TTFT.
     #
     # Seeded with the continuation `prior_turns` (if any) so a refine
@@ -742,12 +788,10 @@ async def refine(
     # accumulated per-slug history exclusively.
     panel_conversations: dict[str, list[dict[str, Any]]] = {}
 
-    def _base_for_slug(slug: str) -> str:
-        return _base_slug(slug)
-
     if prior_turns:
-        for s in _suffix_specs(specs, 1):
-            panel_conversations[_base_for_slug(s.slug)] = list(prior_turns)
+        for s in specs:
+            assert s.slug is not None  # _assign_stable_slugs guarantees it
+            panel_conversations[s.slug] = list(prior_turns)
 
     for round_num in range(1, max_rounds + 1):
         # Strategy decides which panellists run this round. The default
@@ -765,14 +809,20 @@ async def refine(
             )
             break
         # Estimate the next round's cost (fanout + arbiter) and refuse if it
-        # would blow the cap. See `_round_cost_gate`.
+        # would blow the cap. Each panellist is priced against the input it
+        # will actually send — accumulated history (or the continuation
+        # seed) plus the round prompt. See `_round_cost_gate`.
+        gate_inputs: list[tuple[ModelSpec, str]] = []
+        for rspec in round_base_specs:
+            history = panel_conversations.get(rspec.slug or "") or prior_turns
+            prefix = runner.concat_turn_text(history) + "\n" if history else ""
+            gate_inputs.append((rspec, prefix + round_prompt))
         gate_reason = await _round_cost_gate(
-            round_base_specs=round_base_specs,
+            round_inputs=gate_inputs,
             round_prompt=round_prompt,
-            prior_turns=prior_turns,
             resolved_kind=resolved_kind,
             arbiter_spec=arbiter_spec,
-            cumulative_cost=cumulative_cost,
+            spent_usd=meter.total,
             cap=cap,
         )
         if gate_reason is not None:
@@ -781,19 +831,24 @@ async def refine(
 
         round_base = (round_num - 1) * (panel_n * 2 + 1)
         round_specs = _suffix_specs(round_base_specs, round_num)
-        # Per-panellist conversation history for round 2+. Map each
-        # round-N slug to its base's accumulated turns. Round 1 falls
-        # back to the global `prior_turns` (continuation context) since
+        # Per-panellist conversation history for round 2+. Keys must be
+        # the slugs FANOUT will actually assign — under `blinded=True`
+        # fanout renames every panellist to `panelist-<greek>.r<n>`, and
+        # keying by our own round slug meant blinded rounds never found
+        # their history. `_make_slugs` is the same derivation fanout
+        # uses, so the prediction is exact. Round 1 falls back to the
+        # global `prior_turns` (continuation context) since
         # `panel_conversations` only has continuation seeds at this point.
         round_prior_by_slug: dict[str, list[dict[str, Any]]] | None
         if round_num == 1:
             round_prior_by_slug = None
         else:
             round_prior_by_slug = {}
-            for rspec in round_specs:
-                base = _base_for_slug(rspec.slug)
+            fanout_slugs = runner._make_slugs(round_specs, blinded)
+            for rspec, fanout_slug in zip(round_specs, fanout_slugs, strict=True):
+                base = _base_slug(rspec.slug or "")
                 if base in panel_conversations:
-                    round_prior_by_slug[rspec.slug] = panel_conversations[base]
+                    round_prior_by_slug[fanout_slug] = panel_conversations[base]
         # Pass the remaining budget so fanout's internal cap matches the
         # refine cap — without this the nested call falls back to
         # `registry.default_max_run_usd()` and a caller's higher refine
@@ -802,7 +857,7 @@ async def refine(
             round_prompt,
             round_specs,
             blinded=blinded,
-            max_run_usd=cap - cumulative_cost,
+            max_run_usd=cap - meter.total,
             existing_paths=paths,
             on_progress=progress_mod.make_phase_cb(
                 emit if on_progress else None,
@@ -827,9 +882,7 @@ async def refine(
         # would clobber round 1's good consensus with the empty failure
         # manifest before the break fired.
         if handle.partial:
-            cumulative_cost += handle.cost_usd
-            if not handle.cost_known:
-                cost_all_known = False
+            meter.add(handle.cost_usd, handle.cost_known)
             partial_reason = f"round {round_num} fanout partial: {handle.partial_reason}"
             break
         final_manifest = handle.manifest
@@ -841,21 +894,34 @@ async def refine(
         # rather than receiving the question fresh. The round-1 user
         # turn (`round_prompt`) is byte-stable across rounds 2+'s
         # prefix — that's what Anthropic's prompt cache keys on.
-        for entry in handle.manifest:
-            if entry.status not in (Status.OK, Status.TRUNCATED):
-                continue
-            try:
-                body_text = (paths.root / "responses" / f"{entry.slug}.txt").read_text()
-            except OSError:
-                # Body file missing — skip this panellist's history
-                # update. The next round will fall back to a fresh
-                # turn for this slug (no per-slug entry in the dict).
-                logger.debug("could not read body for %s; skipping history", entry.slug)
-                continue
-            base = _base_for_slug(entry.slug)
-            history = panel_conversations.setdefault(base, [])
-            history.append({"role": "user", "content": round_prompt})
-            history.append({"role": "assistant", "content": body_text})
+        #
+        # Identity comes from ORDER (fanout assembles the manifest in
+        # spec order), not from the manifest slug — under blinded mode
+        # the manifest carries greek slugs that say nothing about which
+        # spec produced them.
+        if len(handle.manifest) != len(round_specs):
+            logger.warning(
+                "round %d manifest has %d entries for %d specs; skipping history update",
+                round_num,
+                len(handle.manifest),
+                len(round_specs),
+            )
+        else:
+            for rspec, entry in zip(round_specs, handle.manifest, strict=True):
+                if entry.status not in (Status.OK, Status.TRUNCATED):
+                    continue
+                try:
+                    body_text = await asyncio.to_thread(Path(entry.body_path).read_text)
+                except OSError:
+                    # Body file missing — skip this panellist's history
+                    # update. The next round will fall back to a fresh
+                    # turn for this slug (no per-slug entry in the dict).
+                    logger.debug("could not read body for %s; skipping history", entry.slug)
+                    continue
+                base = _base_slug(rspec.slug or "")
+                history = panel_conversations.setdefault(base, [])
+                history.append({"role": "user", "content": round_prompt})
+                history.append({"role": "assistant", "content": body_text})
 
         handle = await capsule.annotate(
             handle,
@@ -872,9 +938,7 @@ async def refine(
         # dropped the extractor cost (one bug-fix landed in iter1 of the
         # refine loop). cost_known likewise needs the post-capsule view: an
         # extractor pricing miss flips handle.cost_known False.
-        cumulative_cost += handle.cost_usd
-        if not handle.cost_known:
-            cost_all_known = False
+        meter.add(handle.cost_usd, handle.cost_known)
 
         # Arbiter sees the follow-up question alone when a continuation is
         # active. Passing the full `prompt` (which `_apply_continuation`
@@ -895,19 +959,11 @@ async def refine(
             )
         )
         verdicts.append(verdict)
-        # `is not None` rather than truthy: a successful arbiter call that
-        # returned a $0.00 cost is semantically different from no-cost-known.
-        # Functionally equivalent for zero but reads correctly when the
-        # invariant is "None ⇒ unknown".
-        if verdict.cost_usd is not None:
-            cumulative_cost += verdict.cost_usd
-        # An arbiter pricing miss must propagate to the top-level cost_known.
-        # Previously only the truthy-cost branch fed into the totals — an
-        # unmapped-price arbiter (verdict.cost_usd=None, cost_known=False)
-        # left cost_all_known wrongly True, breaching the same invariant
-        # that bit the consult success path.
-        if not verdict.cost_known:
-            cost_all_known = False
+        # The meter owns the None-means-unknown convention: an unmapped-price
+        # arbiter (cost_usd=None, cost_known=False) adds nothing and flips
+        # the total to a lower bound. The hand-rolled version of this got
+        # the flag wrong once already (iter1 fix).
+        meter.add(verdict.cost_usd, verdict.cost_known)
         paths.arbiter_for(round_num).write_text(verdict.model_dump_json(indent=2))
 
         if not verdict.parsed_ok:
@@ -956,9 +1012,7 @@ async def refine(
         # (an arbiter failure or cap break, which we keep).
         if synth_result.status is not synth.SynthStatus.OK and partial_reason is None:
             partial_reason = f"synthesis status={synth_result.status.value}"
-        cumulative_cost += synth_result.cost_usd
-        if not synth_result.cost_known:
-            cost_all_known = False
+        meter.add(synth_result.cost_usd, synth_result.cost_known)
         progress_done[0] = progress_total
         await emit(progress_mod.SynthCompleted(done=progress_done[0], total=progress_total))
         # Persist synthesiser + cumulative cost. Refine writes the manifest
@@ -970,8 +1024,8 @@ async def refine(
         await artifacts.aaugment_manifest(
             paths,
             synthesiser=synth_alias,
-            cost_usd=cumulative_cost,
-            cost_known=cost_all_known,
+            cost_usd=meter.total,
+            cost_known=meter.known,
         )
     else:
         text = "(no rounds completed — see partial_reason)"
@@ -985,8 +1039,8 @@ async def refine(
         synthesis=text,
         converged=converged,
         threshold=threshold,
-        cost_usd=cumulative_cost,
-        cost_known=cost_all_known,
+        cost_usd=meter.total,
+        cost_known=meter.known,
         wall_ms=wall_ms,
         partial=partial_reason is not None,
         partial_reason=partial_reason,

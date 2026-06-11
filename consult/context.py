@@ -18,12 +18,12 @@ from __future__ import annotations
 
 import functools
 import logging
-import os
 import re
 
 from pydantic import Field
 
 from . import artifacts, registry
+from .envutil import env_int
 from .types import StrictModel
 
 logger = logging.getLogger(__name__)
@@ -228,11 +228,11 @@ _CAPSULE_BODY_BUDGET_DEFAULT = 150_000
 
 
 def _synth_input_budget() -> int:
-    return int(os.environ.get("CONSULT_SYNTH_BUDGET_CHARS", _SYNTH_BUDGET_DEFAULT))
+    return env_int("CONSULT_SYNTH_BUDGET_CHARS", _SYNTH_BUDGET_DEFAULT)
 
 
 def _capsule_body_budget() -> int:
-    return int(os.environ.get("CONSULT_CAPSULE_BODY_BUDGET_CHARS", _CAPSULE_BODY_BUDGET_DEFAULT))
+    return env_int("CONSULT_CAPSULE_BODY_BUDGET_CHARS", _CAPSULE_BODY_BUDGET_DEFAULT)
 
 
 def trim_text(text: str, max_chars: int, *, label: str = "TEXT") -> str:

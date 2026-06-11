@@ -48,6 +48,14 @@ __version__ = "0.3.0"  # x-release-please-version
 #
 # Result types are re-exported below — those don't share a name with any
 # submodule and are safe.
+from .exceptions import (
+    BudgetExceededError,
+    CapsuleParseError,
+    ConsultError,
+    PathTrustError,
+    ProviderError,
+    UnknownModelError,
+)
 from .orchestrate import consult
 from .runner import fanout as panel
 from .sequence import SequenceResult
@@ -66,69 +74,6 @@ from .types import (
     RunResult,
     Status,
 )
-
-
-class ConsultError(Exception):
-    """Root of the consult exception taxonomy.
-
-    Library callers can `except ConsultError` to catch anything raised
-    by the engine, then branch on the subclass. The MCP adapter translates
-    these into the wire-shape `ErrorEnvelope` so MCP clients get the same
-    discriminated cases without importing this module.
-    """
-
-
-class UnknownModelError(ConsultError, KeyError):
-    """Raised when a model alias or raw LiteLLM ID can't be resolved.
-
-    Multiple-inherits `KeyError` so existing `except KeyError` blocks in
-    older code continue to catch it.
-    """
-
-
-class BudgetExceededError(ConsultError):
-    """A run's estimated or accumulated cost exceeded `max_run_usd`.
-
-    The engine degrades rather than raising: an over-cap run returns a result
-    with `partial=True` and a cap `partial_reason`, so output already produced
-    isn't thrown away. Check `partial` for the budget path. This type stays in
-    the taxonomy for callers that wrap the engine and want to re-raise a budget
-    breach as a typed error.
-    """
-
-
-class PathTrustError(ConsultError, ValueError):
-    """Raised when an attachment path or git_diff repo path is rejected by
-    the `CONSULT_TRUSTED_REPO_ROOTS` containment check.
-
-    Multiple-inherits `ValueError` so the MCP adapter's existing
-    `except ValueError` path (mapped to `INVALID_INPUT`) catches it
-    without a special case.
-    """
-
-
-class ProviderError(ConsultError):
-    """An upstream LLM provider returned an unrecoverable error after retries
-    were exhausted.
-
-    The engine degrades rather than raising: the failing panellist is recorded
-    in the manifest with `status=ERROR` and a redacted error message while the
-    rest of the panel proceeds, so inspect `ManifestEntry` for per-panellist
-    failures. This type stays in the taxonomy for callers that re-raise a
-    provider failure as a typed error.
-    """
-
-
-class CapsuleParseError(ConsultError):
-    """The structured-extractor output couldn't be parsed into a `Capsule` /
-    `ReviewCapsule` / `ResearchCapsule`, even after the salvage path.
-
-    The engine degrades rather than raising: the panellist gets an empty
-    capsule (with a body-derived confidence when available) so one bad
-    extraction doesn't sink the panel. This type stays in the taxonomy for
-    callers that re-raise an extraction failure as a typed error.
-    """
-
 
 __all__ = [
     "__version__",

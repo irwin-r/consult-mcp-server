@@ -1,10 +1,14 @@
 """Sequential multi-step consultation.
 
 Runs an ordered list of prompts where each step is a full
-fanout → capsule → synth cycle, and step N's synthesis is prepended as
-context for step N+1. Each step gets its own run_id; the SequenceResult
-collects them all with the final synth (= last step's synth) exposed
-directly for callers that don't need per-step detail.
+fanout → capsule → synth cycle, and EVERY prior step's synthesis is
+prepended as context for step N+1. (Only the immediately-prior synthesis
+used to be threaded, so a final "synthesise across the prior steps"
+prompt silently saw one step; the per-call context fit still trims if a
+long chain outgrows a model's window.) Each step gets its own run_id;
+the SequenceResult collects them all with the final synth (= last
+step's synth) exposed directly for callers that don't need per-step
+detail.
 
 Stops early on cost-cap violation; returns a partial SequenceResult so
 the caller can see how far the chain got.
@@ -19,6 +23,7 @@ from pydantic import Field, model_validator
 
 from . import artifacts, capsule, registry, runner, synth
 from . import progress as progress_mod
+from .cost import CostMeter
 from .types import ModelSpec, StrictModel
 
 logger = logging.getLogger(__name__)
@@ -65,14 +70,16 @@ class SequenceResult(StrictModel):
         return self
 
 
-def _step_prompt(step_num: int, total: int, prior_synth: str | None, body: str) -> str:
-    if prior_synth is None:
+def _step_prompt(step_num: int, total: int, prior_syntheses: list[str] | None, body: str) -> str:
+    """Assemble step N's prompt with every prior step's synthesis ahead of it."""
+    if not prior_syntheses:
         return body
-    return (
-        f"## Step {step_num - 1} of {total} — prior synthesis\n\n"
-        f"{prior_synth}\n\n---\n\n"
-        f"## Step {step_num} of {total} prompt\n\n{body}"
-    )
+    sections = [
+        f"## Step {i} of {total} — prior synthesis\n\n{synth_text}"
+        for i, synth_text in enumerate(prior_syntheses, start=1)
+    ]
+    sections.append(f"## Step {step_num} of {total} prompt\n\n{body}")
+    return "\n\n---\n\n".join(sections)
 
 
 async def sequence(
@@ -86,7 +93,7 @@ async def sequence(
     rubric: str | None = None,
     on_progress: runner.ProgressCallback | None = None,
 ) -> SequenceResult:
-    """Run `prompts` as a chain where step i sees step i-1's synthesis."""
+    """Run `prompts` as a chain where step i sees every prior step's synthesis."""
     if not prompts:
         raise ValueError("sequence requires at least one prompt")
     if not specs:
@@ -105,10 +112,9 @@ async def sequence(
 
     start = time.time()
     steps: list[SequenceStep] = []
-    cumulative_cost = 0.0
-    cost_all_known = True
+    meter = CostMeter()
     partial_reason: str | None = None
-    prior_synth: str | None = None
+    prior_syntheses: list[str] = []
     total = len(prompts)
 
     # Bucketed progress: roughly 2N+1 ticks per step (fanout panellists +
@@ -130,16 +136,16 @@ async def sequence(
 
     for i, body in enumerate(prompts, start=1):
         step_base = (i - 1) * (panel_n * 2 + 1)
-        full_prompt = _step_prompt(i, total, prior_synth, body)
+        full_prompt = _step_prompt(i, total, prior_syntheses, body)
 
         estimate, est_known = await runner.aestimate_cost(
             specs,
             full_prompt,
             capsule_kind=capsule_kind,
         )
-        if cumulative_cost + estimate > cap:
+        if meter.total + estimate > cap:
             partial_reason = (
-                f"would exceed cap: spent ${cumulative_cost:.2f}, step {i} estimate "
+                f"would exceed cap: spent ${meter.total:.2f}, step {i} estimate "
                 f"${estimate:.2f}, cap ${cap:.2f}"
             )
             break
@@ -151,7 +157,7 @@ async def sequence(
         # asked for N specific steps, surfacing cost_known=False at the end
         # is enough signal.
         if not est_known:
-            cost_all_known = False
+            meter.mark_unknown()
 
         await emit(
             progress_mod.SequenceStepStarted(
@@ -164,7 +170,7 @@ async def sequence(
             full_prompt,
             specs,
             blinded=blinded,
-            max_run_usd=cap - cumulative_cost,
+            max_run_usd=cap - meter.total,
             on_progress=progress_mod.make_phase_cb(
                 emit if on_progress else None,
                 step_base,
@@ -178,9 +184,7 @@ async def sequence(
             # breaking — a zero-usable-panel fanout may have billed for
             # timeouts. Mirrors the refine iter1 fix; without this the
             # SequenceResult silently understates spend on the break.
-            cumulative_cost += handle.cost_usd
-            if not handle.cost_known:
-                cost_all_known = False
+            meter.add(handle.cost_usd, handle.cost_known)
             partial_reason = f"step {i} fanout returned partial: {handle.partial_reason}"
             break
 
@@ -194,9 +198,7 @@ async def sequence(
             ),
             kind=capsule_kind,
         )
-        cumulative_cost += handle.cost_usd
-        if not handle.cost_known:
-            cost_all_known = False
+        meter.add(handle.cost_usd, handle.cost_known)
 
         progress_done[0] = step_base + panel_n * 2
         await emit(progress_mod.SynthStarted(done=progress_done[0], total=progress_total))
@@ -208,9 +210,7 @@ async def sequence(
         # refine handlers. Previously this was silently dropped.
         step_cost = handle.cost_usd + synth_result.cost_usd
         step_cost_known = handle.cost_known and synth_result.cost_known
-        cumulative_cost += synth_result.cost_usd
-        if not synth_result.cost_known:
-            cost_all_known = False
+        meter.add(synth_result.cost_usd, synth_result.cost_known)
 
         # Persist + record the step regardless of synth status. Previously
         # the synth-failure break ran BEFORE augment_manifest and
@@ -256,15 +256,15 @@ async def sequence(
                 step=i,
             )
         )
-        prior_synth = synth_result.text
+        prior_syntheses.append(synth_result.text)
 
     wall_ms = int((time.time() - start) * 1000)
     final = steps[-1].synthesis if steps else "(no steps completed — see partial_reason)"
     return SequenceResult(
         steps=steps,
         final_synthesis=final,
-        cost_usd=cumulative_cost,
-        cost_known=cost_all_known,
+        cost_usd=meter.total,
+        cost_known=meter.known,
         wall_ms=wall_ms,
         partial=partial_reason is not None,
         partial_reason=partial_reason,

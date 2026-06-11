@@ -37,6 +37,8 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 
+from .exceptions import PathTrustError
+
 logger = logging.getLogger(__name__)
 
 # Injectable URI formatter. The default produces the `consult://` scheme
@@ -242,7 +244,7 @@ def load_run(run_id: str) -> RunPaths:
     try:
         root.relative_to(base)
     except ValueError as e:
-        raise ValueError(f"run_id {run_id!r} escapes runs_root") from e
+        raise PathTrustError(f"run_id {run_id!r} escapes runs_root") from e
     if not root.exists():
         raise FileNotFoundError(f"Run not found: {run_id}")
     return RunPaths(run_id=run_id, root=root)

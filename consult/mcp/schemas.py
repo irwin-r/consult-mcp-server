@@ -15,9 +15,10 @@ definitions, and per-tool orchestration). Splitting them out:
 fragment and a renderer concern, and putting it next to `render_attachment`
 keeps the two from drifting.
 
-`consult_schema()` is a function (not a constant) because its `tier` enum
-is derived from the live registry — adding a tier to models.json must take
-effect on the next call without a server restart.
+`consult_schema()` is a function (not a constant) so test monkeypatching
+of the registry config is honoured. Note the registry caches models.json
+for the process lifetime (`lru_cache`), so editing the file still needs a
+server restart to show up here.
 """
 
 from __future__ import annotations
@@ -110,6 +111,16 @@ PANEL_SCHEMA = {
                 "Shape of the extracted capsule. 'decision' = position/recommendation "
                 "(general-purpose). 'review' = line-anchored Finding[] for code/PR "
                 "review. 'research' = claims/evidence/uncertainties for research."
+            ),
+        },
+        "peer_rank": {
+            "type": "boolean",
+            "default": False,
+            "description": (
+                "After the panel, have each panellist rank the others' "
+                "anonymised answers; Borda-count aggregate lands in the "
+                "result as `peer_ranking`. Costs roughly one extra call "
+                "per panellist."
             ),
         },
     },
@@ -243,8 +254,9 @@ SEQUENCE_SCHEMA = {
             "description": (
                 "Ordered list of prompts. Each entry is either a string (uses "
                 "the top-level `attachments`) or an object `{prompt, attachments?}` "
-                "with per-step attachments. Each step's synthesis is prepended to "
-                "the next step's prompt as 'prior synthesis' context."
+                "with per-step attachments. Every prior step's synthesis is "
+                "prepended to each subsequent step's prompt as 'prior synthesis' "
+                "context."
             ),
         },
         "models": {
@@ -295,9 +307,10 @@ def _tier_names() -> list[str]:
 def consult_schema() -> dict[str, Any]:
     """Build the `consult` schema at call time.
 
-    The `tier` enum is derived from the live registry so adding a tier to
-    models.json doesn't require a restart to expose it through MCP. Kept
-    as a function (rather than a constant) for that reason.
+    The `tier` enum is read from the registry config on each call, which
+    keeps test monkeypatching honest. The registry itself caches
+    models.json for the process lifetime, so a config edit still needs a
+    server restart to appear here.
     """
     tier_names = _tier_names()
     default_tier = "standard" if "standard" in tier_names else (tier_names[0] if tier_names else "standard")
@@ -336,6 +349,11 @@ def consult_schema() -> dict[str, Any]:
             },
             "blinded": {"type": "boolean", "default": False},
             "max_run_usd": {"type": "number"},
+            "dry_run": {
+                "type": "boolean",
+                "default": False,
+                "description": "Estimate the panel cost without calling any model.",
+            },
             "gate_synth_at_agreement": {
                 "type": "number",
                 "minimum": 0.0,

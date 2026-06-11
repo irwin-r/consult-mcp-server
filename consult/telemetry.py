@@ -67,7 +67,7 @@ def _get_tracer() -> Any:
         return None
 
     try:
-        from opentelemetry import trace
+        from opentelemetry import trace  # pyright: ignore[reportMissingImports]
     except ImportError:
         logger.debug(
             "OTEL_EXPORTER_OTLP_ENDPOINT set but `opentelemetry` not "

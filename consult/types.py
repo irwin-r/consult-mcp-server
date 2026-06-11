@@ -41,7 +41,6 @@ class Status(StrEnum):
     RATE_LIMITED = "RATE_LIMITED"
     TIMEOUT = "TIMEOUT"
     ERROR = "ERROR"
-    SKIPPED = "SKIPPED"
 
 
 class ModelSpec(StrictModel):
@@ -86,8 +85,6 @@ class Capsule(StrictModel):
     key_points: list[str] = Field(default_factory=list)
     unique_claims: list[str] = Field(default_factory=list, description="Claims only this panellist made")
     caveats: list[str] = Field(default_factory=list)
-    agrees_with: list[str] = Field(default_factory=list, description="Slugs this agrees with")
-    disagrees_with: list[str] = Field(default_factory=list, description="Slugs this disagrees with")
     confidence: float | None = Field(None, ge=0.0, le=1.0)
 
 
@@ -182,15 +179,24 @@ class ManifestEntry(StrictModel):
     @model_validator(mode="before")
     @classmethod
     def _default_capsule_kind(cls, data):
-        """Inject `kind="decision"` into legacy capsule dicts that predate the
-        discriminated union. Without this, manifest.json files written before
-        M2 fail to validate because the discriminator field is absent.
+        """Upgrade legacy capsule dicts so old manifest.json files still load.
+
+        Two upgrades: inject `kind="decision"` for pre-M2 capsules that
+        predate the discriminated union, and strip the retired
+        `agrees_with` / `disagrees_with` keys (they were never populated —
+        the cross-referencing orchestrator they were reserved for was not
+        built — but on-disk capsules written while the fields existed
+        would otherwise trip `extra="forbid"`).
         """
         if isinstance(data, dict):
             cap = data.get("capsule")
-            if isinstance(cap, dict) and "kind" not in cap:
-                # Copy to avoid mutating the caller's dict, then add kind.
-                data = {**data, "capsule": {**cap, "kind": "decision"}}
+            if isinstance(cap, dict) and (
+                "kind" not in cap or "agrees_with" in cap or "disagrees_with" in cap
+            ):
+                # Copy to avoid mutating the caller's dict.
+                cap = {k: v for k, v in cap.items() if k not in ("agrees_with", "disagrees_with")}
+                cap.setdefault("kind", "decision")
+                data = {**data, "capsule": cap}
         return data
 
     @model_validator(mode="after")

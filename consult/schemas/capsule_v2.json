@@ -17,8 +17,6 @@
         "key_points": { "type": "array", "items": { "type": "string" } },
         "unique_claims": { "type": "array", "items": { "type": "string" }, "description": "Claims only this panellist made." },
         "caveats": { "type": "array", "items": { "type": "string" } },
-        "agrees_with": { "type": "array", "items": { "type": "string" }, "description": "Slugs this agrees with." },
-        "disagrees_with": { "type": "array", "items": { "type": "string" } },
         "confidence": { "type": ["number", "null"], "minimum": 0.0, "maximum": 1.0 }
       }
     },

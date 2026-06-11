@@ -33,6 +33,7 @@ import asyncio
 import logging
 import random
 from dataclasses import dataclass
+from typing import Any, cast
 
 import litellm
 
@@ -144,7 +145,7 @@ async def _ask_one_ranker(
     litellm_id: str = ranker.model_id or ""
     if not litellm_id:
         try:
-            litellm_id = registry.resolve_model(ranker.slug)["litellm_id"]
+            litellm_id = registry.resolve_model(ranker.slug).get("litellm_id") or ""
         except KeyError:
             logger.warning(
                 "peer_rank: ranker %s has no model_id and slug isn't an alias — skipping",
@@ -153,13 +154,16 @@ async def _ask_one_ranker(
             return [], 0.0, True
 
     try:
-        resp = await asyncio.wait_for(
-            litellm.acompletion(
-                model=litellm_id,
-                messages=[{"role": "user", "content": prompt}],
-                max_completion_tokens=512,
+        resp = cast(
+            Any,
+            await asyncio.wait_for(
+                litellm.acompletion(
+                    model=litellm_id,
+                    messages=[{"role": "user", "content": prompt}],
+                    max_completion_tokens=512,
+                ),
+                timeout=120,
             ),
-            timeout=120,
         )
     except Exception as e:  # noqa: BLE001
         logger.warning(

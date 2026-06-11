@@ -15,8 +15,11 @@ from __future__ import annotations
 import logging
 from collections.abc import Awaitable, Callable
 
+import litellm
+
 from . import artifacts, capsule, registry, runner, synth, voting
 from . import attachments as attachments_mod
+from .cost import CostMeter
 from .progress import ProgressEvent, SynthCompleted, SynthStarted, shift_bucket
 from .types import Capsule, ManifestEntry, ModelSpec, RunResult, Status
 
@@ -41,15 +44,14 @@ async def _safe_emit(cb: ProgressCallback | None, event: ProgressEvent) -> None:
         logger.debug("progress callback failed: %s", e)
 
 
-def _deterministic_aggregate(manifest: list[ManifestEntry], disagreement: float) -> str:
+def _deterministic_aggregate(manifest: list[ManifestEntry], *, heading: str, note: str) -> str:
     """Produce a synthesis-shaped markdown without calling the flagship.
 
-    Used when `gate_synth_at_agreement` is set and the panel's
-    `disagreement` falls below the threshold — high consensus means the
-    flagship's added cost buys little. We surface each usable
-    panellist's position/recommendation as a bulleted aggregate and tag
-    the synthesis with the gating score so the caller can audit the
-    decision.
+    Two callers: the agreement gate (high consensus means the flagship's
+    added cost buys little) and the cost-cap gate (the flagship estimate
+    would breach `max_run_usd`). Each supplies its own heading and note
+    so the reader can audit why the flagship was skipped. We surface each
+    usable panellist's position/recommendation as a bulleted aggregate.
 
     Only `Capsule` (decision-kind) entries get a structured rendering;
     review/research kinds fall back to their slug + status because their
@@ -57,13 +59,9 @@ def _deterministic_aggregate(manifest: list[ManifestEntry], disagreement: float)
     mislead.
     """
     lines = [
-        "# Synthesis (gated — high consensus)",
+        heading,
         "",
-        (
-            f"The panel converged with low disagreement (score "
-            f"{disagreement:.2f}). The flagship synth was skipped to "
-            f"save cost; each panellist's position is listed below."
-        ),
+        note,
         "",
         "## Positions",
         "",
@@ -82,6 +80,32 @@ def _deterministic_aggregate(manifest: list[ManifestEntry], disagreement: float)
             line = f"- **{entry.slug}** — see capsule artefact (`{type(cap).__name__}`)"
         lines.append(line)
     return "\n".join(lines)
+
+
+def _estimate_synth_cost(synth_alias: str, manifest: list[ManifestEntry]) -> tuple[float, bool]:
+    """Rough pre-flight price for the synth call.
+
+    The panel bodies are the synth's input, so their combined output
+    tokens approximate its prompt size; the output side uses the same
+    budget floor `synth.synthesise` applies. Returns `(0.0, False)` when
+    the model can't be priced (CLI synthesisers, table misses) — the
+    caller then mirrors fanout's warn-don't-block posture.
+    """
+    try:
+        entry = registry.resolve_model(synth_alias)
+        litellm_id = entry.get("litellm_id")
+        if not litellm_id:
+            return 0.0, False
+        tokens_in = sum(m.tokens_out or 0 for m in manifest)
+        budget = max(entry.get("default_budget_tokens", 16000), 16000)
+        prompt_cost, completion_cost = litellm.cost_per_token(
+            model=litellm_id, prompt_tokens=tokens_in, completion_tokens=budget
+        )
+        if prompt_cost is None or completion_cost is None:
+            return 0.0, False
+        return float(prompt_cost) + float(completion_cost), True
+    except Exception:  # noqa: BLE001 — estimate failure must not block the run
+        return 0.0, False
 
 
 async def consult(
@@ -197,6 +221,11 @@ async def consult(
             kind=capsule_kind,
         )
 
+    # Spend so far: fanout plus (post-annotate) capsule extraction. The
+    # meter owns the None-means-unknown propagation from here on.
+    meter = CostMeter()
+    meter.add(handle.cost_usd, handle.cost_known)
+
     # Compute disagreement post-capsule-extraction. None when fewer than
     # two usable capsules to compare (e.g. extract_capsules=False, or a
     # panel where most entries failed).
@@ -218,28 +247,90 @@ async def consult(
         # We still write `synthesis.md` so the on-disk artifact dir stays
         # consistent (consult-view + consult-ledger work the same way).
         paths = artifacts.load_run(handle.run_id)
-        synth_text = _deterministic_aggregate(handle.manifest, disagreement or 0.0)
+        synth_text = _deterministic_aggregate(
+            handle.manifest,
+            heading="# Synthesis (gated — high consensus)",
+            note=(
+                f"The panel converged with low disagreement (score "
+                f"{disagreement:.2f}). The flagship synth was skipped to "
+                f"save cost; each panellist's position is listed below."
+            ),
+        )
         (paths.root / "synthesis.md").write_text(synth_text)
         await _safe_emit(on_progress, SynthCompleted(done=overall_total, total=overall_total))
-        total_cost = handle.cost_usd
-        total_cost_known = handle.cost_known
         await artifacts.aaugment_manifest(
             paths,
             synthesiser="(gated)",  # marker so the ledger entry is unambiguous
-            cost_usd=total_cost,
-            cost_known=total_cost_known,
+            cost_usd=meter.total,
+            cost_known=meter.known,
         )
         return RunResult(
             run_id=handle.run_id,
             synthesis=synth_text,
             manifest=handle.manifest,
-            cost_usd=total_cost,
-            cost_known=total_cost_known,
+            cost_usd=meter.total,
+            cost_known=meter.known,
             wall_ms=handle.wall_ms,
             partial=False,
             synthesiser="(gated)",
             disagreement=disagreement,
             synth_gated=True,
+        )
+
+    # Cost-cap gate for the synth stage. The fanout gate only covered the
+    # panel: the flagship synth is often the most expensive single call in
+    # the run and previously went unchecked, so a run could sail past
+    # `max_run_usd` after the panel had already passed its own gate. When
+    # the estimate can't be priced we mirror fanout's warn-don't-block
+    # posture, unless spend has already reached the cap.
+    cap = max_run_usd if max_run_usd is not None else registry.default_max_run_usd()
+    synth_est, synth_est_known = _estimate_synth_cost(synth_alias, handle.manifest)
+    synth_over_cap = (synth_est_known and meter.total + synth_est > cap) or (
+        not synth_est_known and meter.total >= cap
+    )
+    if not synth_est_known and not synth_over_cap:
+        logger.warning(
+            "synth cost for %s can't be estimated; proceeding (spent $%.2f of $%.2f cap)",
+            synth_alias,
+            meter.total,
+            cap,
+        )
+    if synth_over_cap:
+        paths = artifacts.load_run(handle.run_id)
+        est_text = f"${synth_est:.2f}" if synth_est_known else "unknown"
+        synth_text = _deterministic_aggregate(
+            handle.manifest,
+            heading="# Synthesis (aggregate — cost cap reached)",
+            note=(
+                f"The flagship synthesis was skipped: ${meter.total:.2f} of the "
+                f"${cap:.2f} cap is already spent and the synthesiser estimate is "
+                f"{est_text}. Each usable panellist's position is listed below. "
+                f"Run `synthesise(run_id)` with a higher cap or a cheaper model "
+                f"for a full synthesis."
+            ),
+        )
+        (paths.root / "synthesis.md").write_text(synth_text)
+        await _safe_emit(on_progress, SynthCompleted(done=overall_total, total=overall_total))
+        await artifacts.aaugment_manifest(
+            paths,
+            synthesiser="(cap-skipped)",
+            cost_usd=meter.total,
+            cost_known=meter.known,
+        )
+        return RunResult(
+            run_id=handle.run_id,
+            synthesis=synth_text,
+            manifest=handle.manifest,
+            cost_usd=meter.total,
+            cost_known=meter.known,
+            wall_ms=handle.wall_ms,
+            partial=True,
+            partial_reason=(
+                f"synthesis skipped at cost cap: spent ${meter.total:.2f}, "
+                f"synth estimate {est_text}, cap ${cap:.2f}"
+            ),
+            synthesiser="(cap-skipped)",
+            disagreement=disagreement,
         )
 
     # The outer total was sized for fanout + capsules + synth, so synth's
@@ -256,8 +347,7 @@ async def consult(
     # Roll synth spend into the run total. The synthesiser is often the most
     # expensive call (flagship + big context), so omitting it silently
     # under-reports the run against `max_run_usd`.
-    total_cost = handle.cost_usd + synth_result.cost_usd
-    total_cost_known = handle.cost_known and synth_result.cost_known
+    meter.add(synth_result.cost_usd, synth_result.cost_known)
     # Persist synthesiser + total cost on disk. `RunResult` carries them on
     # the wire, but the manifest written by `runner.fanout` was assembled
     # before synth ran — `consult-ledger` reads from disk and would otherwise
@@ -265,8 +355,8 @@ async def consult(
     await artifacts.aaugment_manifest(
         artifacts.load_run(handle.run_id),
         synthesiser=synth_alias,
-        cost_usd=total_cost,
-        cost_known=total_cost_known,
+        cost_usd=meter.total,
+        cost_known=meter.known,
     )
     # A non-OK synth status means `.text` is a sentinel ("# Synthesis
     # unavailable" / "# Synthesis empty"), not a real answer. Surface that as
@@ -277,8 +367,8 @@ async def consult(
         run_id=handle.run_id,
         synthesis=synth_result.text,
         manifest=handle.manifest,
-        cost_usd=total_cost,
-        cost_known=total_cost_known,
+        cost_usd=meter.total,
+        cost_known=meter.known,
         wall_ms=handle.wall_ms,
         partial=synth_failed,
         partial_reason=(f"synthesis status={synth_result.status.value}" if synth_failed else None),

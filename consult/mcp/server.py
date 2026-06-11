@@ -22,15 +22,26 @@ import logging
 import os
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
+
+if TYPE_CHECKING:
+    from datetime import datetime
+
+    from mcp.types import TaskStatus
 
 import dotenv
 from mcp.server import NotificationOptions, Server
 from mcp.server.models import InitializationOptions
 from mcp.server.stdio import stdio_server
+from mcp.shared.exceptions import McpError
 from mcp.types import (
-    AnyUrl,
+    INVALID_PARAMS,
+    CancelTaskRequest,
+    CancelTaskResult,
     CreateTaskResult,
+    ErrorData,
+    GetTaskPayloadRequest,
+    GetTaskPayloadResult,
     GetTaskRequest,
     GetTaskResult,
     Resource,
@@ -40,6 +51,7 @@ from mcp.types import (
     Tool,
     ToolAnnotations,
 )
+from pydantic import AnyUrl
 
 from .. import __version__, artifacts, task_store
 from ..progress import ProgressEvent, event_message
@@ -166,8 +178,8 @@ async def handle_list_tools() -> list[Tool]:
         Tool(
             name="sequence",
             description=(
-                "Run an ordered list of prompts where each step's synthesis is prepended "
-                "as context for the next step. "
+                "Run an ordered list of prompts where every prior step's synthesis is "
+                "prepended as context for the next step. "
                 "Use when: a question is too large for a single prompt (decompose → "
                 "per-subquestion → meta-synth), or for plan-then-execute workflows where "
                 "step N depends on step N-1's conclusion. "
@@ -360,58 +372,131 @@ async def handle_call_tool(
     return CreateTaskResult(
         task=Task(
             taskId=rec.task_id,
-            status=rec.status,  # already one of the TaskStatus literals
-            createdAt=_iso(rec.created_at),
-            lastUpdatedAt=_iso(rec.last_updated_at),
+            # task_store keeps plain strings so the engine never imports
+            # mcp.types; the values are the TaskStatus literals.
+            status=cast("TaskStatus", rec.status),
+            createdAt=_ts(rec.created_at),
+            lastUpdatedAt=_ts(rec.last_updated_at),
             ttl=rec.ttl_ms,
             pollInterval=rec.poll_interval_ms,
         ),
     )
 
 
-def _iso(epoch_seconds: float) -> str:
-    """ISO-8601 timestamp from an `epoch_seconds` float, UTC."""
+def _ts(epoch_seconds: float) -> datetime:
+    """UTC datetime from an `epoch_seconds` float. The SDK's Task fields are
+    datetimes; handing them a real datetime beats relying on string coercion."""
     from datetime import UTC, datetime
 
-    return datetime.fromtimestamp(epoch_seconds, tz=UTC).isoformat()
+    return datetime.fromtimestamp(epoch_seconds, tz=UTC)
+
+
+def _require_task(task_id: str) -> task_store.TaskRecord:
+    """Look up a task or raise the JSON-RPC invalid-params error.
+
+    `GetTaskResult` / `CancelTaskResult` have no None-task sentinel — their
+    taskId/status fields are required — and the spec doesn't reserve a
+    dedicated error code for an unknown id. Clients should treat the error
+    as "resubmit", per SEP-1686.
+    """
+    rec = task_store.get(task_id)
+    if rec is None:
+        raise McpError(ErrorData(code=INVALID_PARAMS, message=f"Unknown taskId: {task_id}"))
+    return rec
+
+
+def _task_snapshot_kwargs(rec: task_store.TaskRecord) -> dict[str, Any]:
+    """The Task wire fields shared by tasks/get and tasks/cancel responses."""
+    return {
+        "taskId": rec.task_id,
+        "status": rec.status,  # already one of the TaskStatus literals
+        "statusMessage": rec.status_message,
+        "createdAt": _ts(rec.created_at),
+        "lastUpdatedAt": _ts(rec.last_updated_at),
+        "ttl": rec.ttl_ms,
+        "pollInterval": rec.poll_interval_ms,
+    }
 
 
 async def _handle_get_task(req: GetTaskRequest) -> ServerResult:
-    """Respond to a `tasks/get` poll.
+    """Respond to a `tasks/get` poll with the current task snapshot."""
+    rec = _require_task(req.params.taskId)
+    return ServerResult(GetTaskResult(**_task_snapshot_kwargs(rec)))
 
-    Returns the current task snapshot for the requested taskId. Unknown
-    taskIds resolve via the JSON-RPC error path (the SDK has no
-    "task=None" sentinel — `GetTaskResult` is flat, with required
-    taskId/status fields).
+
+def _tool_result_fields(result: Any) -> dict[str, Any]:
+    """Convert a stored handler result into CallToolResult-shaped fields.
+
+    Mirrors the SDK's own `call_tool` conversion: a dict becomes
+    `structuredContent` plus a JSON-text content block; a list of content
+    blocks (the `synthesise` tool's TextContent wrapping) passes through
+    as `content`. Kept in lockstep so a client sees the identical payload
+    whether the call ran foreground or as a task.
     """
-    task_id = req.params.taskId
-    rec = task_store.get(task_id)
-    if rec is None:
-        # `GetTaskResult` has no None-task sentinel — its taskId/status
-        # fields are required. The JSON-RPC invalid-params code is the
-        # closest standard match; the spec doesn't reserve a code for
-        # this case. Clients should treat it as "resubmit", per SEP-1686.
-        from mcp.shared.exceptions import McpError
-        from mcp.types import INVALID_PARAMS, ErrorData
+    import json as _json
 
-        raise McpError(ErrorData(code=INVALID_PARAMS, message=f"Unknown taskId: {task_id}"))
-    return ServerResult(
-        GetTaskResult(
-            taskId=rec.task_id,
-            status=rec.status,  # already one of the TaskStatus literals
-            statusMessage=rec.status_message,
-            createdAt=_iso(rec.created_at),
-            lastUpdatedAt=_iso(rec.last_updated_at),
-            ttl=rec.ttl_ms,
-            pollInterval=rec.poll_interval_ms,
+    if isinstance(result, dict):
+        return {
+            "content": [TextContent(type="text", text=_json.dumps(result, indent=2))],
+            "structuredContent": result,
+            "isError": False,
+        }
+    return {"content": list(result), "structuredContent": None, "isError": False}
+
+
+async def _handle_get_task_payload(req: GetTaskPayloadRequest) -> ServerResult:
+    """Respond to `tasks/result`: the completed task's tool result.
+
+    Per SEP-1686 the payload matches the original request's result type —
+    for a tools/call task, the CallToolResult shape. Non-terminal tasks
+    error (poll `tasks/get` until terminal); cancelled tasks have no
+    result to return; failed tasks return the same ErrorEnvelope a
+    foreground call would have produced, so client error-handling code
+    is identical for both modes.
+    """
+    rec = _require_task(req.params.taskId)
+    if rec.status == task_store.STATUS_WORKING:
+        raise McpError(
+            ErrorData(
+                code=INVALID_PARAMS,
+                message=f"Task {rec.task_id} is still working; poll tasks/get until terminal",
+            )
         )
-    )
+    if rec.status == task_store.STATUS_CANCELLED:
+        raise McpError(ErrorData(code=INVALID_PARAMS, message=f"Task {rec.task_id} was cancelled; no result"))
+    if rec.status == task_store.STATUS_FAILED:
+        payload = errors.envelope(errors.ErrorCode.INTERNAL_ERROR, rec.error or "task failed")
+        return ServerResult(GetTaskPayloadResult(**_tool_result_fields(payload)))
+    return ServerResult(GetTaskPayloadResult(**_tool_result_fields(rec.result)))
 
 
-# Wire the tasks/get handler. The standard `Server` class doesn't
-# expose a decorator for this (it's not part of the "core" surface)
-# so we register it directly on `request_handlers`.
+async def _handle_cancel_task(req: CancelTaskRequest) -> ServerResult:
+    """Respond to `tasks/cancel`: cancel the background work and return the
+    updated snapshot. Cancelling an already-terminal task is an error per
+    SEP-1686 (there is nothing left to cancel).
+    """
+    rec = _require_task(req.params.taskId)
+    if rec.status in (
+        task_store.STATUS_COMPLETED,
+        task_store.STATUS_FAILED,
+        task_store.STATUS_CANCELLED,
+    ):
+        raise McpError(
+            ErrorData(
+                code=INVALID_PARAMS,
+                message=f"Task {rec.task_id} is already {rec.status}; nothing to cancel",
+            )
+        )
+    task_store.cancel(rec.task_id)
+    return ServerResult(CancelTaskResult(**_task_snapshot_kwargs(rec)))
+
+
+# Wire the task handlers. The standard `Server` class doesn't expose
+# decorators for these (they're not part of the "core" surface) so we
+# register them directly on `request_handlers`.
 server.request_handlers[GetTaskRequest] = _handle_get_task
+server.request_handlers[GetTaskPayloadRequest] = _handle_get_task_payload
+server.request_handlers[CancelTaskRequest] = _handle_cancel_task
 
 
 # ---- Resources --------------------------------------------------------------

@@ -17,10 +17,11 @@ LIMITS:
 - In-process only (no cross-process sharing). A consult-mcp server
   restart loses in-flight tasks; clients re-poll a missing taskId
   see an empty `tasks/get` and should resubmit.
-- TTL is honoured loosely: completed/failed tasks are evicted when
-  *another* task is created and their record is older than `ttl_ms`.
-  An aggressively-low ttl with no follow-up call leaves stale records,
-  which is fine — they're small (a few KB each).
+- TTL is honoured loosely: eviction runs when *another* task is created
+  and the registry is over its size cap. ttl-lapsed terminal records go
+  first; if the registry is still over the cap, the oldest terminal
+  records are dropped regardless of ttl (no-ttl records would otherwise
+  accumulate forever, and each carries its full tool result).
 """
 
 from __future__ import annotations
@@ -86,8 +87,16 @@ _MAX_RECORDS = 256
 
 
 def _evict_stale() -> None:
-    """Prune terminal records older than their ttl. Keeps the registry
-    bounded over long-running server lifetimes.
+    """Keep the registry bounded over long-running server lifetimes.
+
+    Two passes once the registry exceeds `_MAX_RECORDS`: first drop
+    terminal records whose ttl has lapsed, then — if still over the cap —
+    drop the oldest terminal records regardless of ttl. The second pass
+    matters because most clients omit ttl (stored as None), and a
+    ttl-only sweep would never evict those: each record carries its full
+    tool result (manifest + synthesis, easily 100KB+ for a refine), so a
+    long-lived server would leak without the size-based backstop.
+    Working tasks are never evicted.
     """
     if len(_REGISTRY) <= _MAX_RECORDS:
         return
@@ -102,7 +111,22 @@ def _evict_stale() -> None:
             stale_keys.append(tid)
     for tid in stale_keys:
         _REGISTRY.pop(tid, None)
-    logger.debug("task_store evicted %d stale records", len(stale_keys))
+
+    overflow = len(_REGISTRY) - _MAX_RECORDS
+    evicted_for_size = 0
+    if overflow > 0:
+        oldest_terminal = sorted(
+            (rec for rec in _REGISTRY.values() if rec.status in _TERMINAL_STATUSES),
+            key=lambda r: r.last_updated_at,
+        )
+        for rec in oldest_terminal[:overflow]:
+            _REGISTRY.pop(rec.task_id, None)
+            evicted_for_size += 1
+    logger.debug(
+        "task_store evicted %d ttl-stale + %d size-overflow records",
+        len(stale_keys),
+        evicted_for_size,
+    )
 
 
 def create(*, ttl_ms: int | None = None) -> TaskRecord:

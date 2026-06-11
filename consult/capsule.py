@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from typing import Any
+from typing import Any, cast
 
 import litellm
 
@@ -36,15 +36,12 @@ Extract a structured capsule. Return EXACTLY a JSON object with these keys:
   "key_points": ["...", "...", "..."],
   "unique_claims": ["claims this panellist made that others might not"],
   "caveats": ["assumptions or conditions the recommendation depends on"],
-  "agrees_with": [],
-  "disagrees_with": [],
   "confidence": 0.0
 }
 
 Rules:
 - key_points: 2-5 entries, each ≤ 20 words
 - unique_claims and caveats: 0-3 entries each
-- agrees_with / disagrees_with: leave empty here (filled later by the orchestrator)
 - confidence: parse from a "CONFIDENCE:" line in the body if present, else null
 - Output JSON only, no commentary, no markdown fences.
 
@@ -207,7 +204,7 @@ def _body_has_findings(body: str) -> bool:
 async def _extract_one(
     body: str,
     extractor_id: str,
-    timeout: int,
+    timeout: float,
     original_question: str | None = None,
     *,
     kind: str = "decision",
@@ -251,9 +248,12 @@ async def _extract_one(
     }
     provider_caps.apply_temperature(kwargs, extractor_id, 0.0)
     try:
-        resp = await asyncio.wait_for(
-            litellm.acompletion(**kwargs),
-            timeout=timeout,
+        resp = cast(
+            Any,
+            await asyncio.wait_for(
+                litellm.acompletion(**kwargs),
+                timeout=timeout,
+            ),
         )
     except Exception as e:
         logger.warning("capsule extractor call failed for extractor=%s: %s", extractor_id, redact_exc(e))
@@ -310,7 +310,9 @@ async def _extract_one(
             }
         ]
         try:
-            retry_resp = await asyncio.wait_for(litellm.acompletion(**retry_kwargs), timeout=timeout)
+            retry_resp = cast(
+                Any, await asyncio.wait_for(litellm.acompletion(**retry_kwargs), timeout=timeout)
+            )
             billed_responses.append(retry_resp)
             retry_data = extract_json(retry_resp.choices[0].message.content or "") or {}
             if retry_data.get("confidence") in (None, "null"):
@@ -371,7 +373,11 @@ async def annotate(
     """
     ext_alias = extractor or registry.default_capsule_extractor()
     ext_entry = registry.resolve_model(ext_alias)
-    ext_id = ext_entry["litellm_id"]
+    ext_id = ext_entry.get("litellm_id")
+    if not ext_id:
+        # A CLI panellist has no litellm_id; using one as the extractor was
+        # a guaranteed KeyError deep in the annotate pass.
+        raise ValueError(f"capsule extractor {ext_alias!r} must be an API model, not a CLI panellist")
     timeout = ext_entry.get("default_timeout_s", 60)
 
     paths = artifacts.load_run(handle.run_id)

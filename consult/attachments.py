@@ -14,13 +14,13 @@ so server.py stays focused on MCP wiring + tool orchestration.
 from __future__ import annotations
 
 import logging
-import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from . import sources
+from .envutil import env_int
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +34,7 @@ _DEFAULT_MAX_BYTES = 5 * 1024 * 1024
 
 def _max_bytes() -> int:
     """Read the size cap at call time so test monkeypatching works."""
-    return int(os.environ.get("CONSULT_ATTACHMENT_MAX_BYTES", _DEFAULT_MAX_BYTES))
+    return env_int("CONSULT_ATTACHMENT_MAX_BYTES", _DEFAULT_MAX_BYTES)
 
 
 def _read_text_safely(path: Path) -> str:
@@ -143,6 +143,11 @@ def render_attachment(item: Any) -> str:
     elif isinstance(item, dict) and item.get("source") == "git_diff":
         base = item.get("base")
         head = item.get("head")
+        # The MCP schema marks base/head required, but library callers can
+        # hand us anything; without this guard a missing ref reached the
+        # subprocess resolver as None.
+        if not isinstance(base, str) or not isinstance(head, str):
+            return f"\n[ERROR: malformed git_diff spec (base/head must be strings): {item!r}]\n"
         repo_path = item.get("repo_path")
         label = item.get("label") or f"git_diff[{base}..{head}]"
         kind = "git_diff"

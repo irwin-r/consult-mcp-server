@@ -1,6 +1,16 @@
 """Model + stance registry loader. Sources from config/*.json next to the
 package, with optional overrides at ~/.consult/models.json and
 ~/.consult/stances.json.
+
+Override semantics: the user file is deep-merged OVER the packaged config,
+so it only needs to contain what differs. A user file with one new model
+keeps every packaged model, tier, and default; a user entry whose alias
+matches a packaged model overrides just the fields it names. A JSON `null`
+value deletes the corresponding packaged key (e.g. `"deepseek": null` under
+`models` removes that alias entirely).
+
+Configs are cached for the process lifetime (`lru_cache`); a long-lived MCP
+server needs a restart to pick up file edits.
 """
 
 from __future__ import annotations
@@ -9,18 +19,69 @@ import json
 import os
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict, cast
+
+from .envutil import env_float
+from .exceptions import UnknownModelError
 
 _PKG_CONFIG = Path(__file__).parent / "config"
 _USER_CONFIG = Path(os.path.expanduser("~/.consult"))
 
 
+class ModelEntry(TypedDict, total=False):
+    """One resolved registry row.
+
+    `total=False` because the shape is deliberately ragged: raw LiteLLM IDs
+    synthesise a minimal row, CLI panellists carry `cli_command` instead of
+    `litellm_id`, and the optional knobs (`mode`, `reasoning_effort`,
+    `max_input_tokens`) appear only where models.json sets them. The
+    TypedDict documents the known keys so call sites stop spelunking an
+    untyped dict.
+    """
+
+    alias: str
+    litellm_id: str
+    default_budget_tokens: int
+    default_timeout_s: float
+    provider: str
+    family: str
+    privacy_tier: str
+    mode: str
+    reasoning_effort: str
+    max_input_tokens: int
+    cli_command: list[str]
+    cli_env: dict[str, str]
+
+
+def _deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
+    """Recursive dict merge: overlay wins, nested dicts merge key-by-key,
+    a `None` (JSON null) in the overlay deletes the key, and lists/scalars
+    replace wholesale. Returns a new dict; neither input is mutated.
+    """
+    out = dict(base)
+    for key, value in overlay.items():
+        if value is None:
+            out.pop(key, None)
+        elif isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = _deep_merge(out[key], value)
+        else:
+            out[key] = value
+    return out
+
+
 def _load_json(name: str) -> dict[str, Any]:
+    pkg = json.loads((_PKG_CONFIG / name).read_text())
     user = _USER_CONFIG / name
-    if user.exists():
-        return json.loads(user.read_text())
-    pkg = _PKG_CONFIG / name
-    return json.loads(pkg.read_text())
+    if not user.exists():
+        return pkg
+    # The user file used to REPLACE the packaged config wholesale, which
+    # meant a one-model override silently dropped every built-in model,
+    # tier, and default. Merging keeps the packaged config as the base;
+    # users who want a packaged entry gone set it to JSON null.
+    overlay = json.loads(user.read_text())
+    if not isinstance(overlay, dict):
+        raise ValueError(f"{user} must contain a JSON object at the top level")
+    return _deep_merge(pkg, overlay)
 
 
 @lru_cache(maxsize=1)
@@ -33,19 +94,21 @@ def stances_config() -> dict[str, str]:
     return _load_json("stances.json")
 
 
-def resolve_model(alias_or_id: str) -> dict[str, Any]:
+def resolve_model(alias_or_id: str) -> ModelEntry:
     """Look up by registry alias first, then accept a raw LiteLLM ID.
 
-    Returns a dict with at least {alias, litellm_id, default_budget_tokens,
-    default_timeout_s, provider}. Raises KeyError if neither matches and the
-    string doesn't look like a LiteLLM ID.
+    Returns a `ModelEntry` with at least {alias, litellm_id,
+    default_budget_tokens, default_timeout_s, provider} (CLI panellists
+    substitute `cli_command` for `litellm_id`). Raises `UnknownModelError`
+    (a `KeyError` subclass, so legacy `except KeyError` sites still catch
+    it) if neither matches and the string doesn't look like a LiteLLM ID.
     """
     cfg = models_config()
     models = cfg["models"]
     if alias_or_id in models:
         entry = dict(models[alias_or_id])
         entry["alias"] = alias_or_id
-        return entry
+        return cast(ModelEntry, entry)
     # Allow raw LiteLLM IDs like "openrouter/x-ai/grok-4.3" — synthesise a row.
     if "/" in alias_or_id or alias_or_id.startswith(("gpt-", "claude-", "gemini-")):
         return {
@@ -55,7 +118,7 @@ def resolve_model(alias_or_id: str) -> dict[str, Any]:
             "default_timeout_s": 180,
             "provider": _infer_provider(alias_or_id),
         }
-    raise KeyError(f"Unknown model: {alias_or_id}")
+    raise UnknownModelError(f"Unknown model: {alias_or_id}")
 
 
 def _infer_provider(litellm_id: str) -> str:
@@ -84,7 +147,7 @@ def resolve_tier(tier: str) -> list[str]:
     cfg = models_config()
     tiers = cfg.get("tiers", {})
     if tier not in tiers:
-        raise KeyError(f"Unknown tier: {tier}. Available: {list(tiers)}")
+        raise UnknownModelError(f"Unknown tier: {tier}. Available: {list(tiers)}")
     return list(tiers[tier])
 
 
@@ -109,10 +172,8 @@ def default_capsule_extractor() -> str:
 
 
 def default_max_run_usd() -> float:
-    env = os.environ.get("CONSULT_MAX_RUN_USD")
-    if env:
-        return float(env)
-    return float(models_config().get("defaults", {}).get("max_run_usd", 5.0))
+    cfg_default = float(models_config().get("defaults", {}).get("max_run_usd", 5.0))
+    return env_float("CONSULT_MAX_RUN_USD", cfg_default)
 
 
 def list_rubrics() -> list[str]:

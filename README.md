@@ -116,7 +116,7 @@ your shell rc will be visible.
 ```sh
 docker run -i --rm \
   -e ANTHROPIC_API_KEY -e OPENAI_API_KEY -e GEMINI_API_KEY -e OPENROUTER_API_KEY \
-  -v ~/.consult:/root/.consult \
+  -v ~/.consult:/home/consult/.consult \
   ghcr.io/irwin-r/consult-mcp-server:latest
 ```
 
@@ -187,6 +187,24 @@ to the current best model; the resolved LiteLLM ID is captured per run in
 
 A per-run cap (`max_run_usd`, default `$5.00`) refuses panels whose estimated
 cost exceeds the limit before any provider is called.
+
+### Custom models and overrides
+
+Drop a `~/.consult/models.json` (and/or `stances.json`) containing only what
+differs; it deep-merges over the packaged config. Add a model by declaring
+just its entry, override a single field of a packaged model by naming only
+that field, or remove a packaged entry by setting it to JSON `null`:
+
+```json
+{
+  "models": {
+    "my-local": { "litellm_id": "ollama/llama3", "provider": "ollama" },
+    "deepseek": null
+  }
+}
+```
+
+Config is cached for the process lifetime; restart the server after edits.
 
 ---
 
@@ -405,9 +423,16 @@ the CLI flags override them.
 
 Read [`SECURITY.md`](SECURITY.md) for the full threat model. Short version:
 
-- **File attachments and `git_diff`** must resolve under
-  `CONSULT_TRUSTED_REPO_ROOTS` (defaults to CWD). Symlinks resolved with
-  `strict=True`; escape attempts fail closed.
+- **`git_diff` attachments** must resolve under `CONSULT_TRUSTED_REPO_ROOTS`
+  (defaults to the server's CWD). Symlinks are resolved before the check;
+  escape attempts fail closed.
+- **File attachments** are containment-checked only when
+  `CONSULT_TRUSTED_REPO_ROOTS` is set. When it's unset, any path the server
+  process can read is accepted, on the reasoning that the calling agent
+  already has filesystem access of its own. If the server runs with broader
+  filesystem access than the calling agent (Docker, a shared host, a
+  remote deployment), set `CONSULT_TRUSTED_REPO_ROOTS` so attachments are
+  confined to the directories you intend.
 - **Run artefacts are `chmod 0o700`** — per-run prompts (often containing
   pasted credentials or code) are not world-readable on shared hosts.
 - **`git diff` runs with global/system git config neutralised** so a
@@ -437,7 +462,12 @@ or `tier="deep"` (heavily aggregator-routed).
 
 ```
 consult/                # ENGINE — no mcp.* imports
-  runner.py             # async fanout + LiteLLM + progress log
+  runner/               # async fan-out package (facade in __init__)
+    transport.py        #   LiteLLM retry/streaming/Responses adapter
+    fit.py              #   context-budget fitting + attachment trims
+    specs.py            #   model:N expansion + slug grammar
+    costs.py            #   panel cost estimation
+    fanout.py           #   _call_one, slow-tail dropout, fanout()
   capsule.py            # post-fanout structured extraction
   synth.py              # flagship synthesiser
   refine.py             # arbiter-driven loop (max 3 rounds) + continuation
@@ -455,6 +485,9 @@ consult/                # ENGINE — no mcp.* imports
   status.py             # LiteLLM response → Status
   types.py              # Pydantic models (StrictModel base)
   jsonparse.py          # tolerant JSON extraction from model output
+  cost.py               # CostMeter — spend roll-up with unknown propagation
+  envutil.py            # tolerant numeric env parsing
+  exceptions.py         # typed exception taxonomy
   provider_caps.py      # per-provider capability flags (temperature, etc.)
   cli_executor.py       # CLI-as-panellist subprocess transport
   telemetry.py          # optional OpenTelemetry spans (otel extra)

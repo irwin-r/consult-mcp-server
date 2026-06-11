@@ -35,7 +35,7 @@ import random
 import re
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any
+from typing import Any, cast
 
 import litellm
 
@@ -221,13 +221,15 @@ async def synthesise(
     anonymised: bool = False,
 ) -> SynthResult:
     paths = artifacts.load_run(run_id)
-    manifest_payload = json.loads(paths.manifest_json.read_text())
+    manifest_payload = json.loads(await asyncio.to_thread(paths.manifest_json.read_text))
     manifest = manifest_payload["manifest"]
-    bodies = {
-        m["slug"]: paths.response_text(m["slug"]).read_text()
-        for m in manifest
-        if m["status"] in (Status.OK.value, Status.TRUNCATED.value)
-    }
+    # Body reads are threaded: a wide panel's bodies sum to hundreds of KB
+    # and sequential sync reads here stalled heartbeats on concurrent runs.
+    usable_entries = [m for m in manifest if m["status"] in (Status.OK.value, Status.TRUNCATED.value)]
+    body_texts = await asyncio.gather(
+        *(asyncio.to_thread(paths.response_text(m["slug"]).read_text) for m in usable_entries)
+    )
+    bodies = {m["slug"]: text for m, text in zip(usable_entries, body_texts, strict=True)}
     # Zero-usable-body guard. Without this, a dry-run or fully-failed run
     # would proceed to call the synthesiser with an empty RESPONSES block —
     # a billable call whose only possible output is hallucinated content.
@@ -262,8 +264,9 @@ async def synthesise(
         original_prompt=original_prompt,
     )
     # Persist for reproducibility — the synth input is what the model
-    # *actually* saw (blind labels in place of slugs).
-    (paths.root / "synth_input.txt").write_text(synth_input)
+    # *actually* saw (blind labels in place of slugs). Threaded: this file
+    # is the concatenation of every body and can run to megabytes.
+    await asyncio.to_thread((paths.root / "synth_input.txt").write_text, synth_input)
     # Persist the blind→slug mapping so the viewer (and any forensic
     # tooling) can reconstruct exactly which panellist each Alpha/Beta
     # corresponded to on this call. Cheap on disk and uncomplicates
@@ -273,7 +276,9 @@ async def synthesise(
 
     synth_alias = by_model or registry.default_synthesiser()
     entry = registry.resolve_model(synth_alias)
-    litellm_id = entry["litellm_id"]
+    litellm_id = entry.get("litellm_id")
+    if not litellm_id:
+        raise ValueError(f"synthesiser {synth_alias!r} must be an API model, not a CLI panellist")
     budget = max(entry.get("default_budget_tokens", 16000), 16000)
     timeout = entry.get("default_timeout_s", 300)
     provider = entry.get("provider", "")
@@ -282,13 +287,16 @@ async def synthesise(
     # (consult / refine). Persist a clear sentinel to synthesis.md so the run
     # artifact directory remains consistent.
     try:
-        resp = await asyncio.wait_for(
-            litellm.acompletion(
-                model=litellm_id,
-                messages=build_messages(synth_input, provider),
-                max_completion_tokens=budget,
+        resp = cast(
+            Any,
+            await asyncio.wait_for(
+                litellm.acompletion(
+                    model=litellm_id,
+                    messages=build_messages(synth_input, provider),
+                    max_completion_tokens=budget,
+                ),
+                timeout=timeout,
             ),
-            timeout=timeout,
         )
     except Exception as e:
         logger.warning("synth call failed (%s): %s", litellm_id, redact_exc(e))

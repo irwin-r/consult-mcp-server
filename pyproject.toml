@@ -65,6 +65,7 @@ dev = [
     "pytest-asyncio>=0.23",
     "pytest-cov>=5.0",
     "ruff>=0.15,<0.16",
+    "pyright>=1.1,<2",
     "pre-commit>=3.7",
     "pip-audit>=2.7",
 ]
@@ -98,3 +99,18 @@ ignore = ["E501"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+
+[tool.pyright]
+typeCheckingMode = "basic"
+venvPath = "."
+venv = ".venv"
+# pydantic 2.13's Field() overloads hide positional defaults from pyright's
+# dataclass_transform handling, so every Model(...) call that omits a
+# defaulted field reports "argument missing" (reproducible on a 3-line
+# probe). Re-enable once the pydantic/pyright pair recognises defaults.
+reportCallIssue = false
+pythonVersion = "3.11"
+include = ["consult"]
+# LiteLLM and the OTel API ship partial typing; missing-stub noise isn't a
+# defect in this codebase.
+reportMissingTypeStubs = false

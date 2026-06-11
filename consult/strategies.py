@@ -122,26 +122,35 @@ class EliminationStrategy(Strategy):
         if prior_manifest is None:
             return list(base_specs)
 
+        # Survivors of every prior elimination. Every no-new-elimination
+        # path below must return THIS list, not `base_specs` — returning
+        # the full panel would silently re-admit panellists eliminated in
+        # earlier rounds, breaking the documented monotonicity.
+        survivors = [s for s in base_specs if (s.model, s.stance, s.slug) not in self._eliminated]
+
         worst_slug = self._compute_worst(prior_manifest)
         if worst_slug is None:
             logger.info(
-                "EliminationStrategy: no clear outlier in round %d; keeping full panel",
+                "EliminationStrategy: no clear outlier in round %d; keeping current panel",
                 round_num - 1,
             )
-            return [s for s in base_specs if (s.model, s.stance, s.slug) not in self._eliminated]
+            return survivors
 
-        # `worst_slug` carries the `.r<round_num-1>` suffix from
-        # _suffix_specs. Map back to the base ModelSpec by stripping
-        # the `-<i>.r<n>` and matching on model+stance order.
-        # Simpler: iterate base_specs and pick the one whose generated
-        # round-N slug would equal worst_slug. But we don't have the
-        # slug-derivation here. Use a positional match instead — the
-        # i-th base spec corresponds to round-N slug `<base>-<i>.r<N>`.
         worst_base_idx = self._find_worst_base_index(worst_slug, base_specs)
         if worst_base_idx is None:
-            return list(base_specs)
+            return survivors
         target = base_specs[worst_base_idx]
         key = (target.model, target.stance, target.slug)
+        if key in self._eliminated:
+            # Stale mapping (only reachable via the positional fallback on
+            # slug-less specs) — don't double-count; keep the panel as-is.
+            return survivors
+        candidate = [s for s in survivors if (s.model, s.stance, s.slug) != key]
+        # Floor at 2 panellists — eliminating below that loses the
+        # consensus signal. Stop further eliminations rather than
+        # walking the panel to zero.
+        if len(candidate) < 2:
+            return survivors
         self._eliminated.add(key)
         logger.info(
             "EliminationStrategy: eliminating %s (slug=%s) for round %d",
@@ -149,14 +158,7 @@ class EliminationStrategy(Strategy):
             worst_slug,
             round_num,
         )
-
-        usable_specs = [s for s in base_specs if (s.model, s.stance, s.slug) not in self._eliminated]
-        # Floor at 2 panellists — eliminating below that loses the
-        # consensus signal. Stop further eliminations rather than
-        # walking the panel to zero.
-        if len(usable_specs) < 2:
-            return list(base_specs)
-        return usable_specs
+        return candidate
 
     def _compute_worst(
         self,
@@ -190,8 +192,24 @@ class EliminationStrategy(Strategy):
         worst_slug: str,
         base_specs: list[ModelSpec],
     ) -> int | None:
-        """Map a round-suffixed `<base>-<i>.r<n>` slug back to its base-spec
-        index via the shared slug grammar (`slugs.panel_index`)."""
+        """Map the worst panellist's round slug back to its base spec.
+
+        Primary path: refine pre-assigns each spec a stable unique slug
+        and the round slug is `<slug>.r<n>`, so equality after stripping
+        the round suffix is exact regardless of how the panel shrank in
+        between. The positional `slugs.panel_index` parse remains as a
+        fallback for slug-less specs (direct strategy callers); it is
+        only correct while the panel hasn't shrunk, which is exactly the
+        bug the stable-slug path closes.
+
+        Blinded runs carry greek manifest slugs that match neither path,
+        so elimination is a deliberate no-op under `blinded=True` (we
+        cannot attribute the outlier to a spec without unblinding).
+        """
+        base = slugs.strip_round(worst_slug)
+        for i, s in enumerate(base_specs):
+            if s.slug and s.slug == base:
+                return i
         idx = slugs.panel_index(worst_slug)
         if idx is not None and 0 <= idx < len(base_specs):
             return idx

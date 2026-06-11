@@ -134,9 +134,10 @@ def _check_trusted_roots() -> tuple[list[str], int]:
     else:
         lines.append(
             _warn(
-                "CONSULT_TRUSTED_REPO_ROOTS unset — file attachments and git_diff "
-                f"restricted to CWD ({Path.cwd()}) only. Set this env var to a "
-                "colon-separated list of directories to allow attachments from elsewhere."
+                f"CONSULT_TRUSTED_REPO_ROOTS unset — git_diff repos restricted to CWD "
+                f"({Path.cwd()}); file attachments are NOT containment-checked (any "
+                "readable path is accepted). Set this env var to a colon-separated "
+                "list of directories to confine both."
             )
         )
     return lines, 0
@@ -164,7 +165,9 @@ async def _ping_provider(env_var: str, alias: str) -> tuple[bool, str]:
         import litellm
 
         info = registry.resolve_model(alias)
-        litellm_id = info["litellm_id"]
+        litellm_id = info.get("litellm_id")
+        if not litellm_id:
+            return False, "no litellm_id (CLI panellist?)"
         await litellm.acompletion(
             model=litellm_id,
             messages=[{"role": "user", "content": "."}],
