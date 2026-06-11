@@ -75,12 +75,17 @@ def _capsule_is_empty(cap: dict[str, Any] | None) -> bool:
     )
 
 
-def _summarise_manifest(manifest: list[dict[str, Any]]) -> dict[str, Any]:
+def _summarise_manifest(manifest: list[dict[str, Any]], *, cost_usd: float | None = None) -> dict[str, Any]:
     """Roll up per-panellist health so the invoking agent can see, from the
     result alone, which models contributed and which returned nothing usable —
     the "which models didn't return value?" question that otherwise needs a
     manual manifest dig. `no_value` lists each dud with a concrete reason
     (errored, timed out, truncated before a usable capsule, or empty extraction).
+
+    When `cost_usd` (the run's total, synth and extractor included) is
+    given, the summary also carries `cost_per_usable_capsule` — the run's
+    truncation-economics headline (issue #55): what one unit of usable
+    panel signal cost, with dud panellists priced in rather than hidden.
     """
     from collections import Counter
 
@@ -127,12 +132,19 @@ def _summarise_manifest(manifest: list[dict[str, Any]]) -> dict[str, Any]:
                 "reason": reason[:200],
             }
         )
-    return {
+    # A panellist is "usable" when it isn't a dud: it returned OK/TRUNCATED
+    # and (when capsules were extracted) its capsule carries substance.
+    usable = len(manifest) - len(no_value)
+    summary: dict[str, Any] = {
         "panellists": len(manifest),
         "status_counts": dict(status_counts),
         "findings_total": findings_total,
+        "usable_capsules": usable,
         "no_value": no_value,
     }
+    if cost_usd is not None:
+        summary["cost_per_usable_capsule"] = round(cost_usd / usable, 4) if usable > 0 else None
+    return summary
 
 
 async def _augment_result(result: dict[str, Any]) -> dict[str, Any]:
@@ -163,7 +175,11 @@ async def _augment_result(result: dict[str, Any]) -> dict[str, Any]:
     manifest = result.get("manifest")
     if isinstance(manifest, list) and manifest:
         try:
-            result.setdefault("run_summary", _summarise_manifest(manifest))
+            cost = result.get("cost_usd")
+            result.setdefault(
+                "run_summary",
+                _summarise_manifest(manifest, cost_usd=cost if isinstance(cost, (int, float)) else None),
+            )
         except Exception as e:  # noqa: BLE001
             logger.warning("run_summary build failed for run %s: %s", run_id, e)
     return result
