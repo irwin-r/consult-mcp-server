@@ -147,3 +147,73 @@ caught by dogfooding, not by the integration tests.
   panel test and immediately surfaced the inherited-too-much-of-refine bug.
   Worth keeping a live-smoke pass routinely after copying logic between
   similar modules.
+
+## 2026-06-11 — strategy dogfood pass (9 runs, ~$3.1 known spend)
+
+Exercised all five tools live for the strategy review in
+docs/strategy/2026-06-dogfood-review.md: consult (standard + deep/research),
+refine (blinded, stances), sequence (3 steps, per-step attachments), panel
+(peer_rank), synthesise (re-run under critique rubric), plus two dry_runs.
+
+- [bug] **synthesise() clobbers the run's recorded cost**. Re-synthesising
+  20260611-042818-67174 rewrote the manifest's top-level cost_usd from $1.26
+  to $0.087 (the re-synth call alone) and flipped cost_known false->true.
+  synth.py wrote its own cost instead of accumulating, and the ledger reads
+  the manifest, so one re-synth erased the panel's spend from the books.
+  RESOLVED in this PR: accumulate cost, AND the known flags, regression test.
+- [bug] **Test suite was polluting the real runs dir and ledger**. 1,243 run
+  dirs had accumulated; ~130 created today alone in bursts of five (prompt
+  "p", "estimated cost exceeds cap" rejections) by pytest runs. consult-ledger
+  counted each as a $0 run, drowning the day's real spend. No conftest set
+  CONSULT_RUNS_DIR. RESOLVED in this PR: autouse fixture isolates every test
+  into tmp_path. Full suite now adds zero dirs.
+- [bug] **refine's arbiter died parsing its own verdict**. Run
+  20260611-043229-95424 round 1: the arbiter (gemini-pro) returned non-JSON,
+  score 0.0, `json_parse_failed`, loop aborted. refine degraded to a
+  single-round panel at full cost. partial_reason surfaced it well, but
+  there is no retry and no structured-output request on the arbiter call.
+  Second arbiter-fragility incident (see 2026-05-20 pass two). Issue filed.
+- [ux] **Truncation waste dominated every flagship-bearing run, again**.
+  6/9 TRUNCATED on the $1.26 standard run (042818); 6/13 on the $1.23 deep
+  run (044542); gpt-pro burned $1.45 across the two for zero usable capsules
+  (reasoning burn inside max_completion_tokens). Subtler: the consensus
+  rubric tells the synth to down-weight TRUNCATED, so terse cheap models
+  ended up steering the strategy verdicts while truncated flagships were
+  discounted. The cap distorts synthesis weighting, not just cost. Issue filed.
+- [ux] **cost_known=false on effectively every standard/deep run**: all
+  OpenRouter panellists (5/9 standard, 8/13 deep) return null pricing, so
+  caps and the ledger run half-blind on exactly the most diverse tiers.
+- [ux] **peer_rank: silent ranker dropout, invisible spend**. deepseek
+  returned no usable ranking and was skipped per design, but the result
+  carries only an empty per_ranker list, no reason, and PeerRanking's
+  cost fields aren't serialised into the result. Feature verdict: earns
+  its keep (clean Borda separation for ~$0.04, surfaced the strongest
+  answer). Issue filed for the two gaps.
+- [ux] **sequence gives no per-step health rollup**. Step syntheses
+  mentioned a truncated panellist, but the result JSON has no per-step
+  run_summary/no_value, so step-level waste is invisible without reading
+  run dirs. Wall time 493s for 3 steps x 3 models is fine for research
+  use, but only if progress reaches the host.
+- [ux] **synthesise(anonymised=true) output cites real slugs**, which read
+  as a blinding bug until reading synth.py: the synth input is always
+  blinded and shuffled, output deliberately de-blinded, and `anonymised`
+  only scrubs brand names from the prompt bundle. The tool description
+  ("hide real model IDs from the synthesiser input") invites the wrong
+  read, and nothing in the result says blinding happened. Fold into the
+  calibration-report work: disclose the bias controls per run.
+- [ux] **blinded refine now returns real model_id per final_manifest
+  entry** (043229), where the 2026-05-20 pass four recorded model_id=None
+  on blinded manifests. Either an intentional post-hoc reveal or a
+  regression from the 0.4.0 identity work; needs a decided, documented
+  answer. Issue filed.
+- [ux] **research capsules lose the web panellist's sources**. sonar-pro's
+  sources_cited came back as opaque indices (["[3]", "[4]"]) that only
+  resolve inside the full body. The one web-grounded panellist's citations
+  are unusable from the capsule. Kind verdict: claims/evidence/uncertainties
+  shape clearly beat decision-shape for the competitive scan; worth keeping
+  with the sources fix and a rethink of the 4000 cap (3/13 zero-value).
+- [meta] **Panellists asserted stale host facts with confidence**: "agent
+  hosts time out MCP tool calls over 15s" (glm, echoed by the synth) while
+  this very session ran 271s and 493s tool calls in Claude Code without
+  incident. Only 1 of 14 deep panellists had web access. Good calibration
+  case for the research tier and for weighting web-grounded panellists.
