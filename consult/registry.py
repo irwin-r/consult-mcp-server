@@ -21,6 +21,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+from .envutil import env_float
 from .exceptions import UnknownModelError
 
 _PKG_CONFIG = Path(__file__).parent / "config"
@@ -145,10 +146,8 @@ def default_capsule_extractor() -> str:
 
 
 def default_max_run_usd() -> float:
-    env = os.environ.get("CONSULT_MAX_RUN_USD")
-    if env:
-        return float(env)
-    return float(models_config().get("defaults", {}).get("max_run_usd", 5.0))
+    cfg_default = float(models_config().get("defaults", {}).get("max_run_usd", 5.0))
+    return env_float("CONSULT_MAX_RUN_USD", cfg_default)
 
 
 def list_rubrics() -> list[str]:

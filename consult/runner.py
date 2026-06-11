@@ -24,6 +24,7 @@ import litellm
 from . import artifacts, context, registry, slugs, telemetry
 from . import attachments as attachments_mod
 from .capsule import MAX_TOKENS_BY_KIND
+from .envutil import env_float, env_int
 from .progress import (
     Heartbeat,
     PanellistCompleted,
@@ -354,8 +355,8 @@ async def _acompletion_with_retry(*, timeout: float, **kwargs: Any) -> Any:
     transient_classes = _transient_error_classes()
     bare_api_cls = _bare_api_error_class()
     retriable: tuple[type[BaseException], ...] = (rate_cls, *transient_classes)
-    max_attempts = max(1, int(os.environ.get("CONSULT_RETRY_MAX_ATTEMPTS", _RETRY_MAX_ATTEMPTS)))
-    base_delay = float(os.environ.get("CONSULT_RETRY_BASE_DELAY", _RETRY_BASE_DELAY_S))
+    max_attempts = max(1, env_int("CONSULT_RETRY_MAX_ATTEMPTS", _RETRY_MAX_ATTEMPTS))
+    base_delay = env_float("CONSULT_RETRY_BASE_DELAY", _RETRY_BASE_DELAY_S)
     model_label = kwargs.get("model", "?")
 
     start = time.monotonic()
@@ -565,7 +566,7 @@ _STREAM_PARTIAL_INTERVAL_S_DEFAULT = 1.0
 
 def _stream_partial_interval_s() -> float:
     """Read at call time so test monkeypatching of the env var works."""
-    return float(os.environ.get("CONSULT_STREAM_PARTIAL_INTERVAL_S", _STREAM_PARTIAL_INTERVAL_S_DEFAULT))
+    return env_float("CONSULT_STREAM_PARTIAL_INTERVAL_S", _STREAM_PARTIAL_INTERVAL_S_DEFAULT)
 
 
 def _max_input_tokens(litellm_id: str, entry: dict[str, Any]) -> int | None:
@@ -1761,7 +1762,7 @@ async def fanout(
 
     # Heartbeat task: periodic liveness pulse. Set CONSULT_HEARTBEAT_INTERVAL_S=0
     # to disable (used in tests that mock _call_one to instant returns).
-    hb_interval = float(os.environ.get("CONSULT_HEARTBEAT_INTERVAL_S", 5.0))
+    hb_interval = env_float("CONSULT_HEARTBEAT_INTERVAL_S", 5.0)
     heartbeat_task: asyncio.Task[None] | None = None
     if hb_interval > 0:
 
@@ -1858,8 +1859,8 @@ async def fanout(
     # long-context reviews produce useful capsules from slower models (kimi,
     # qwen, deepseek often take 60-180s on ~200K input), so the prior 30s was
     # dropping real signal on wide panels.
-    tail_dropout_s = float(os.environ.get("CONSULT_TAIL_DROPOUT_S", 180.0))
-    tail_k_frac = float(os.environ.get("CONSULT_TAIL_K_FRAC", 0.2))
+    tail_dropout_s = env_float("CONSULT_TAIL_DROPOUT_S", 180.0)
+    tail_k_frac = env_float("CONSULT_TAIL_K_FRAC", 0.2)
 
     try:
         manifest = await _gather_with_tail_dropout(

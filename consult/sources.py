@@ -37,6 +37,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
+from .envutil import env_float
 from .exceptions import PathTrustError
 
 logger = logging.getLogger(__name__)
@@ -47,7 +48,13 @@ logger = logging.getLogger(__name__)
 # a "ref" like `--no-index` becomes `git diff --no-index..HEAD`, smuggling
 # a git option through as a positional arg.
 _REF_RE = re.compile(r"^[A-Za-z0-9._/+~^][A-Za-z0-9._/+~^-]*$")
-_DEFAULT_GIT_TIMEOUT_S = float(os.environ.get("CONSULT_GIT_TIMEOUT_S", 30.0))
+_GIT_TIMEOUT_DEFAULT_S = 30.0
+
+
+def _git_timeout_s() -> float:
+    """Read at call time: the old module-level `float(os.environ[...])`
+    crashed the whole import on a malformed value."""
+    return env_float("CONSULT_GIT_TIMEOUT_S", _GIT_TIMEOUT_DEFAULT_S)
 
 
 def _trusted_roots() -> list[Path]:
@@ -154,6 +161,7 @@ def resolve_git_diff(base: str, head: str, repo_path: str | None = None) -> str:
         "GIT_CONFIG_SYSTEM": os.devnull,
         "GIT_TERMINAL_PROMPT": "0",
     }
+    timeout_s = _git_timeout_s()
     try:
         # `--` after the diff range forces git to stop interpreting any
         # subsequent arg as an option. Belt-and-braces with the ref regex's
@@ -165,13 +173,13 @@ def resolve_git_diff(base: str, head: str, repo_path: str | None = None) -> str:
             cwd=repo,
             capture_output=True,
             text=True,
-            timeout=_DEFAULT_GIT_TIMEOUT_S,
+            timeout=timeout_s,
             check=True,
             shell=False,
             env=env,
         )
     except subprocess.TimeoutExpired:
-        raise RuntimeError(f"git diff timed out after {_DEFAULT_GIT_TIMEOUT_S}s for {base}..{head}") from None
+        raise RuntimeError(f"git diff timed out after {timeout_s}s for {base}..{head}") from None
     except subprocess.CalledProcessError as e:
         # stderr length capped — a buggy git wrapper can spew megabytes.
         raise RuntimeError(f"git diff failed (exit {e.returncode}): {e.stderr.strip()[:1024]}") from e

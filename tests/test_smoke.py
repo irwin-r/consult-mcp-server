@@ -6763,7 +6763,7 @@ def test_slow_tail_dropout_default_is_180s():
     from consult import runner
 
     src = inspect.getsource(runner.fanout)
-    assert 'os.environ.get("CONSULT_TAIL_DROPOUT_S", 180.0)' in src
+    assert 'env_float("CONSULT_TAIL_DROPOUT_S", 180.0)' in src
 
 
 @pytest.mark.asyncio
