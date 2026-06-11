@@ -15,7 +15,7 @@ import random
 import time
 from collections.abc import Awaitable, Callable
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import litellm
 
@@ -340,7 +340,7 @@ async def _stream_acompletion(
     complexity without much practical benefit. Falls back to the synthetic
     response object on the happy path.
     """
-    stream = await litellm.acompletion(stream=True, **kwargs)
+    stream = cast(Any, await litellm.acompletion(stream=True, **kwargs))
     chunks: list[Any] = []
     body = ""
     last_emit = time.monotonic()

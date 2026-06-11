@@ -93,7 +93,9 @@ def _estimate_synth_cost(synth_alias: str, manifest: list[ManifestEntry]) -> tup
     """
     try:
         entry = registry.resolve_model(synth_alias)
-        litellm_id = entry["litellm_id"]
+        litellm_id = entry.get("litellm_id")
+        if not litellm_id:
+            return 0.0, False
         tokens_in = sum(m.tokens_out or 0 for m in manifest)
         budget = max(entry.get("default_budget_tokens", 16000), 16000)
         prompt_cost, completion_cost = litellm.cost_per_token(

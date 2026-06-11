@@ -143,6 +143,11 @@ def render_attachment(item: Any) -> str:
     elif isinstance(item, dict) and item.get("source") == "git_diff":
         base = item.get("base")
         head = item.get("head")
+        # The MCP schema marks base/head required, but library callers can
+        # hand us anything; without this guard a missing ref reached the
+        # subprocess resolver as None.
+        if not isinstance(base, str) or not isinstance(head, str):
+            return f"\n[ERROR: malformed git_diff spec (base/head must be strings): {item!r}]\n"
         repo_path = item.get("repo_path")
         label = item.get("label") or f"git_diff[{base}..{head}]"
         kind = "git_diff"

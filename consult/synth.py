@@ -35,7 +35,7 @@ import random
 import re
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any
+from typing import Any, cast
 
 import litellm
 
@@ -276,7 +276,9 @@ async def synthesise(
 
     synth_alias = by_model or registry.default_synthesiser()
     entry = registry.resolve_model(synth_alias)
-    litellm_id = entry["litellm_id"]
+    litellm_id = entry.get("litellm_id")
+    if not litellm_id:
+        raise ValueError(f"synthesiser {synth_alias!r} must be an API model, not a CLI panellist")
     budget = max(entry.get("default_budget_tokens", 16000), 16000)
     timeout = entry.get("default_timeout_s", 300)
     provider = entry.get("provider", "")
@@ -285,13 +287,16 @@ async def synthesise(
     # (consult / refine). Persist a clear sentinel to synthesis.md so the run
     # artifact directory remains consistent.
     try:
-        resp = await asyncio.wait_for(
-            litellm.acompletion(
-                model=litellm_id,
-                messages=build_messages(synth_input, provider),
-                max_completion_tokens=budget,
+        resp = cast(
+            Any,
+            await asyncio.wait_for(
+                litellm.acompletion(
+                    model=litellm_id,
+                    messages=build_messages(synth_input, provider),
+                    max_completion_tokens=budget,
+                ),
+                timeout=timeout,
             ),
-            timeout=timeout,
         )
     except Exception as e:
         logger.warning("synth call failed (%s): %s", litellm_id, redact_exc(e))

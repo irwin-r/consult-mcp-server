@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Mapping
 from typing import Any
 
 import litellm
@@ -32,7 +33,7 @@ def concat_turn_text(turns: list[dict[str, Any]]) -> str:
     return "\n".join(parts)
 
 
-def _max_input_tokens(litellm_id: str, entry: dict[str, Any]) -> int | None:
+def _max_input_tokens(litellm_id: str, entry: Mapping[str, Any]) -> int | None:
     """Return the model's maximum input-token budget, or None if unknown.
 
     Lookup order:

@@ -165,7 +165,9 @@ async def _ping_provider(env_var: str, alias: str) -> tuple[bool, str]:
         import litellm
 
         info = registry.resolve_model(alias)
-        litellm_id = info["litellm_id"]
+        litellm_id = info.get("litellm_id")
+        if not litellm_id:
+            return False, "no litellm_id (CLI panellist?)"
         await litellm.acompletion(
             model=litellm_id,
             messages=[{"role": "user", "content": "."}],

@@ -22,7 +22,12 @@ import logging
 import os
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
+
+if TYPE_CHECKING:
+    from datetime import datetime
+
+    from mcp.types import TaskStatus
 
 import dotenv
 from mcp.server import NotificationOptions, Server
@@ -31,7 +36,6 @@ from mcp.server.stdio import stdio_server
 from mcp.shared.exceptions import McpError
 from mcp.types import (
     INVALID_PARAMS,
-    AnyUrl,
     CancelTaskRequest,
     CancelTaskResult,
     CreateTaskResult,
@@ -47,6 +51,7 @@ from mcp.types import (
     Tool,
     ToolAnnotations,
 )
+from pydantic import AnyUrl
 
 from .. import __version__, artifacts, task_store
 from ..progress import ProgressEvent, event_message
@@ -367,20 +372,23 @@ async def handle_call_tool(
     return CreateTaskResult(
         task=Task(
             taskId=rec.task_id,
-            status=rec.status,  # already one of the TaskStatus literals
-            createdAt=_iso(rec.created_at),
-            lastUpdatedAt=_iso(rec.last_updated_at),
+            # task_store keeps plain strings so the engine never imports
+            # mcp.types; the values are the TaskStatus literals.
+            status=cast("TaskStatus", rec.status),
+            createdAt=_ts(rec.created_at),
+            lastUpdatedAt=_ts(rec.last_updated_at),
             ttl=rec.ttl_ms,
             pollInterval=rec.poll_interval_ms,
         ),
     )
 
 
-def _iso(epoch_seconds: float) -> str:
-    """ISO-8601 timestamp from an `epoch_seconds` float, UTC."""
+def _ts(epoch_seconds: float) -> datetime:
+    """UTC datetime from an `epoch_seconds` float. The SDK's Task fields are
+    datetimes; handing them a real datetime beats relying on string coercion."""
     from datetime import UTC, datetime
 
-    return datetime.fromtimestamp(epoch_seconds, tz=UTC).isoformat()
+    return datetime.fromtimestamp(epoch_seconds, tz=UTC)
 
 
 def _require_task(task_id: str) -> task_store.TaskRecord:
@@ -403,8 +411,8 @@ def _task_snapshot_kwargs(rec: task_store.TaskRecord) -> dict[str, Any]:
         "taskId": rec.task_id,
         "status": rec.status,  # already one of the TaskStatus literals
         "statusMessage": rec.status_message,
-        "createdAt": _iso(rec.created_at),
-        "lastUpdatedAt": _iso(rec.last_updated_at),
+        "createdAt": _ts(rec.created_at),
+        "lastUpdatedAt": _ts(rec.last_updated_at),
         "ttl": rec.ttl_ms,
         "pollInterval": rec.poll_interval_ms,
     }

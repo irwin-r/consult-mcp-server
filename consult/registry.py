@@ -19,13 +19,38 @@ import json
 import os
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict, cast
 
 from .envutil import env_float
 from .exceptions import UnknownModelError
 
 _PKG_CONFIG = Path(__file__).parent / "config"
 _USER_CONFIG = Path(os.path.expanduser("~/.consult"))
+
+
+class ModelEntry(TypedDict, total=False):
+    """One resolved registry row.
+
+    `total=False` because the shape is deliberately ragged: raw LiteLLM IDs
+    synthesise a minimal row, CLI panellists carry `cli_command` instead of
+    `litellm_id`, and the optional knobs (`mode`, `reasoning_effort`,
+    `max_input_tokens`) appear only where models.json sets them. The
+    TypedDict documents the known keys so call sites stop spelunking an
+    untyped dict.
+    """
+
+    alias: str
+    litellm_id: str
+    default_budget_tokens: int
+    default_timeout_s: float
+    provider: str
+    family: str
+    privacy_tier: str
+    mode: str
+    reasoning_effort: str
+    max_input_tokens: int
+    cli_command: list[str]
+    cli_env: dict[str, str]
 
 
 def _deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
@@ -69,20 +94,21 @@ def stances_config() -> dict[str, str]:
     return _load_json("stances.json")
 
 
-def resolve_model(alias_or_id: str) -> dict[str, Any]:
+def resolve_model(alias_or_id: str) -> ModelEntry:
     """Look up by registry alias first, then accept a raw LiteLLM ID.
 
-    Returns a dict with at least {alias, litellm_id, default_budget_tokens,
-    default_timeout_s, provider}. Raises `UnknownModelError` (a `KeyError`
-    subclass, so legacy `except KeyError` sites still catch it) if neither
-    matches and the string doesn't look like a LiteLLM ID.
+    Returns a `ModelEntry` with at least {alias, litellm_id,
+    default_budget_tokens, default_timeout_s, provider} (CLI panellists
+    substitute `cli_command` for `litellm_id`). Raises `UnknownModelError`
+    (a `KeyError` subclass, so legacy `except KeyError` sites still catch
+    it) if neither matches and the string doesn't look like a LiteLLM ID.
     """
     cfg = models_config()
     models = cfg["models"]
     if alias_or_id in models:
         entry = dict(models[alias_or_id])
         entry["alias"] = alias_or_id
-        return entry
+        return cast(ModelEntry, entry)
     # Allow raw LiteLLM IDs like "openrouter/x-ai/grok-4.3" — synthesise a row.
     if "/" in alias_or_id or alias_or_id.startswith(("gpt-", "claude-", "gemini-")):
         return {

@@ -15,7 +15,7 @@ import logging
 import math
 import os
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Coroutine
 from contextlib import nullcontext, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -444,7 +444,7 @@ def _dropout_entry(
 
 async def _gather_with_tail_dropout(
     *,
-    run_one: Callable[[ModelSpec, str, str], Awaitable[ManifestEntry]],
+    run_one: Callable[[ModelSpec, str, str], Coroutine[Any, Any, ManifestEntry]],
     specs: list[ModelSpec],
     panel_slugs: list[str],
     per_prompts: list[str],
@@ -542,7 +542,7 @@ async def _gather_with_tail_dropout(
                         total=total,
                         slug=slug,
                         status=recovered.status.value,
-                        latency_ms=recovered.latency_ms,
+                        latency_ms=recovered.latency_ms or 0,
                     )
                 )
                 continue
@@ -922,7 +922,7 @@ async def fanout(
                     total=total,
                     slug=slug,
                     status=entry.status.value,
-                    latency_ms=entry.latency_ms,
+                    latency_ms=entry.latency_ms or 0,
                 )
             )
             return entry

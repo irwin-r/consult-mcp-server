@@ -18,7 +18,7 @@ import logging
 import random
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import litellm
 
@@ -324,7 +324,9 @@ async def _ask_arbiter(
     prior_manifest: list[ManifestEntry] | None = None,
 ) -> ArbiterVerdict:
     entry = registry.resolve_model(arbiter_alias)
-    litellm_id = entry["litellm_id"]
+    litellm_id = entry.get("litellm_id")
+    if not litellm_id:
+        raise ValueError(f"arbiter {arbiter_alias!r} must be an API model, not a CLI panellist")
     timeout = entry.get("default_timeout_s", 180)
 
     usable_count = sum(1 for m in manifest if m.status in (Status.OK, Status.TRUNCATED))
@@ -354,9 +356,12 @@ async def _ask_arbiter(
     }
     provider_caps.apply_temperature(call_kwargs, litellm_id, 0.0)
     try:
-        resp = await asyncio.wait_for(
-            litellm.acompletion(**call_kwargs),
-            timeout=timeout,
+        resp = cast(
+            Any,
+            await asyncio.wait_for(
+                litellm.acompletion(**call_kwargs),
+                timeout=timeout,
+            ),
         )
     except Exception as e:
         logger.warning("arbiter call failed: %s", redact_exc(e))

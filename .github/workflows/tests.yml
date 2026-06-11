@@ -23,6 +23,12 @@ jobs:
       - name: Run ruff
         run: uv run ruff check
 
+      - name: Check formatting
+        run: uv run ruff format --check
+
+      - name: Run pyright
+        run: uv run pyright
+
   test:
     runs-on: ubuntu-latest
     strategy:
@@ -42,4 +48,4 @@ jobs:
         run: uv sync --extra dev
 
       - name: Run tests
-        run: uv run pytest -v --cov=consult --cov-report=term-missing
+        run: uv run pytest -v --cov=consult --cov-report=term-missing --cov-fail-under=80

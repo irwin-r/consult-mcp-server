@@ -76,7 +76,10 @@ def estimate_cost(
         # conservative for what is genuinely free at this layer).
         if entry.get("provider") == "cli":
             continue
-        litellm_id = entry["litellm_id"]
+        litellm_id = entry.get("litellm_id")
+        if not litellm_id:
+            all_known = False
+            continue
         try:
             tin = litellm.token_counter(model=litellm_id, text=prompt)
             # Match _call_one: estimate output by capsule_kind, not per-model

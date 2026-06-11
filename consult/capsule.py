@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from typing import Any
+from typing import Any, cast
 
 import litellm
 
@@ -204,7 +204,7 @@ def _body_has_findings(body: str) -> bool:
 async def _extract_one(
     body: str,
     extractor_id: str,
-    timeout: int,
+    timeout: float,
     original_question: str | None = None,
     *,
     kind: str = "decision",
@@ -248,9 +248,12 @@ async def _extract_one(
     }
     provider_caps.apply_temperature(kwargs, extractor_id, 0.0)
     try:
-        resp = await asyncio.wait_for(
-            litellm.acompletion(**kwargs),
-            timeout=timeout,
+        resp = cast(
+            Any,
+            await asyncio.wait_for(
+                litellm.acompletion(**kwargs),
+                timeout=timeout,
+            ),
         )
     except Exception as e:
         logger.warning("capsule extractor call failed for extractor=%s: %s", extractor_id, redact_exc(e))
@@ -307,7 +310,9 @@ async def _extract_one(
             }
         ]
         try:
-            retry_resp = await asyncio.wait_for(litellm.acompletion(**retry_kwargs), timeout=timeout)
+            retry_resp = cast(
+                Any, await asyncio.wait_for(litellm.acompletion(**retry_kwargs), timeout=timeout)
+            )
             billed_responses.append(retry_resp)
             retry_data = extract_json(retry_resp.choices[0].message.content or "") or {}
             if retry_data.get("confidence") in (None, "null"):
@@ -368,7 +373,11 @@ async def annotate(
     """
     ext_alias = extractor or registry.default_capsule_extractor()
     ext_entry = registry.resolve_model(ext_alias)
-    ext_id = ext_entry["litellm_id"]
+    ext_id = ext_entry.get("litellm_id")
+    if not ext_id:
+        # A CLI panellist has no litellm_id; using one as the extractor was
+        # a guaranteed KeyError deep in the annotate pass.
+        raise ValueError(f"capsule extractor {ext_alias!r} must be an API model, not a CLI panellist")
     timeout = ext_entry.get("default_timeout_s", 60)
 
     paths = artifacts.load_run(handle.run_id)
