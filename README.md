@@ -462,7 +462,12 @@ or `tier="deep"` (heavily aggregator-routed).
 
 ```
 consult/                # ENGINE — no mcp.* imports
-  runner.py             # async fanout + LiteLLM + progress log
+  runner/               # async fan-out package (facade in __init__)
+    transport.py        #   LiteLLM retry/streaming/Responses adapter
+    fit.py              #   context-budget fitting + attachment trims
+    specs.py            #   model:N expansion + slug grammar
+    costs.py            #   panel cost estimation
+    fanout.py           #   _call_one, slow-tail dropout, fanout()
   capsule.py            # post-fanout structured extraction
   synth.py              # flagship synthesiser
   refine.py             # arbiter-driven loop (max 3 rounds) + continuation
@@ -480,6 +485,9 @@ consult/                # ENGINE — no mcp.* imports
   status.py             # LiteLLM response → Status
   types.py              # Pydantic models (StrictModel base)
   jsonparse.py          # tolerant JSON extraction from model output
+  cost.py               # CostMeter — spend roll-up with unknown propagation
+  envutil.py            # tolerant numeric env parsing
+  exceptions.py         # typed exception taxonomy
   provider_caps.py      # per-provider capability flags (temperature, etc.)
   cli_executor.py       # CLI-as-panellist subprocess transport
   telemetry.py          # optional OpenTelemetry spans (otel extra)

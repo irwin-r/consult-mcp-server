@@ -32,6 +32,10 @@ USER consult
 
 # Run directory: per-run artifacts land under /home/consult/.consult/runs/.
 # Mount a host volume here if you want runs to survive container restarts.
+# The mkdir runs as the consult user so the volume mountpoint exists in the
+# image with the right owner — Docker would otherwise create it root-owned
+# at runtime and the server couldn't write its first run.
+RUN mkdir -p /home/consult/.consult
 VOLUME ["/home/consult/.consult"]
 
 ENTRYPOINT ["consult-mcp"]

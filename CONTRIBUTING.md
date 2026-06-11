@@ -17,8 +17,8 @@ cp .env.example .env   # then fill in at least one provider key
 ## Running tests
 
 ```sh
-uv run pytest -v                  # full suite
-uv run pytest tests/test_smoke.py # smoke only
+uv run pytest -v                    # full suite
+uv run pytest tests/test_runner.py  # one module's tests (per-module layout)
 ```
 
 Live tests are gated on provider API keys — they skip cleanly when absent.
