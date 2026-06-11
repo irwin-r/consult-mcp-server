@@ -24,6 +24,7 @@ import litellm
 
 from . import artifacts, capsule, context, provider_caps, registry, runner, slugs, strategies, synth
 from . import progress as progress_mod
+from .cost import CostMeter
 from .jsonparse import extract_json
 from .redact import redact_exc, redact_secrets
 from .types import (
@@ -586,32 +587,36 @@ def _apply_continuation(prompt: str, continuation_id: str | None) -> tuple[str, 
 
 async def _round_cost_gate(
     *,
-    round_base_specs: list[ModelSpec],
+    round_inputs: list[tuple[ModelSpec, str]],
     round_prompt: str,
-    prior_turns: list[dict[str, Any]] | None,
     resolved_kind: str,
     arbiter_spec: ModelSpec,
-    cumulative_cost: float,
+    spent_usd: float,
     cap: float,
 ) -> str | None:
     """Estimate the next refine round's cost (fanout + arbiter) and decide
     whether to proceed. Returns a `partial_reason` when the round should be
     refused, or None to proceed.
 
+    `round_inputs` pairs each panellist with the input text it will
+    actually send: its accumulated conversation history plus the round
+    prompt. Per-panellist pricing matters from round 2 on — histories
+    grow per slug, and a single shared-text estimate ignored them, waving
+    through rounds whose real input was much larger. Mispricing here is
+    worse than elsewhere: a round that fanout then rejects as
+    cap-exceeded clobbers the prior round's manifest (shared `paths`).
+
     Two refusals: the estimate would push cumulative spend past the cap, or
     pricing is unknown and spend is already past 80% of the cap (a conservative
     floor that still leaves headroom for one bounded round).
     """
-    # Mirror runner.fanout's view: when a continuation is active, the
-    # prior_turns text is part of every panellist call's input. Omitting it
-    # here would wave through a round that fanout then rejects as cap-exceeded,
-    # whose early return clobbers the prior round's manifest (shared `paths`).
-    fanout_cost_input = round_prompt
-    if prior_turns:
-        fanout_cost_input = runner.concat_turn_text(prior_turns) + "\n" + round_prompt
-    fanout_est, fanout_known = await runner.aestimate_cost(
-        round_base_specs, fanout_cost_input, capsule_kind=resolved_kind
-    )
+    fanout_est = 0.0
+    fanout_known = True
+    for spec, cost_input in round_inputs:
+        est, known = await runner.aestimate_cost([spec], cost_input, capsule_kind=resolved_kind)
+        fanout_est += est
+        if not known:
+            fanout_known = False
     # The arbiter call has its own hardcoded max_completion_tokens=2000 (see
     # _ask_arbiter); "decision" matches that budget so the estimate is honest.
     arbiter_est, arbiter_known = await runner.aestimate_cost(
@@ -619,9 +624,9 @@ async def _round_cost_gate(
     )
     estimate = fanout_est + arbiter_est
     est_known = fanout_known and arbiter_known
-    if cumulative_cost + estimate > cap:
+    if spent_usd + estimate > cap:
         return (
-            f"would exceed cap: spent ${cumulative_cost:.2f}, next round estimate "
+            f"would exceed cap: spent ${spent_usd:.2f}, next round estimate "
             f"${estimate:.2f} (fanout ${fanout_est:.2f} + arbiter ${arbiter_est:.2f}), "
             f"cap ${cap:.2f}"
         )
@@ -629,11 +634,11 @@ async def _round_cost_gate(
     # most of the way to the cap. FRICTION pass #14 saw an asymmetric
     # round-1-proceeds / round-2-refuses surprise callers with mixed-provider
     # panels; the 80% floor leaves headroom for one more bounded round.
-    if not est_known and cumulative_cost > cap * 0.8:
+    if not est_known and spent_usd > cap * 0.8:
         return (
             f"refusing further rounds: per-model pricing unknown for at least one "
             f"panellist and spend is past 80% of cap "
-            f"(${cumulative_cost:.2f} spent / ${cap:.2f} cap)"
+            f"(${spent_usd:.2f} spent / ${cap:.2f} cap)"
         )
     return None
 
@@ -722,8 +727,7 @@ async def refine(
     start = time.time()
     verdicts: list[ArbiterVerdict] = []
     final_manifest: list[ManifestEntry] = []
-    cumulative_cost = 0.0
-    cost_all_known = True
+    meter = CostMeter()
     converged = False
     partial_reason: str | None = None
 
@@ -794,14 +798,20 @@ async def refine(
             )
             break
         # Estimate the next round's cost (fanout + arbiter) and refuse if it
-        # would blow the cap. See `_round_cost_gate`.
+        # would blow the cap. Each panellist is priced against the input it
+        # will actually send — accumulated history (or the continuation
+        # seed) plus the round prompt. See `_round_cost_gate`.
+        gate_inputs: list[tuple[ModelSpec, str]] = []
+        for rspec in round_base_specs:
+            history = panel_conversations.get(rspec.slug or "") or prior_turns
+            prefix = runner.concat_turn_text(history) + "\n" if history else ""
+            gate_inputs.append((rspec, prefix + round_prompt))
         gate_reason = await _round_cost_gate(
-            round_base_specs=round_base_specs,
+            round_inputs=gate_inputs,
             round_prompt=round_prompt,
-            prior_turns=prior_turns,
             resolved_kind=resolved_kind,
             arbiter_spec=arbiter_spec,
-            cumulative_cost=cumulative_cost,
+            spent_usd=meter.total,
             cap=cap,
         )
         if gate_reason is not None:
@@ -836,7 +846,7 @@ async def refine(
             round_prompt,
             round_specs,
             blinded=blinded,
-            max_run_usd=cap - cumulative_cost,
+            max_run_usd=cap - meter.total,
             existing_paths=paths,
             on_progress=progress_mod.make_phase_cb(
                 emit if on_progress else None,
@@ -861,9 +871,7 @@ async def refine(
         # would clobber round 1's good consensus with the empty failure
         # manifest before the break fired.
         if handle.partial:
-            cumulative_cost += handle.cost_usd
-            if not handle.cost_known:
-                cost_all_known = False
+            meter.add(handle.cost_usd, handle.cost_known)
             partial_reason = f"round {round_num} fanout partial: {handle.partial_reason}"
             break
         final_manifest = handle.manifest
@@ -919,9 +927,7 @@ async def refine(
         # dropped the extractor cost (one bug-fix landed in iter1 of the
         # refine loop). cost_known likewise needs the post-capsule view: an
         # extractor pricing miss flips handle.cost_known False.
-        cumulative_cost += handle.cost_usd
-        if not handle.cost_known:
-            cost_all_known = False
+        meter.add(handle.cost_usd, handle.cost_known)
 
         # Arbiter sees the follow-up question alone when a continuation is
         # active. Passing the full `prompt` (which `_apply_continuation`
@@ -942,19 +948,11 @@ async def refine(
             )
         )
         verdicts.append(verdict)
-        # `is not None` rather than truthy: a successful arbiter call that
-        # returned a $0.00 cost is semantically different from no-cost-known.
-        # Functionally equivalent for zero but reads correctly when the
-        # invariant is "None ⇒ unknown".
-        if verdict.cost_usd is not None:
-            cumulative_cost += verdict.cost_usd
-        # An arbiter pricing miss must propagate to the top-level cost_known.
-        # Previously only the truthy-cost branch fed into the totals — an
-        # unmapped-price arbiter (verdict.cost_usd=None, cost_known=False)
-        # left cost_all_known wrongly True, breaching the same invariant
-        # that bit the consult success path.
-        if not verdict.cost_known:
-            cost_all_known = False
+        # The meter owns the None-means-unknown convention: an unmapped-price
+        # arbiter (cost_usd=None, cost_known=False) adds nothing and flips
+        # the total to a lower bound. The hand-rolled version of this got
+        # the flag wrong once already (iter1 fix).
+        meter.add(verdict.cost_usd, verdict.cost_known)
         paths.arbiter_for(round_num).write_text(verdict.model_dump_json(indent=2))
 
         if not verdict.parsed_ok:
@@ -1003,9 +1001,7 @@ async def refine(
         # (an arbiter failure or cap break, which we keep).
         if synth_result.status is not synth.SynthStatus.OK and partial_reason is None:
             partial_reason = f"synthesis status={synth_result.status.value}"
-        cumulative_cost += synth_result.cost_usd
-        if not synth_result.cost_known:
-            cost_all_known = False
+        meter.add(synth_result.cost_usd, synth_result.cost_known)
         progress_done[0] = progress_total
         await emit(progress_mod.SynthCompleted(done=progress_done[0], total=progress_total))
         # Persist synthesiser + cumulative cost. Refine writes the manifest
@@ -1017,8 +1013,8 @@ async def refine(
         await artifacts.aaugment_manifest(
             paths,
             synthesiser=synth_alias,
-            cost_usd=cumulative_cost,
-            cost_known=cost_all_known,
+            cost_usd=meter.total,
+            cost_known=meter.known,
         )
     else:
         text = "(no rounds completed — see partial_reason)"
@@ -1032,8 +1028,8 @@ async def refine(
         synthesis=text,
         converged=converged,
         threshold=threshold,
-        cost_usd=cumulative_cost,
-        cost_known=cost_all_known,
+        cost_usd=meter.total,
+        cost_known=meter.known,
         wall_ms=wall_ms,
         partial=partial_reason is not None,
         partial_reason=partial_reason,

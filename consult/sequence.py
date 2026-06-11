@@ -19,6 +19,7 @@ from pydantic import Field, model_validator
 
 from . import artifacts, capsule, registry, runner, synth
 from . import progress as progress_mod
+from .cost import CostMeter
 from .types import ModelSpec, StrictModel
 
 logger = logging.getLogger(__name__)
@@ -105,8 +106,7 @@ async def sequence(
 
     start = time.time()
     steps: list[SequenceStep] = []
-    cumulative_cost = 0.0
-    cost_all_known = True
+    meter = CostMeter()
     partial_reason: str | None = None
     prior_synth: str | None = None
     total = len(prompts)
@@ -137,9 +137,9 @@ async def sequence(
             full_prompt,
             capsule_kind=capsule_kind,
         )
-        if cumulative_cost + estimate > cap:
+        if meter.total + estimate > cap:
             partial_reason = (
-                f"would exceed cap: spent ${cumulative_cost:.2f}, step {i} estimate "
+                f"would exceed cap: spent ${meter.total:.2f}, step {i} estimate "
                 f"${estimate:.2f}, cap ${cap:.2f}"
             )
             break
@@ -151,7 +151,7 @@ async def sequence(
         # asked for N specific steps, surfacing cost_known=False at the end
         # is enough signal.
         if not est_known:
-            cost_all_known = False
+            meter.mark_unknown()
 
         await emit(
             progress_mod.SequenceStepStarted(
@@ -164,7 +164,7 @@ async def sequence(
             full_prompt,
             specs,
             blinded=blinded,
-            max_run_usd=cap - cumulative_cost,
+            max_run_usd=cap - meter.total,
             on_progress=progress_mod.make_phase_cb(
                 emit if on_progress else None,
                 step_base,
@@ -178,9 +178,7 @@ async def sequence(
             # breaking — a zero-usable-panel fanout may have billed for
             # timeouts. Mirrors the refine iter1 fix; without this the
             # SequenceResult silently understates spend on the break.
-            cumulative_cost += handle.cost_usd
-            if not handle.cost_known:
-                cost_all_known = False
+            meter.add(handle.cost_usd, handle.cost_known)
             partial_reason = f"step {i} fanout returned partial: {handle.partial_reason}"
             break
 
@@ -194,9 +192,7 @@ async def sequence(
             ),
             kind=capsule_kind,
         )
-        cumulative_cost += handle.cost_usd
-        if not handle.cost_known:
-            cost_all_known = False
+        meter.add(handle.cost_usd, handle.cost_known)
 
         progress_done[0] = step_base + panel_n * 2
         await emit(progress_mod.SynthStarted(done=progress_done[0], total=progress_total))
@@ -208,9 +204,7 @@ async def sequence(
         # refine handlers. Previously this was silently dropped.
         step_cost = handle.cost_usd + synth_result.cost_usd
         step_cost_known = handle.cost_known and synth_result.cost_known
-        cumulative_cost += synth_result.cost_usd
-        if not synth_result.cost_known:
-            cost_all_known = False
+        meter.add(synth_result.cost_usd, synth_result.cost_known)
 
         # Persist + record the step regardless of synth status. Previously
         # the synth-failure break ran BEFORE augment_manifest and
@@ -263,8 +257,8 @@ async def sequence(
     return SequenceResult(
         steps=steps,
         final_synthesis=final,
-        cost_usd=cumulative_cost,
-        cost_known=cost_all_known,
+        cost_usd=meter.total,
+        cost_known=meter.known,
         wall_ms=wall_ms,
         partial=partial_reason is not None,
         partial_reason=partial_reason,
