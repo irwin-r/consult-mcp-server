@@ -10,7 +10,7 @@ import json
 import pytest
 
 from consult import artifacts
-from consult.types import ArbiterVerdict, ManifestEntry, RunHandle, Status
+from consult.types import ArbiterVerdict, Capsule, ManifestEntry, RunHandle, Status
 
 
 def test_run_handle_usable_parametric():
@@ -204,3 +204,64 @@ def test_sequenceresult_invariant_propagates_step_cost_known():
             wall_ms=0,
         )
     assert "cost_known" in str(exc.value)
+
+
+def _usable_entry(slug, provider, status, capsule=None, error=None):
+    return ManifestEntry(
+        slug=slug,
+        model_id=f"{provider}/m",
+        status=status,
+        resource_uri=f"consult://x/{slug}",
+        body_path=f"/x/{slug}",
+        capsule=capsule,
+        error=error,
+    )
+
+
+def test_usable_counts_truncated_with_capsule_content():
+    """(issue #37) A truncated panellist that still produced a substantive
+    capsule is usable signal, matching how synth and refine treat it."""
+    handle = RunHandle(
+        run_id="r",
+        artifacts_dir="/x",
+        manifest=[
+            _usable_entry("a", "anthropic", Status.OK, capsule=Capsule(position="yes")),
+            _usable_entry("b", "openai", Status.TRUNCATED, capsule=Capsule(position="partial but real")),
+            _usable_entry("c", "google", Status.ERROR, error="boom"),
+        ],
+        cost_usd=0.0,
+        wall_ms=1,
+    )
+    assert handle.usable() is True
+
+
+def test_usable_excludes_truncated_empty_capsule():
+    """(issue #37) Truncated-with-nothing counts the same as a hard failure."""
+    handle = RunHandle(
+        run_id="r",
+        artifacts_dir="/x",
+        manifest=[
+            _usable_entry("a", "anthropic", Status.OK, capsule=Capsule(position="yes")),
+            _usable_entry("b", "openai", Status.TRUNCATED, capsule=Capsule()),
+            _usable_entry("c", "google", Status.ERROR, error="boom"),
+        ],
+        cost_usd=0.0,
+        wall_ms=1,
+    )
+    assert handle.usable() is False
+
+
+def test_usable_excludes_truncated_before_annotation():
+    """(issue #37) Pre-annotation TRUNCATED entries (capsule=None) stay
+    excluded — the conservative reading until the extractor has run."""
+    handle = RunHandle(
+        run_id="r",
+        artifacts_dir="/x",
+        manifest=[
+            _usable_entry("a", "anthropic", Status.OK, capsule=Capsule(position="yes")),
+            _usable_entry("b", "openai", Status.TRUNCATED),
+        ],
+        cost_usd=0.0,
+        wall_ms=1,
+    )
+    assert handle.usable() is False
