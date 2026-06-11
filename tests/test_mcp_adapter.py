@@ -571,3 +571,25 @@ def test_summary_without_cost_omits_metric_but_counts_usable():
     summary = _summarise_manifest([_entry("a", "OK", good)])
     assert summary["usable_capsules"] == 1
     assert "cost_per_usable_capsule" not in summary
+
+
+@pytest.mark.asyncio
+async def test_augment_result_summarises_refine_final_manifest():
+    """Refine results carry final_manifest, not manifest; the rollup must
+    still appear so a dud panellist is visible without digging run dirs."""
+    from consult.mcp.handlers import _augment_result
+
+    good = {"kind": "decision", "position": "yes", "recommendation": "do", "key_points": ["x"]}
+    result = await _augment_result(
+        {
+            "run_id": "nonexistent-run-for-render",
+            "cost_usd": 0.2,
+            "final_manifest": [
+                _entry("a", "OK", good),
+                _entry("b", "TIMEOUT", None, error="timed out"),
+            ],
+        }
+    )
+    assert result["run_summary"]["usable_capsules"] == 1
+    assert result["run_summary"]["cost_per_usable_capsule"] == pytest.approx(0.2)
+    assert result["run_summary"]["no_value"][0]["slug"] == "b"

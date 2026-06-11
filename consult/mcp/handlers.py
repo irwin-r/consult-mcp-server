@@ -172,7 +172,13 @@ async def _augment_result(result: dict[str, Any]) -> dict[str, Any]:
     except Exception as e:  # noqa: BLE001 — surfacing is best-effort
         logger.warning("report_url render failed for run %s: %s", run_id, e)
 
-    manifest = result.get("manifest")
+    # Refine results carry `final_manifest` (the last round's panel), not
+    # `manifest` — without the fallback they never got a run_summary and a
+    # dud panellist was invisible from the result (FRICTION 2026-06-11).
+    # On refine, cost_per_usable_capsule prices ALL rounds against the
+    # final round's usable panellists, which is the honest read: earlier
+    # rounds are what the final capsules cost to produce.
+    manifest = result.get("manifest") or result.get("final_manifest")
     if isinstance(manifest, list) and manifest:
         try:
             cost = result.get("cost_usd")
