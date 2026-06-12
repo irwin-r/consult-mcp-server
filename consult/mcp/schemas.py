@@ -130,8 +130,11 @@ PANEL_SCHEMA = {
             "description": (
                 "After the panel, have each panellist rank the others' "
                 "anonymised answers; Borda-count aggregate lands in the "
-                "result as `peer_ranking`. Costs roughly one extra call "
-                "per panellist."
+                "result as `peer_ranking`, with `cost_usd`/`cost_known` "
+                "line items and per_ranker entries "
+                "{ranker, pairs, reason, cost_usd, cost_known} (reason "
+                "is null unless that ranker's contribution was dropped). "
+                "Costs roughly one extra call per panellist."
             ),
         },
     },

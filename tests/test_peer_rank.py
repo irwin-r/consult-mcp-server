@@ -99,6 +99,8 @@ async def test_peer_rank_borda_aggregates_per_ranker_contributions(monkeypatch):
     assert result.ranks == [("a", 2), ("b", 1), ("c", 0)]
     # Cost rolled up across 3 ranker calls
     assert result.cost_usd == pytest.approx(0.003, abs=1e-9)
+    # Usable rankings carry no drop reason
+    assert all(o.reason is None and not o.failed for o in result.per_ranker)
 
 
 @pytest.mark.asyncio
@@ -136,9 +138,16 @@ async def test_peer_rank_skips_failed_rankers(monkeypatch):
     assert isinstance(result, PeerRanking)
     # Cost reflects only the successful calls
     assert result.cost_usd == pytest.approx(0.002, abs=1e-9)
-    # All 3 rankers appear in per_ranker, but the failed one has empty pairs
-    failed = [r for r in result.per_ranker if not r[1]]
+    # All 3 rankers appear in per_ranker; the failed one carries the
+    # drop reason and an unknown (zero) spend.
+    failed = [o for o in result.per_ranker if o.failed]
     assert len(failed) == 1
+    assert failed[0].pairs == []
+    assert failed[0].reason == "ranker raised TimeoutError: first ranker timed out"
+    assert failed[0].cost_usd == 0.0
+    assert failed[0].cost_known is False
+    # An unknowable ranker spend makes the pass total unknowable too
+    assert result.cost_known is False
 
 
 @pytest.mark.asyncio
@@ -264,6 +273,227 @@ async def test_peer_rank_all_rankers_fail_returns_zeroed_ranking(monkeypatch):
         question="q",
     )
     assert ranking.ranks == [("a-0", 0), ("b-1", 0)]
-    assert all(pairs == [] for _ranker, pairs in ranking.per_ranker)
+    assert all(o.pairs == [] for o in ranking.per_ranker)
+    assert all(o.reason == "non-JSON ranking" for o in ranking.per_ranker)
+    # Parse failures still billed a real call — that spend is preserved
+    # per outcome and lands in the pass total.
+    assert all(o.cost_usd == pytest.approx(0.001) for o in ranking.per_ranker)
     assert ranking.cost_usd == pytest.approx(0.002)
     assert ranking.cost_known is True
+
+
+# --- RankerOutcome forensics (issue #58) -----------------------------------
+#
+# A dropped ranker must say WHY it was dropped and what it cost. These
+# exercise `_ask_one_ranker` directly, one test per failure exit.
+
+
+def _ranker_view(monkeypatch):
+    """Pin the per-ranker shuffle so labels are deterministic."""
+    monkeypatch.setattr(
+        peer_rank_mod,
+        "_blocks_for_ranker",
+        lambda others, bodies: (
+            "\n\n".join(f"[{['Alpha', 'Beta', 'Gamma'][i]}]\n{bodies[e.slug]}" for i, e in enumerate(others)),
+            {label: entry.slug for label, entry in zip(["Alpha", "Beta", "Gamma"], others, strict=False)},
+        ),
+    )
+
+
+async def _run_one_ranker(monkeypatch, payload):
+    _ranker_view(monkeypatch)
+
+    async def fake_acompletion(**kw):
+        return _fake_response(payload)
+
+    monkeypatch.setattr("consult.peer_rank.litellm.acompletion", fake_acompletion)
+    monkeypatch.setattr(
+        "consult.peer_rank.litellm.completion_cost",
+        lambda completion_response=None: 0.001,
+    )
+    return await peer_rank_mod._ask_one_ranker(
+        ranker=_entry("r", "x/r"),
+        others=[_entry("a", "x/a"), _entry("b", "x/b")],
+        bodies={"a": "A", "b": "B"},
+        question="Q?",
+    )
+
+
+@pytest.mark.asyncio
+async def test_ask_one_ranker_success_has_no_reason(monkeypatch):
+    outcome = await _run_one_ranker(monkeypatch, {"ranking": ["Alpha", "Beta"]})
+    assert outcome.slug == "r"
+    assert outcome.pairs == [(1, "a"), (2, "b")]
+    assert outcome.reason is None
+    assert not outcome.failed
+    assert outcome.cost_usd == pytest.approx(0.001)
+    assert outcome.cost_known is True
+
+
+@pytest.mark.asyncio
+async def test_ask_one_ranker_prompt_example_uses_actual_labels(monkeypatch):
+    """The JSON example in the rank prompt is built from the ranker's
+    real labels. The old hardcoded three-label example taught models to
+    copy it verbatim and invent labels on two-peer rankings."""
+    _ranker_view(monkeypatch)
+    captured: dict = {}
+
+    async def capture(**kw):
+        captured["prompt"] = kw["messages"][0]["content"]
+        return _fake_response({"ranking": ["Alpha", "Beta"]})
+
+    monkeypatch.setattr("consult.peer_rank.litellm.acompletion", capture)
+    monkeypatch.setattr(
+        "consult.peer_rank.litellm.completion_cost",
+        lambda completion_response=None: 0.001,
+    )
+    outcome = await peer_rank_mod._ask_one_ranker(
+        ranker=_entry("r", "x/r"),
+        others=[_entry("a", "x/a"), _entry("b", "x/b")],
+        bodies={"a": "A", "b": "B"},
+        question="Q?",
+    )
+    assert not outcome.failed
+    assert '{"ranking": ["Alpha", "Beta"]}' in captured["prompt"]
+    assert "Gamma" not in captured["prompt"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("payload", "expected_reason"),
+    [
+        ({"ranking": ["Zeta", "Beta"]}, "unknown or non-string label 'Zeta'"),
+        ({"ranking": [42, "Beta"]}, "unknown or non-string label 42"),
+        ({"ranking": ["Alpha", "Alpha"]}, "duplicate label Alpha"),
+        ({"ranking": ["Alpha"]}, "ranked only 1/2 labels"),
+        ({"ranking": "Alpha"}, "ranking field missing or not a list"),
+        ({"verdict": "fine"}, "ranking field missing or not a list"),
+    ],
+)
+async def test_ask_one_ranker_reason_per_failure_path(monkeypatch, payload, expected_reason):
+    outcome = await _run_one_ranker(monkeypatch, payload)
+    assert outcome.failed
+    assert outcome.reason == expected_reason
+    assert outcome.pairs == []
+    # The call was billed before the parse failed — spend is preserved
+    assert outcome.cost_usd == pytest.approx(0.001)
+    assert outcome.cost_known is True
+
+
+@pytest.mark.asyncio
+async def test_ask_one_ranker_non_json_reason_preserves_cost(monkeypatch):
+    from types import SimpleNamespace
+
+    _ranker_view(monkeypatch)
+
+    async def garbage(**kw):
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="definitely not json"))]
+        )
+
+    monkeypatch.setattr("consult.peer_rank.litellm.acompletion", garbage)
+    monkeypatch.setattr(
+        "consult.peer_rank.litellm.completion_cost",
+        lambda completion_response=None: 0.001,
+    )
+    outcome = await peer_rank_mod._ask_one_ranker(
+        ranker=_entry("r", "x/r"),
+        others=[_entry("a", "x/a"), _entry("b", "x/b")],
+        bodies={"a": "A", "b": "B"},
+        question="Q?",
+    )
+    assert outcome.reason == "non-JSON ranking"
+    assert outcome.cost_usd == pytest.approx(0.001)
+    assert outcome.cost_known is True
+
+
+@pytest.mark.asyncio
+async def test_ask_one_ranker_no_content_reason(monkeypatch):
+    from types import SimpleNamespace
+
+    _ranker_view(monkeypatch)
+
+    async def empty(**kw):
+        return SimpleNamespace(choices=[])
+
+    monkeypatch.setattr("consult.peer_rank.litellm.acompletion", empty)
+    monkeypatch.setattr(
+        "consult.peer_rank.litellm.completion_cost",
+        lambda completion_response=None: 0.001,
+    )
+    outcome = await peer_rank_mod._ask_one_ranker(
+        ranker=_entry("r", "x/r"),
+        others=[_entry("a", "x/a")],
+        bodies={"a": "A"},
+        question="Q?",
+    )
+    assert outcome.reason == "response carried no content"
+    assert outcome.cost_usd == pytest.approx(0.001)
+
+
+@pytest.mark.asyncio
+async def test_ask_one_ranker_unresolvable_model_is_flagged(monkeypatch):
+    """No model_id and a slug that isn't a registry alias: flagged as a
+    failure, but with a known-zero spend (no call was made)."""
+    _ranker_view(monkeypatch)
+
+    def no_such_alias(slug):
+        raise KeyError(slug)
+
+    monkeypatch.setattr(peer_rank_mod.registry, "resolve_model", no_such_alias)
+    ranker = ManifestEntry(
+        slug="not-an-alias",
+        model_id=None,
+        status=Status.OK,
+        resource_uri="consult://x/not-an-alias",
+        body_path="/x/not-an-alias",
+    )
+    outcome = await peer_rank_mod._ask_one_ranker(
+        ranker=ranker,
+        others=[_entry("a", "x/a")],
+        bodies={"a": "A"},
+        question="Q?",
+    )
+    assert outcome.failed
+    assert outcome.reason == "no model_id and slug is not a registry alias"
+    assert outcome.cost_usd == 0.0
+    assert outcome.cost_known is True
+
+
+@pytest.mark.asyncio
+async def test_peer_rank_gather_exception_becomes_outcome(monkeypatch):
+    """An exception that escapes `_ask_one_ranker` entirely (a bug, not a
+    provider failure) still lands in per_ranker with a reason, and the
+    pass total is marked unknowable."""
+    manifest = [_entry("a", "x/a"), _entry("b", "x/b")]
+
+    async def boom(**kw):
+        raise RuntimeError("loop bug")
+
+    monkeypatch.setattr(peer_rank_mod, "_ask_one_ranker", boom)
+
+    result = await peer_rank_run(manifest, {"a": "A", "b": "B"}, question="Q?")
+    assert all(o.failed for o in result.per_ranker)
+    assert all(o.reason == "ranker raised RuntimeError: loop bug" for o in result.per_ranker)
+    assert all(o.cost_usd == 0.0 and o.cost_known is False for o in result.per_ranker)
+    assert result.cost_usd == 0.0
+    assert result.cost_known is False
+
+
+@pytest.mark.asyncio
+async def test_ask_one_ranker_truncates_long_reasons(monkeypatch):
+    _ranker_view(monkeypatch)
+
+    async def fail_loudly(**kw):
+        raise RuntimeError("x" * 500)
+
+    monkeypatch.setattr("consult.peer_rank.litellm.acompletion", fail_loudly)
+    outcome = await peer_rank_mod._ask_one_ranker(
+        ranker=_entry("r", "x/r"),
+        others=[_entry("a", "x/a")],
+        bodies={"a": "A"},
+        question="Q?",
+    )
+    assert outcome.failed
+    assert len(outcome.reason) == 200
+    assert outcome.reason.startswith("ranker raised RuntimeError: xxx")
