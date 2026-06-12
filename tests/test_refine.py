@@ -717,6 +717,7 @@ async def test_refine_round_two_passes_per_panellist_conversation(
                 "specs": [(s.model, s.slug) for s in specs],
                 "prior_turns": copy.deepcopy(kwargs.get("prior_turns")),
                 "prior_turns_by_slug": copy.deepcopy(kwargs.get("prior_turns_by_slug")),
+                "capsule_kind": kwargs.get("capsule_kind"),
             }
         )
         # Use the existing run dir (existing_paths) when refine passes one
@@ -781,10 +782,17 @@ async def test_refine_round_two_passes_per_panellist_conversation(
         [ModelSpec(model="claude-haiku"), ModelSpec(model="gpt-mini")],
         threshold=0.85,
         max_rounds=2,
+        capsule_kind="review",
     )
 
     # Two rounds fired
     assert len(fanout_calls) == 2
+
+    # Every round's fanout must receive the resolved capsule_kind. Omitting
+    # it (the pre-fix behaviour) made fanout default to "decision", which
+    # floored panellist output budgets at the decision cap instead of the
+    # kind cap — reasoning models then burned the whole grant thinking.
+    assert [c["capsule_kind"] for c in fanout_calls] == ["review", "review"]
 
     # Round 1: no per-slug history (the seed) — falls through to global
     # `prior_turns` (None here, since no continuation_id).

@@ -931,6 +931,14 @@ async def refine(
             blinded=blinded,
             max_run_usd=cap - meter.total,
             existing_paths=paths,
+            # Issue #55 follow-up: omitting this defaulted fanout to
+            # "decision", flooring panellist budgets at 2000 instead of the
+            # kind cap — reasoning models burned the whole grant thinking and
+            # returned zero text (run 20260612-005818: gpt-pro spent
+            # 8000/8000 output tokens on reasoning and surfaced as TRUNCATED
+            # with an empty body). `_should_run_round` already prices the
+            # kind cap, so the grant must match the estimate.
+            capsule_kind=resolved_kind,
             on_progress=progress_mod.make_phase_cb(
                 emit if on_progress else None,
                 round_base,
