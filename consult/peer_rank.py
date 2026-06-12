@@ -30,6 +30,7 @@ Implementation notes:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import random
 from dataclasses import dataclass
@@ -46,20 +47,43 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
+class RankerOutcome:
+    """One ranker's contribution to a peer-rank pass.
+
+    `pairs` is `[(rank_position, ranked_slug), ...]`, empty when the
+    ranker produced no usable ranking. `reason` is None on success and a
+    short explanation otherwise (call failure, parse error, label
+    misuse), so a dropped ranker is attributable from the serialised
+    result. `cost_usd`/`cost_known` follow the ManifestEntry convention;
+    a dropped ranker's spend still counts toward the pass total.
+    """
+
+    slug: str
+    pairs: list[tuple[int, str]]
+    reason: str | None = None
+    cost_usd: float = 0.0
+    cost_known: bool = True
+
+    @property
+    def failed(self) -> bool:
+        return self.reason is not None
+
+
+@dataclass(frozen=True)
 class PeerRanking:
     """Aggregate ranking produced by a peer-rank pass.
 
     `ranks` is the canonical output: a list of (slug, borda_count) in
     descending order (most-preferred first). `per_ranker` is the raw
-    per-ranker contributions for forensics — each entry is `(ranker_slug,
-    [(rank_position, ranked_slug), ...])`. Rankers that produced no
-    usable ranking appear with an empty inner list.
+    per-ranker forensics, one `RankerOutcome` per ranker.
 
-    `cost_usd` and `cost_known` follow the same convention as ManifestEntry.
+    `cost_usd` and `cost_known` follow the same convention as
+    ManifestEntry. `cost_known` is conservatively marked False when a
+    ranker raised outright, since that call's spend may be unknowable.
     """
 
     ranks: list[tuple[str, int]]
-    per_ranker: list[tuple[str, list[tuple[int, str]]]]
+    per_ranker: list[RankerOutcome]
     cost_usd: float = 0.0
     cost_known: bool = True
 
@@ -82,7 +106,7 @@ Rank the responses from best to worst, considering:
 
 Return EXACTLY this JSON object (no commentary, no markdown fences):
 
-{{"ranking": ["Alpha", "Beta", "Gamma"]}}
+{{"ranking": {example}}}
 
 — the first label is best, the last is worst. Use every label exactly \
 once. Do NOT invent labels.
@@ -117,27 +141,33 @@ async def _ask_one_ranker(
     others: list[ManifestEntry],
     bodies: dict[str, str],
     question: str,
-) -> tuple[list[tuple[int, str]], float, bool]:
+) -> RankerOutcome:
     """Run the peer-rank prompt against a single ranker.
 
-    Returns `(ranked_pairs, cost_usd, cost_known)` where `ranked_pairs`
-    is a list of (rank_position, ranker_slug_seen_as_real_slug) — empty
-    when the ranker errored or returned malformed JSON or used unknown
-    labels. Cost is captured even on parse failure.
+    Returns a `RankerOutcome`. `pairs` is empty and `reason` set when
+    the ranker errored, returned malformed JSON, or misused labels.
+    Cost is captured even on parse failure.
 
     The ranker is the panellist's model (we use `ranker.model_id`); if
     the model_id was lost (e.g. blinded run) we use the ranker's slug
     as a registry alias (best-effort).
     """
     if not others:
-        # Nothing to rank — return immediately with no cost.
-        return [], 0.0, True
+        # Nothing to rank — not a failure, just no work to do.
+        return RankerOutcome(slug=ranker.slug, pairs=[])
 
     blocks, label_to_slug = _blocks_for_ranker(others, bodies)
+    # The example must use this ranker's real labels. A hardcoded
+    # three-label example taught models to copy it verbatim: on a
+    # two-peer ranking, 7 of 30 nano-tier rankers invented "Gamma" and
+    # were dropped. label_to_slug insertion order matches the rendered
+    # block order, so the example lists labels as the ranker sees them.
+    example = json.dumps(list(label_to_slug))
     prompt = _PEER_RANK_PROMPT.format(
         n=len(others),
         question=question,
         blocks=blocks,
+        example=example,
     )
 
     # Resolve the ranker's model. Prefer model_id (litellm-resolvable)
@@ -151,7 +181,12 @@ async def _ask_one_ranker(
                 "peer_rank: ranker %s has no model_id and slug isn't an alias — skipping",
                 ranker.slug,
             )
-            return [], 0.0, True
+            # No call was made, so the zero spend is known-true.
+            return RankerOutcome(
+                slug=ranker.slug,
+                pairs=[],
+                reason="no model_id and slug is not a registry alias",
+            )
 
     try:
         resp = cast(
@@ -171,7 +206,12 @@ async def _ask_one_ranker(
             ranker.slug,
             e,
         )
-        return [], 0.0, False
+        return RankerOutcome(
+            slug=ranker.slug,
+            pairs=[],
+            reason=f"ranker raised {type(e).__name__}: {e}"[:200],
+            cost_known=False,
+        )
 
     try:
         cost = litellm.completion_cost(completion_response=resp)
@@ -181,10 +221,19 @@ async def _ask_one_ranker(
         cost_value = 0.0
         cost_known = False
 
+    def _dropped(reason: str) -> RankerOutcome:
+        return RankerOutcome(
+            slug=ranker.slug,
+            pairs=[],
+            reason=reason[:200],
+            cost_usd=cost_value,
+            cost_known=cost_known,
+        )
+
     try:
         content = resp.choices[0].message.content or ""
     except (AttributeError, IndexError, KeyError, TypeError):
-        return [], cost_value, cost_known
+        return _dropped("response carried no content")
 
     data = extract_json(content)
     if not isinstance(data, dict):
@@ -193,11 +242,11 @@ async def _ask_one_ranker(
             ranker.slug,
             content[:120].replace("\n", " "),
         )
-        return [], cost_value, cost_known
+        return _dropped("non-JSON ranking")
 
     raw_ranking = data.get("ranking")
     if not isinstance(raw_ranking, list):
-        return [], cost_value, cost_known
+        return _dropped("ranking field missing or not a list")
 
     # Validate: every entry must be a known label, and every label must
     # appear exactly once. Partial / wrong rankings produce no Borda
@@ -212,14 +261,14 @@ async def _ask_one_ranker(
                 ranker.slug,
                 label,
             )
-            return [], cost_value, cost_known
+            return _dropped(f"unknown or non-string label {label!r}")
         if label in seen:
             logger.warning(
                 "peer_rank: %s emitted duplicate label %s",
                 ranker.slug,
                 label,
             )
-            return [], cost_value, cost_known
+            return _dropped(f"duplicate label {label}")
         seen.add(label)
         pairs.append((position, label_to_slug[label]))
     if seen != set(label_to_slug.keys()):
@@ -230,9 +279,14 @@ async def _ask_one_ranker(
             len(seen),
             len(label_to_slug),
         )
-        return [], cost_value, cost_known
+        return _dropped(f"ranked only {len(seen)}/{len(label_to_slug)} labels")
 
-    return pairs, cost_value, cost_known
+    return RankerOutcome(
+        slug=ranker.slug,
+        pairs=pairs,
+        cost_usd=cost_value,
+        cost_known=cost_known,
+    )
 
 
 async def peer_rank_run(
@@ -252,7 +306,8 @@ async def peer_rank_run(
     Returns a `PeerRanking` with aggregate Borda counts. Failing
     rankers (timeout, parse error, malformed ranking) contribute zero to
     the aggregate — their score on the rank scale is uncountable, so
-    surrendering one ranker's input is safer than imputing.
+    surrendering one ranker's input is safer than imputing. Each such
+    ranker's `RankerOutcome` carries the drop reason and its spend.
 
     Cost is the sum of all ranker calls; `cost_known=False` if any
     ranker call's price was unknown.
@@ -277,21 +332,30 @@ async def peer_rank_run(
     # Borda count: rank-1 ⇒ (N-1) pts, rank-(N-1) ⇒ 0 pts.
     n = len(usable)
     points: dict[str, int] = {m.slug: 0 for m in usable}
-    per_ranker: list[tuple[str, list[tuple[int, str]]]] = []
+    per_ranker: list[RankerOutcome] = []
     total_cost = 0.0
     all_known = True
     for ranker, result in zip(usable, results, strict=True):
         if isinstance(result, BaseException):
+            # Defensive: _ask_one_ranker catches its own failures, so
+            # only a bug reaches here. Any spend from a billed-then-
+            # crashed call is lost, hence cost 0 with cost_known False.
             logger.warning("peer_rank: %s ranker raised %r", ranker.slug, result)
-            per_ranker.append((ranker.slug, []))
+            per_ranker.append(
+                RankerOutcome(
+                    slug=ranker.slug,
+                    pairs=[],
+                    reason=f"ranker raised {type(result).__name__}: {result}"[:200],
+                    cost_known=False,
+                )
+            )
             all_known = False
             continue
-        pairs, cost, cost_known = result
-        per_ranker.append((ranker.slug, pairs))
-        total_cost += cost
-        if not cost_known:
+        per_ranker.append(result)
+        total_cost += result.cost_usd
+        if not result.cost_known:
             all_known = False
-        for position, slug in pairs:
+        for position, slug in result.pairs:
             # rank-1 worth most; rank-(N-1) worth 0 (N-1 others ranked, so
             # max points = N-2 for the best, min = 0 for the worst)
             points[slug] += n - 1 - position
@@ -308,5 +372,6 @@ async def peer_rank_run(
 
 __all__ = [
     "PeerRanking",
+    "RankerOutcome",
     "peer_rank_run",
 ]

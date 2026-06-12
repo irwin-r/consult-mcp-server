@@ -217,9 +217,12 @@ async def _attach_peer_ranking(result: dict[str, Any], handle: Any, *, question:
     """Run the opt-in llm-council peer-rank pass and attach it to the result.
 
     Mutates `result` in place: adds `peer_ranking` (Borda ranks plus the
-    per-ranker forensics) and rolls the ranking calls' spend into
+    per-ranker forensics, each entry carrying its pairs, drop reason,
+    and spend) and rolls the ranking calls' spend into
     `cost_usd`/`cost_known`, on disk too so the ledger sees the true run
-    total. Best-effort: a ranking failure logs and leaves the panel
+    total. The block itemises its own `cost_usd`/`cost_known` so the
+    rank pass's spend stays attributable after the roll-up.
+    Best-effort: a ranking failure logs and leaves the panel
     result untouched — the user paid for the panel, not the side-car.
     """
     import asyncio as _asyncio
@@ -238,8 +241,17 @@ async def _attach_peer_ranking(result: dict[str, Any], handle: Any, *, question:
         result["peer_ranking"] = {
             "ranks": [[slug, points] for slug, points in ranking.ranks],
             "per_ranker": [
-                [ranker, [[pos, slug] for pos, slug in pairs]] for ranker, pairs in ranking.per_ranker
+                {
+                    "ranker": outcome.slug,
+                    "pairs": [[pos, slug] for pos, slug in outcome.pairs],
+                    "reason": outcome.reason,
+                    "cost_usd": outcome.cost_usd,
+                    "cost_known": outcome.cost_known,
+                }
+                for outcome in ranking.per_ranker
             ],
+            "cost_usd": ranking.cost_usd,
+            "cost_known": ranking.cost_known,
         }
         result["cost_usd"] = float(result.get("cost_usd") or 0.0) + ranking.cost_usd
         if not ranking.cost_known:

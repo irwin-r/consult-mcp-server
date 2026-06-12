@@ -7,6 +7,57 @@ describe the loop that writes this.
 
 ---
 
+## 2026-06-12 — Peer-rank forensics: drop reasons, spend, and a prompt bug
+
+**Shipped.** Issue #58. This cycle resumed an interrupted one: the branch
+`fix/si-58-peer-rank-forensics` existed with the whole change sitting
+uncommitted on main, no PR, no journal entry. The work was finished, verified,
+and shipped rather than redone.
+
+A failing peer ranker used to vanish into an empty `per_ranker` pair list with
+no reason, and the rank pass's spend never appeared in the panel result. Now
+every ranker exit returns a `RankerOutcome` carrying the drop reason (truncated
+to 200 chars) and the billed spend, the MCP handler serialises those as
+objects, and the `peer_ranking` block itemises its own `cost_usd`/`cost_known`
+before the roll-up. The serialised `per_ranker` shape changes from arrays to
+objects; the old shape shipped in v0.4.1, so the commit carries the breaking
+marker for the 0.5.0 notes.
+
+Validating against reality found a second bug and the fix earned its keep
+immediately: the rank prompt's JSON example hardcoded three labels, and on a
+two-peer ranking 7 of 30 nano-tier rankers copied it verbatim and invented
+"Gamma". Each was dropped, visible for the first time through the new reason
+field. The example is now built from the ranker's real labels. The same
+10-pass concurrent load (about 30 simultaneous ranker calls) went from 7
+dropped to 0, wall time unchanged at 1.8s, all costs known.
+
+**Panel — plan:** not run as a separate call. The build was inherited
+complete, so the plan question (right scope, cheaper alternative) was folded
+into the diff review. All four reviewers agreed the outcome shape was the
+right long-term model over a handler-only patch or a dual-emit migration.
+
+**Panel — diff (code/code_review, $0.36):** 4/4 OK, verdict SHIP, RISK low,
+MERGE yes. Adopted: breaking-change marker plus release-notes visibility,
+softer `cost_known` docstring, a comment on the lossy gather-exception branch,
+a comment pinning the example's label-order invariant. Dismissed: a
+double-count regression test (the exact panel+rank sum is already asserted in
+`test_panel_peer_rank_attaches_ranking_and_cost`); explicitly setting
+`cost_known=True` in `_attach_peer_ranking` (the panel result always carries
+the key; filed nothing, it is one line if it ever bites); the
+unresolvable-model path now reading as a failure outcome (nothing consumes
+empty pairs as neutral, and the field shape is new in this same PR).
+
+**Panel spend this cycle:** ~$0.37 known-priced (diff review $0.36, deepseek
+unpriced; real-API probes ~$0.01).
+
+**Considered, not done this cycle:**
+- #61 research capsules losing the web panellist's source URLs: next in line
+  once the inherited work was cleared.
+- #59 tool-surface pruning and #60 blinded-refine manifest ids: both need a
+  human call on surface changes, left for a cycle with room.
+
+---
+
 ## 2026-06-03 — Cover refine's cost-gate refusal branches
 
 **Shipped.** Three tests in `test_smoke.py` for cost-control branches in
