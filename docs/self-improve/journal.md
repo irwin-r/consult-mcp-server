@@ -7,6 +7,67 @@ describe the loop that writes this.
 
 ---
 
+## 2026-06-12 — Web citation URLs reach bodies and research capsules
+
+**Shipped.** Issue #61. Web-grounded panellists (sonar-pro) cite sources as
+bracket markers whose URL list arrives as response metadata, never as message
+content, so saved bodies and research capsules carried unusable entries like
+`["[3]", "[4]"]`. A probe against `openrouter/perplexity/sonar-pro` settled
+where the metadata lives: top-level `citations`/`search_results` arrive null
+through OpenRouter, and the URLs survive only as `message.annotations` in
+`url_citation` shape, list order matching the 1-indexed markers.
+
+The fix is a new `consult/citations.py`. `harvest` reads the raw `model_dump`
+dict (LiteLLM's models can strip provider-extra fields) and tolerates all
+three shapes. Fanout appends a numbered `Sources:` footer to the body right
+after `classify`, the one choke point every consumer reads. The capsule pass
+splits the footer off before trimming and re-attaches it, and a deterministic
+Python pass rewrites bare-marker `sources_cited` entries against the footer.
+The extractor prompt now demands verbatim copying, no marker resolution, on
+the panel's argument that cheap extractors hallucinate string lookups.
+
+Validation: 10-way concurrent fanout (5x sonar-pro, 5x claude-haiku), run
+twice. All 5 sonar bodies got footers, all 5 research capsules carried full
+`Title - URL` entries with zero bare-marker leaks, haiku bodies stayed
+byte-identical, no lost results, fanout 11.8s and 14.4s. Suite 459 passing
+(22 new tests), ruff clean.
+
+**Panel, plan (standard/consensus, $3.09 known):** 8/8 proceed. Adopted all
+five amendments: probe the real metadata shape first (it reshaped `harvest`,
+the documented top-level fields are dead on the OpenRouter route), read the
+raw dict not the response object, Python-only marker resolution, a stable
+footer delimiter with split-trim-reattach, and no `capsule_kind` gating since
+an empty harvest already scopes the append.
+
+**Panel, diff (code/code_review, $0.42 known):** 4/4 MERGE yes, RISK low x1
+medium x3, verdict DISCUSS. Adopted: structural validation on the footer
+split (an organic delimiter in prose no longer misparses), the inline-dedupe
+rule tightened to require a numbered source-list line, a comment plus test
+pinning bare-digit marker handling, and a drift debug log when the body cites
+more markers than were harvested. Dismissed with reasons: a UUID delimiter
+(bodies are human-read; validation covers the misparse), punctuation-wrapped
+marker resolution (none observed live; pass-through is the safe default),
+warning on unresolvable `[99]` (documented pass-through, a per-capsule warn
+is noise), refine double-append (append runs once per fresh response, and
+the dedupe makes it idempotent anyway), and "classify ordering" (already the
+case; the reviewer misread the diff).
+
+**Panel spend this cycle:** ~$3.51 known-priced (plan $3.09, diff $0.42);
+live validation ~$0.11 further. Several OpenRouter panellists unpriced.
+
+**Considered, not done this cycle:**
+- The arbiter cost-gate input underestimate a scan lane flagged in
+  `refine.py`. Same family as the arbiter-reservation idea the 2026-06-03
+  entry rejected: bounded estimate-vs-actual variance, no clean win.
+- The stance/rubric "prompt injection" a security lane flagged. The MCP
+  caller composes their own panel prompts by design; no boundary is crossed.
+- gpt-pro truncated at its 8000-token budget on the plan call and burned
+  $1.98 for an empty capsule, after the issue 55 budget fix. Filed.
+- Streamed web panellists get no footer (`stream_chunk_builder` drops
+  annotations). Documented in the module docstring and filed.
+
+---
+
 ## 2026-06-12 — Peer-rank forensics: drop reasons, spend, and a prompt bug
 
 **Shipped.** Issue #58. This cycle resumed an interrupted one: the branch

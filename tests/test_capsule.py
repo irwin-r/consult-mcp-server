@@ -502,3 +502,89 @@ async def test_decision_short_body_does_not_retry(monkeypatch):
 
     await capsule_mod._extract_one("No comment.", "anthropic/claude-haiku-4-5", 30, kind="decision")
     assert calls["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_research_capsule_resolves_marker_sources_from_footer(monkeypatch):
+    """A web panellist's body carries a Sources footer (appended by fanout,
+    issue #61); when the extractor copies bare markers into sources_cited,
+    the deterministic post-pass rewrites them to the footer's URLs."""
+    import litellm
+
+    from consult import capsule as capsule_mod
+    from consult.citations import SourceRef, append_sources_footer
+
+    body = append_sources_footer(
+        "Claims:\n1. Python 3.14.6 is current.[1] Released June 2026.[2] "
+        + ("Evidence and reasoning follow. " * 20),
+        [
+            SourceRef(url="https://devguide.python.org/versions/", title="Status of Python versions"),
+            SourceRef(url="https://www.python.org/downloads/"),
+        ],
+    )
+    calls = {"n": 0}
+    monkeypatch.setattr(
+        litellm,
+        "acompletion",
+        _fake_resp_factory(
+            [
+                '{"kind":"research","claims":["3.14.6 is current"],"evidence":["release page"],'
+                '"sources_cited":["[1]","[2]","https://peps.python.org/"]}'
+            ],
+            calls,
+        ),
+    )
+    monkeypatch.setattr(litellm, "completion_cost", lambda completion_response: 0.001)
+
+    capsule, _, _ = await capsule_mod._extract_one(body, "anthropic/claude-haiku-4-5", 30, kind="research")
+    assert capsule.sources_cited == [
+        "Status of Python versions - https://devguide.python.org/versions/",
+        "https://www.python.org/downloads/",
+        "https://peps.python.org/",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_capsule_trim_preserves_sources_footer(monkeypatch):
+    """The Sources footer must survive body trimming: the prose is trimmed,
+    the footer is re-attached whole, so the extractor can always see the
+    lines the body's [n] markers point at."""
+    import litellm
+
+    from consult import capsule as capsule_mod
+    from consult.citations import SourceRef, append_sources_footer
+
+    monkeypatch.setenv("CONSULT_CAPSULE_BODY_BUDGET_CHARS", "600")
+    body = append_sources_footer(
+        "Long claim.[1] " + ("filler sentence. " * 200),
+        [SourceRef(url="https://tail.example/source", title="Tail Source")],
+    )
+    seen = {}
+
+    async def fake_acompletion(**kwargs):
+        seen["prompt"] = kwargs["messages"][0]["content"]
+
+        class _Resp:
+            choices = [
+                type(
+                    "C",
+                    (),
+                    {
+                        "message": type(
+                            "M", (), {"content": '{"kind":"research","claims":["x"],"evidence":["y"]}'}
+                        )()
+                    },
+                )()
+            ]
+
+            def model_dump(self):
+                return {}
+
+        return _Resp()
+
+    monkeypatch.setattr(litellm, "acompletion", fake_acompletion)
+    monkeypatch.setattr(litellm, "completion_cost", lambda completion_response: 0.001)
+
+    await capsule_mod._extract_one(body, "anthropic/claude-haiku-4-5", 30, kind="research")
+    assert "TRIMMED" in seen["prompt"], "prose over budget should have been trimmed"
+    assert "[1] Tail Source - https://tail.example/source" in seen["prompt"]

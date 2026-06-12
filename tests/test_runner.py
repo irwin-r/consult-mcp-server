@@ -1539,3 +1539,100 @@ async def test_fanout_cost_cap_survives_driver_enrichment_failure(monkeypatch):
     assert handle.partial_reason is not None
     assert "exceeds cap" in handle.partial_reason
     assert "drivers" not in handle.partial_reason
+
+
+@pytest.mark.asyncio
+async def test_call_one_appends_sources_footer_from_annotations(tmp_path, monkeypatch):
+    """A web-grounded panellist's citation metadata (OpenRouter url_citation
+    annotations) must be folded into the persisted body as a Sources footer
+    so the [n] markers resolve everywhere downstream (issue #61)."""
+    from consult import runner
+    from consult.citations import FOOTER_DELIM
+    from consult.runner import _call_one
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+
+    annotations = [
+        {"type": "url_citation", "url_citation": {"url": "https://a.example/one", "title": "One"}},
+        {"type": "url_citation", "url_citation": {"url": "https://b.example/two", "title": "Two"}},
+    ]
+
+    async def fake_acompletion(**kwargs):
+        class _Msg:
+            content = "Grounded claim.[1] Another.[2]"
+            tool_calls = None
+
+        class _Choice:
+            message = _Msg()
+            finish_reason = "stop"
+
+        class _Resp:
+            choices = [_Choice()]
+            usage = None
+
+            def model_dump(self):
+                return {
+                    "citations": None,
+                    "search_results": None,
+                    "choices": [
+                        {
+                            "message": {
+                                "content": _Msg.content,
+                                "annotations": annotations,
+                            }
+                        }
+                    ],
+                }
+
+        return _Resp()
+
+    monkeypatch.setattr(runner.litellm, "acompletion", fake_acompletion)
+    monkeypatch.setattr(runner.litellm, "completion_cost", lambda **_: 0.0)
+
+    paths = artifacts.create_run()
+    entry = await _call_one(ModelSpec(model="claude-haiku"), "haiku-0", "prompt", paths)
+    assert entry.status is Status.OK
+    saved = paths.response_text("haiku-0").read_text()
+    assert saved.startswith("Grounded claim.[1] Another.[2]")
+    assert FOOTER_DELIM in saved
+    assert "[1] One - https://a.example/one" in saved
+    assert "[2] Two - https://b.example/two" in saved
+
+
+@pytest.mark.asyncio
+async def test_call_one_no_footer_without_citation_metadata(tmp_path, monkeypatch):
+    """Responses without citation metadata must persist byte-identical
+    bodies — no footer, no trailing changes."""
+    from consult import runner
+    from consult.citations import FOOTER_DELIM
+    from consult.runner import _call_one
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+
+    async def fake_acompletion(**kwargs):
+        class _Msg:
+            content = "Plain answer, no web grounding."
+            tool_calls = None
+
+        class _Choice:
+            message = _Msg()
+            finish_reason = "stop"
+
+        class _Resp:
+            choices = [_Choice()]
+            usage = None
+
+            def model_dump(self):
+                return {"choices": [{"message": {"content": _Msg.content}}]}
+
+        return _Resp()
+
+    monkeypatch.setattr(runner.litellm, "acompletion", fake_acompletion)
+    monkeypatch.setattr(runner.litellm, "completion_cost", lambda **_: 0.0)
+
+    paths = artifacts.create_run()
+    entry = await _call_one(ModelSpec(model="claude-haiku"), "haiku-0", "prompt", paths)
+    assert entry.status is Status.OK
+    saved = paths.response_text("haiku-0").read_text()
+    assert saved == "Plain answer, no web grounding."
+    assert FOOTER_DELIM not in saved

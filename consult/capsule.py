@@ -17,7 +17,7 @@ from typing import Any, cast
 
 import litellm
 
-from . import artifacts, context, provider_caps, registry
+from . import artifacts, citations, context, provider_caps, registry
 from .jsonparse import extract_json
 from .progress import CapsuleExtracted, PhaseStarted, ProgressCallback, append_progress_log
 from .redact import redact_exc
@@ -107,7 +107,7 @@ Rules:
 - claims: 2-5 entries, each ≤ 20 words. The panellist's main assertions.
 - evidence: 2-5 entries, each ≤ 30 words. What backs each claim (study, doc, first-principles reasoning, vendor claim).
 - uncertainties: 0-3 entries, each ≤ 20 words. Where the panellist is genuinely unsure.
-- sources_cited: 0-5 entries — URLs, papers, vendor docs the panellist named verbatim.
+- sources_cited: 0-5 entries, copied exactly as they appear in the body: URLs, paper titles, or bare bracket markers like "[3]". Do not resolve markers to URLs and do not invent sources.
 - confidence: parse from a "CONFIDENCE:" line in the body if present, else null
 - Output JSON only, no commentary, no markdown fences.
 
@@ -259,7 +259,12 @@ async def _extract_one(
     # loops; claude-opus-4-7 errors outright). `provider_caps` centralises
     # the deny list so capsule/synth/arbiter share the same source of truth.
     # Trim overlong bodies to keep the cheap extractor's input bounded.
-    body = context.trim_capsule_body(body)
+    # The Sources footer (web panellist citations, issue #61) is split off
+    # first and re-attached so it survives regardless of the trim policy —
+    # head+tail today, but a future change must not silently drop the one
+    # block that resolves the body's [n] markers.
+    prose, sources_footer = citations.split_sources_footer(body)
+    body = context.trim_capsule_body(prose) + sources_footer
     prompt = _build_capsule_prompt(body, original_question, kind=kind)
     kwargs: dict[str, Any] = {
         "model": extractor_id,
@@ -354,6 +359,15 @@ async def _extract_one(
                 extractor_id,
                 redact_exc(e),
             )
+
+    # 2c) Resolve bare-marker sources against the body's Sources footer.
+    # Runs once on the adopted capsule (first attempt or retry) — the
+    # extractor prompt asks for verbatim copying only, and this Python pass
+    # owns the marker-to-URL lookup, since cheap extractor models are
+    # unreliable at deterministic string mapping (issue #61).
+    cited = getattr(capsule, "sources_cited", None)
+    if cited:
+        capsule.sources_cited = citations.resolve_marker_sources(cited, body)
 
     # 3) Cost lookup — sum every extractor call we made (first + any retry).
     # A pricing miss on any call flips cost_known False but never discards a
