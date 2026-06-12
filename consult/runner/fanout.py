@@ -25,7 +25,7 @@ import litellm
 
 from consult import runner as _facade
 
-from .. import artifacts, context, registry, telemetry
+from .. import artifacts, citations, context, registry, telemetry
 from .. import attachments as attachments_mod
 from ..capsule import MAX_TOKENS_BY_KIND
 from ..envutil import env_float
@@ -275,6 +275,14 @@ async def _call_one(
             await _write_text_async(paths.response_raw(slug), json.dumps(raw, indent=2, default=str))
 
             status, finish, body = classify(resp)
+            # Web-grounded panellists (sonar) cite sources as [n] markers
+            # whose URL list lives in response metadata, not the content.
+            # Fold it into the body here — the one choke point every
+            # consumer (extractor, synth, artifacts, refine) reads from
+            # (issue #61). Reads `raw` rather than `resp` so LiteLLM's
+            # models can't strip the provider-extra fields.
+            if body:
+                body = citations.append_sources_footer(body, citations.harvest(raw))
             usage = getattr(resp, "usage", None)
             if usage:
                 tokens_in = getattr(usage, "prompt_tokens", None)
