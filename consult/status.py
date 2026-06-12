@@ -86,8 +86,10 @@ def classify(
 ) -> tuple[Status, str | None, str]:
     """Return (status, finish_reason, body_text).
 
-    Designed to be tolerant of provider quirks. Bodies that are mostly whitespace
-    (a known OR thinking-model failure mode) are classified as EMPTY.
+    Designed to be tolerant of provider quirks. When `content` is empty but
+    the model put its text in `reasoning_content`/`reasoning` (OR thinking
+    models), the reasoning text is salvaged as the body; bodies that are
+    still mostly whitespace after that are classified as EMPTY.
     """
     if exception is not None:
         return _classify_exception(exception), None, ""
@@ -104,6 +106,23 @@ def classify(
         return Status.MALFORMED, None, ""
 
     body_stripped = (body or "").strip()
+    if not body_stripped:
+        # OR thinking models (kimi k2.6, glm-5.1) can return an empty
+        # `content` with the actual text in `reasoning_content` — a
+        # completed, billed answer that EMPTY would discard (run
+        # 20260612-005818: kimi finished with finish_reason=stop, 52k chars
+        # of reasoning_content, zero content). Salvage it; truncated
+        # reasoning likewise downgrades to TRUNCATED-with-body, which the
+        # capsule extractor can still mine.
+        msg = getattr(choice, "message", None)
+        salvaged = (
+            (getattr(msg, "reasoning_content", None) or getattr(msg, "reasoning", None) or "")
+            if msg is not None
+            else ""
+        )
+        if isinstance(salvaged, str) and salvaged.strip():
+            body = salvaged
+            body_stripped = salvaged.strip()
     if not body_stripped:
         # Distinguish: empty body + length finish → token exhaustion
         if finish in ("length", "MAX_TOKENS", "max_tokens"):

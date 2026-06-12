@@ -60,6 +60,45 @@ def test_status_classifier_normal_responses():
     assert s == Status.EMPTY
 
 
+def test_status_classifier_salvages_reasoning_content():
+    """OR thinking models (kimi k2.6, glm-5.1) can return an empty `content`
+    with the actual text in `reasoning_content`. classify() must salvage it
+    rather than discard a completed (stop) or partially-useful (length)
+    response — run 20260612-005818 binned a finished kimi answer (52k chars
+    of reasoning_content, zero content) as EMPTY.
+    """
+    from types import SimpleNamespace
+
+    def make_resp(content, finish, reasoning=None):
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content=content, reasoning_content=reasoning),
+                    finish_reason=finish,
+                )
+            ]
+        )
+
+    # Completed answer that landed in the reasoning channel → OK, salvaged.
+    s, _, body = classify(make_resp("", "stop", reasoning="the actual findings"))
+    assert s == Status.OK
+    assert body == "the actual findings"
+
+    # Reasoning truncated before any content → TRUNCATED with the partial body.
+    s, _, body = classify(make_resp("", "length", reasoning="partial reasoning"))
+    assert s == Status.TRUNCATED
+    assert body == "partial reasoning"
+
+    # Whitespace-only reasoning doesn't rescue anything.
+    s, _, _ = classify(make_resp("", "stop", reasoning="   \n"))
+    assert s == Status.EMPTY
+
+    # `content` wins when present; reasoning stays untouched.
+    s, _, body = classify(make_resp("real", "stop", reasoning="ignored"))
+    assert s == Status.OK
+    assert body == "real"
+
+
 def test_daily_ledger_aggregates_costs_status_and_panel_size(tmp_path, monkeypatch):
     """Daily ledger reads every run dir whose ID starts with YYYYMMDD,
     aggregates cost + cost_known, and records per-status counts. Malformed
