@@ -149,6 +149,8 @@ def harvest(raw: Any) -> list[SourceRef]:
 
 # A line that reads as an entry in a provider-inlined reference list:
 # leading number (bracketed or dotted) followed by text carrying a URL.
+# Deliberately permissive — a false match only skips appending the footer,
+# and only when every harvested URL is already present in the body too.
 _NUMBERED_SOURCE_LINE_RE = re.compile(r"^\s*\[?\d{1,3}[\].:]?\s+\S*.*https?://", re.M)
 
 # Any [n] marker in prose — used only for drift observability.
