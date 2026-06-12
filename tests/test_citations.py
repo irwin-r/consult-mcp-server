@@ -109,16 +109,28 @@ def test_append_sources_footer_noop_without_sources_or_body():
     assert append_sources_footer("   \n", [SourceRef(url="https://a.example")]) == "   \n"
 
 
-def test_append_sources_footer_skips_when_all_urls_already_inline():
-    """A provider that inlines its own reference list doesn't need a second
-    one; but if even one URL is missing, the footer is still appended."""
-    body = "See https://a.example and https://b.example for details."
+def test_append_sources_footer_skips_when_provider_inlined_reference_list():
+    """A provider that inlines its own numbered reference list doesn't need
+    a second one; but if even one URL is missing, the footer is still
+    appended."""
+    body = "Claim.[1][2]\n\nReferences:\n[1] https://a.example\n[2] https://b.example"
     refs = [SourceRef(url="https://a.example"), SourceRef(url="https://b.example")]
     assert append_sources_footer(body, refs) == body
 
     refs.append(SourceRef(url="https://c.example"))
     out = append_sources_footer(body, refs)
     assert "[3] https://c.example" in out
+
+
+def test_append_sources_footer_appends_when_urls_only_quoted_in_prose():
+    """URLs merely mentioned in prose are not a reference list — the [n]
+    markers still need the footer to resolve. Substring presence alone
+    must not suppress it."""
+    body = "Compare https://a.example and https://b.example as discussed.[1][2]"
+    refs = [SourceRef(url="https://a.example"), SourceRef(url="https://b.example")]
+    out = append_sources_footer(body, refs)
+    assert FOOTER_DELIM in out
+    assert "[1] https://a.example" in out
 
 
 def test_append_sources_footer_caps_and_notes_elision():
@@ -138,6 +150,15 @@ def test_split_sources_footer_roundtrip():
     assert footer.startswith(FOOTER_DELIM)
 
     assert split_sources_footer("no footer here") == ("no footer here", "")
+
+
+def test_split_sources_footer_rejects_organic_delimiter_without_source_lines():
+    """Prose that organically produces the delimiter text but carries no
+    numbered source lines after it is not a footer — splitting there would
+    exempt an arbitrary tail from trimming and feed garbage to the
+    resolver."""
+    body = "Discussing footers." + FOOTER_DELIM + "are a way to list things, the essay continued."
+    assert split_sources_footer(body) == (body, "")
 
 
 # ------------------------------------------------------------- resolve
@@ -168,6 +189,13 @@ def test_resolve_marker_sources_passes_through_non_markers():
     body = _footered_body()
     cited = ["https://elsewhere.example", "Smith et al. 2024", "[99]", "[1], [2]"]
     assert resolve_marker_sources(cited, body) == cited
+
+
+def test_resolve_marker_sources_leaves_year_like_values_alone():
+    """Four-digit entries ("2023") must never be treated as markers — the
+    3-digit cap in the marker regex is intentional."""
+    body = _footered_body()
+    assert resolve_marker_sources(["2023", "[2024]"], body) == ["2023", "[2024]"]
 
 
 def test_resolve_marker_sources_without_footer_is_noop():

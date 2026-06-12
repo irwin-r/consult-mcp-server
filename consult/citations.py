@@ -147,6 +147,14 @@ def harvest(raw: Any) -> list[SourceRef]:
     return []
 
 
+# A line that reads as an entry in a provider-inlined reference list:
+# leading number (bracketed or dotted) followed by text carrying a URL.
+_NUMBERED_SOURCE_LINE_RE = re.compile(r"^\s*\[?\d{1,3}[\].:]?\s+\S*.*https?://", re.M)
+
+# Any [n] marker in prose — used only for drift observability.
+_BODY_MARKER_RE = re.compile(r"\[(\d{1,3})\]")
+
+
 def append_sources_footer(body: str, sources: list[SourceRef]) -> str:
     """Append a numbered `Sources:` footer so the body resolves its own
     `[n]` markers.
@@ -154,13 +162,19 @@ def append_sources_footer(body: str, sources: list[SourceRef]) -> str:
     Numbering is the 1-indexed list position — the same indexing the
     provider's markers use — so entries must not be deduplicated or
     reordered here. Skipped when there are no sources, the body is empty,
-    or every source URL already appears in the body (a provider that
-    inlines its own reference list doesn't need a second one).
+    or the provider already inlined its own reference list (every source
+    URL present AND a numbered source-list line exists — the structural
+    check keeps URLs merely quoted in prose from suppressing the footer).
     """
     if not body.strip() or not sources:
         return body
-    if all(s.url in body for s in sources):
+    if all(s.url in body for s in sources) and _NUMBERED_SOURCE_LINE_RE.search(body):
         return body
+    markers = [int(m) for m in _BODY_MARKER_RE.findall(body)]
+    if markers and max(markers) > len(sources):
+        # The list-position-equals-marker-number contract is provider
+        # behaviour, not a guarantee; surface drift instead of hiding it.
+        logger.debug("body cites marker [%d] but only %d sources were harvested", max(markers), len(sources))
     capped = sources[:MAX_FOOTER_SOURCES]
     lines = [f"[{i}] {s.title} - {s.url}" if s.title else f"[{i}] {s.url}" for i, s in enumerate(capped, 1)]
     footer = FOOTER_DELIM + "\n".join(lines)
@@ -173,14 +187,25 @@ def append_sources_footer(body: str, sources: list[SourceRef]) -> str:
 def split_sources_footer(body: str) -> tuple[str, str]:
     """Split a body into (prose, footer). The footer includes its delimiter
     so `prose + footer == body`; a body without a footer returns (body, "").
+
+    The suffix after the delimiter must contain at least one numbered
+    source line — prose that organically produces the delimiter text but
+    no source list is not a footer, and treating it as one would feed
+    bogus lines to `resolve_marker_sources` and exempt an arbitrary tail
+    from capsule trimming.
     """
     idx = body.rfind(FOOTER_DELIM)
     if idx == -1:
         return body, ""
-    return body[:idx], body[idx:]
+    footer = body[idx:]
+    if not any(_FOOTER_LINE_RE.match(line.strip()) for line in footer.splitlines()):
+        return body, ""
+    return body[:idx], footer
 
 
 # A sources_cited entry that is nothing but a marker: "[3]", "3", "[14]".
+# Bare digits are intentional — extractors sometimes strip the brackets.
+# The 3-digit cap keeps year-like values ("2023") out of the rewrite.
 _MARKER_RE = re.compile(r"^\[?(\d{1,3})\]?$")
 # A footer line: "[3] Title - https://..." — anchored so prose that merely
 # contains brackets (e.g. `arr[3]`) can never enter the lookup table.
