@@ -1,0 +1,80 @@
+name: registry-canary
+
+# Weekly freshness check on the pinned model registry (issue #57). The registry
+# pins fast-rotting model IDs, and the live half of the rot is pricing: when
+# LiteLLM drops a price-map entry the cost cap and ledger run blind. This job
+# runs the offline pricing-presence check (no API keys needed) plus an optional
+# live provider ping when secrets exist, then opens a plain report issue the
+# self-improve agent can turn into an alias-bump PR.
+on:
+  schedule:
+    - cron: "23 8 * * 1"  # Mondays 08:23 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  canary:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --extra dev
+
+      - name: Pricing presence check
+        run: |
+          {
+            echo '## Pricing presence'
+            echo
+            echo '```'
+            uv run consult-doctor --pricing || echo "(exit non-zero: a first-party model is unpriced)"
+            echo '```'
+            echo
+          } | tee -a report.md
+
+      - name: Provider ping (best-effort)
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        run: |
+          if [ -z "$ANTHROPIC_API_KEY$OPENAI_API_KEY$GEMINI_API_KEY$OPENROUTER_API_KEY" ]; then
+            {
+              echo '## Provider ping'
+              echo
+              echo 'Skipped: no provider API keys configured as repository secrets.'
+              echo
+            } | tee -a report.md
+          else
+            {
+              echo '## Provider ping'
+              echo
+              echo '```'
+              uv run consult-doctor --ping || echo "(exit non-zero: a provider ping failed)"
+              echo '```'
+              echo
+            } | tee -a report.md
+          fi
+
+      - name: Open report issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh label create registry-canary \
+            --color FBCA04 \
+            --description "Automated weekly registry freshness report" \
+            --force || true
+          gh issue create \
+            --title "Registry freshness report $(date -u +%Y-%m-%d)" \
+            --label registry-canary \
+            --body-file report.md

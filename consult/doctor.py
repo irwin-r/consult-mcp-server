@@ -119,6 +119,63 @@ def _check_registry() -> tuple[list[str], int]:
     return lines, fails
 
 
+def _has_pricing(litellm_id: str) -> bool:
+    """True when LiteLLM can price one token for `litellm_id`.
+
+    Mirrors what `runner.costs.estimate_cost` relies on: a model missing from
+    the price map raises (or returns all-None), and the cost cap + ledger then
+    run blind for it. Imported lazily so the offline doctor never touches it.
+    """
+    import litellm
+
+    try:
+        pc, cc = litellm.cost_per_token(model=litellm_id, prompt_tokens=1, completion_tokens=1)
+    except Exception:  # noqa: BLE001 — any failure means "not priced"
+        return False
+    return pc is not None or cc is not None
+
+
+def _check_pricing() -> tuple[list[str], int]:
+    """Report LiteLLM price-map presence for every registry model (issue #57).
+
+    The registry pins fast-rotting model IDs; the live half of the rot is
+    pricing. A first-party model (anthropic/openai/google) LiteLLM can't price
+    means the cost cap and ledger run blind on it — genuine rot worth a bump.
+    Aggregator models (openrouter) routinely lack a price-map entry, so those
+    are reported as warnings, not failures. Returns the count of unpriced
+    first-party models as the fail count.
+    """
+    os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+    try:
+        cfg = registry.models_config()
+    except Exception as e:  # noqa: BLE001
+        return [_fail(f"models.json failed to load: {type(e).__name__}: {e}")], 1
+
+    models = cfg.get("models", {})
+    unpriced_first_party: list[str] = []
+    unpriced_aggregator: list[str] = []
+    priced = 0
+    for alias, entry in sorted(models.items()):
+        litellm_id = entry.get("litellm_id")
+        if not litellm_id:
+            continue
+        if _has_pricing(litellm_id):
+            priced += 1
+        elif entry.get("privacy_tier") == "aggregator":
+            unpriced_aggregator.append(f"{alias} ({litellm_id})")
+        else:
+            unpriced_first_party.append(f"{alias} ({litellm_id})")
+
+    lines = [_ok(f"priced: {priced}/{len(models)} models have a LiteLLM price-map entry")]
+    for item in unpriced_first_party:
+        lines.append(_fail(f"no price for first-party model {item} — caps and ledger run blind"))
+    for item in unpriced_aggregator:
+        lines.append(
+            _warn(f"no price for aggregator model {item} (expected; estimates fall back to cost-unknown)")
+        )
+    return lines, len(unpriced_first_party)
+
+
 def _check_trusted_roots() -> tuple[list[str], int]:
     """Show the configured trusted roots so users can see what file paths
     and git_diff specs will be accepted.
@@ -289,11 +346,29 @@ def cli() -> None:
         action="store_true",
         help="Print a copy-paste-ready Claude Desktop / Cursor JSON snippet and exit.",
     )
+    parser.add_argument(
+        "--pricing",
+        action="store_true",
+        help="Report LiteLLM price-map presence per registry model and exit. Offline "
+        "(uses the bundled price map). Exits non-zero if a first-party model is unpriced. "
+        "Used by the weekly registry-canary workflow.",
+    )
     args = parser.parse_args()
 
     if args.config:
         print(json.dumps(_claude_desktop_config(), indent=2))
         return
+
+    if args.pricing:
+        print("Registry pricing presence (LiteLLM price-map check):")
+        lines, fails = _check_pricing()
+        for line in lines:
+            print(line)
+        if fails:
+            print(f"\nFAIL: {fails} first-party model(s) have no price-map entry.")
+            sys.exit(1)
+        print("\nOK: every first-party model is priced.")
+        sys.exit(0)
 
     exit_code = quick_check()
     if args.ping:
