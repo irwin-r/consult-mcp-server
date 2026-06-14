@@ -180,7 +180,6 @@ to the current best model; the resolved LiteLLM ID is captured per run in
 | `nano` (3) | claude-haiku, gemini-flash, gpt-nano | < $0.01 | smoke tests / trivia |
 | `quick` (5) | claude-haiku, gemini-pro, grok, qwen-max, kimi | ~$0.05 | snap second opinions |
 | `standard` (10) | opus, sonnet, gpt-pro, gpt, gemini-pro, grok, qwen-max, kimi, glm, llama | $0.30–0.60 | normal decisions |
-| `wide` (10) | as standard, openrouter-routed where possible | $0.20–0.50 | maximum diversity |
 | `deep` (14) | standard + mistral, deepseek, mimo, sonar-pro | $0.50–1.00 | high-stakes, includes web search |
 | `code` (5) | opus, gpt-codex, gpt-mini, gemini-pro, deepseek | $0.20–0.40 | code-heavy questions |
 | `review` (6) | opus, gpt-codex, gpt-pro, gemini-pro, deepseek, grok | $0.30–0.60 | PR / code review |
@@ -453,8 +452,8 @@ The model registry tags each entry with a `privacy_tier`:
 
 Mixing tiers in one panel broadcasts the **same prompt** to providers with
 **different data-retention policies**. For prompts containing sensitive
-material, prefer `tier="standard"` (mostly first-party) over `tier="wide"`
-or `tier="deep"` (heavily aggregator-routed).
+material, prefer `tier="standard"` (mostly first-party) over `tier="deep"`
+(heavily aggregator-routed).
 
 ---
 

@@ -1,55 +1,35 @@
 """Pluggable refine strategies.
 
 The default refine flow runs the same panel each round until the arbiter
-converges (or the round cap is hit). Strategies let callers customise
-*what happens between rounds* — which panellists carry over, what
-weight each gets, whether the synth picks from the final round or
-averages — without forking refine.refine().
+converges (or the round cap is hit). Strategies are a per-round hook that
+lets callers customise *what happens between rounds* — which panellists
+carry over, what weight each gets — without forking refine.refine().
 
-Inspired by llm-consortium's strategy plugin system (default, voting,
-elimination, role, semantic). consult ships two for now:
+Inspired by llm-consortium's strategy plugin system. consult ships only
+the default for now:
 
 - "default" — every panellist runs every round (current behaviour).
-- "elimination" — after each round, the panellist whose capsule
-  is *most distant* from the panel medoid is dropped from the next
-  round. Idea: outlier panellists contribute noise; eliminating them
-  tightens the consensus signal each subsequent arbiter evaluates.
 
-Adding a new strategy is a matter of subclassing `Strategy` and
-registering it in `_STRATEGIES`. Refine.refine() consults the strategy
-via `before_round(...)` to decide what panel to run this round.
-
-This module's behaviours are NOT wired into the default flow unless the
-caller explicitly passes `strategy="elimination"`. Default semantics
-are unchanged.
+The "elimination" strategy (drop the most-divergent panellist each round)
+was retired as unused complexity (issue #59); the hook stays so a future
+strategy is a matter of subclassing `Strategy` and registering it in
+`_STRATEGIES`. Refine.refine() consults the strategy via `before_round(...)`
+to decide what panel to run this round.
 """
 
 from __future__ import annotations
 
-import logging
 from abc import ABC, abstractmethod
-from difflib import SequenceMatcher
 
-from . import slugs
-from .types import (
-    Capsule,
-    ManifestEntry,
-    ModelSpec,
-    ResearchCapsule,
-    ReviewCapsule,
-    Status,
-)
-from .voting import _feature_string
-
-logger = logging.getLogger(__name__)
+from .types import ManifestEntry, ModelSpec
 
 
 class Strategy(ABC):
     """Per-round customisation hook for `refine.refine()`.
 
-    Strategies are stateful across rounds — they receive prior-round
-    `handle` (with capsules) and prior `verdict`, and decide what the
-    next round's panel should look like.
+    Strategies are stateful across rounds — they receive the prior round's
+    manifest (with capsules) and decide what the next round's panel should
+    look like.
     """
 
     @abstractmethod
@@ -81,144 +61,8 @@ class DefaultStrategy(Strategy):
         return list(base_specs)
 
 
-class EliminationStrategy(Strategy):
-    """Drop the most-divergent panellist from the next round.
-
-    Each round 2+, computes each panellist's mean similarity to the rest
-    of the panel (via `voting._feature_string` + difflib). The panellist
-    with the LOWEST mean similarity — i.e. the largest distance from the
-    panel consensus — is removed from the next round's spec list.
-
-    Round 1 runs the full panel. Each subsequent round drops one
-    panellist; with `max_rounds=3` and a 5-panellist start, round 2 has
-    4 panellists and round 3 has 3.
-
-    Edge cases:
-    - 2 or fewer usable panellists: elimination is a no-op (we'd
-      otherwise drop down to one panellist, which defeats the consensus
-      purpose entirely).
-    - First-round eliminees never come back — the strategy is
-      monotone. This is intentional; a panellist that disagreed once
-      probably disagrees structurally, not noisily.
-    - When the prior round has all-failed capsules, the strategy can't
-      compute distances and falls back to the default (no elimination).
-    """
-
-    def __init__(self) -> None:
-        # Tracks panellists eliminated in prior rounds so we don't
-        # re-introduce them. Keyed by spec.model + spec.stance + spec.slug
-        # for stability.
-        self._eliminated: set[tuple[str, str | None, str | None]] = set()
-
-    def before_round(
-        self,
-        *,
-        round_num: int,
-        base_specs: list[ModelSpec],
-        prior_manifest: list[ManifestEntry] | None,
-    ) -> list[ModelSpec]:
-        if round_num == 1:
-            return list(base_specs)
-        if prior_manifest is None:
-            return list(base_specs)
-
-        # Survivors of every prior elimination. Every no-new-elimination
-        # path below must return THIS list, not `base_specs` — returning
-        # the full panel would silently re-admit panellists eliminated in
-        # earlier rounds, breaking the documented monotonicity.
-        survivors = [s for s in base_specs if (s.model, s.stance, s.slug) not in self._eliminated]
-
-        worst_slug = self._compute_worst(prior_manifest)
-        if worst_slug is None:
-            logger.info(
-                "EliminationStrategy: no clear outlier in round %d; keeping current panel",
-                round_num - 1,
-            )
-            return survivors
-
-        worst_base_idx = self._find_worst_base_index(worst_slug, base_specs)
-        if worst_base_idx is None:
-            return survivors
-        target = base_specs[worst_base_idx]
-        key = (target.model, target.stance, target.slug)
-        if key in self._eliminated:
-            # Stale mapping (only reachable via the positional fallback on
-            # slug-less specs) — don't double-count; keep the panel as-is.
-            return survivors
-        candidate = [s for s in survivors if (s.model, s.stance, s.slug) != key]
-        # Floor at 2 panellists — eliminating below that loses the
-        # consensus signal. Stop further eliminations rather than
-        # walking the panel to zero.
-        if len(candidate) < 2:
-            return survivors
-        self._eliminated.add(key)
-        logger.info(
-            "EliminationStrategy: eliminating %s (slug=%s) for round %d",
-            target.model,
-            worst_slug,
-            round_num,
-        )
-        return candidate
-
-    def _compute_worst(
-        self,
-        prior_manifest: list[ManifestEntry],
-    ) -> str | None:
-        """Return the slug of the panellist with the lowest mean
-        similarity to the rest of the panel. None when there's no clear
-        outlier (e.g. all-failed manifest, or insufficient usable
-        capsules)."""
-        usable = [
-            m
-            for m in prior_manifest
-            if m.status in (Status.OK, Status.TRUNCATED) and m.capsule is not None and _feature_string(m)
-        ]
-        if len(usable) < 3:
-            # 2 or fewer: dropping one leaves at most one — pointless
-            return None
-        features = [_feature_string(m) for m in usable]
-        worst_slug: str | None = None
-        worst_score = float("inf")
-        for i, entry in enumerate(usable):
-            others = features[:i] + features[i + 1 :]
-            mean_sim = sum(SequenceMatcher(None, features[i], o).ratio() for o in others) / len(others)
-            if mean_sim < worst_score:
-                worst_score = mean_sim
-                worst_slug = entry.slug
-        return worst_slug
-
-    def _find_worst_base_index(
-        self,
-        worst_slug: str,
-        base_specs: list[ModelSpec],
-    ) -> int | None:
-        """Map the worst panellist's round slug back to its base spec.
-
-        Primary path: refine pre-assigns each spec a stable unique slug
-        and the round slug is `<slug>.r<n>`, so equality after stripping
-        the round suffix is exact regardless of how the panel shrank in
-        between. The positional `slugs.panel_index` parse remains as a
-        fallback for slug-less specs (direct strategy callers); it is
-        only correct while the panel hasn't shrunk, which is exactly the
-        bug the stable-slug path closes.
-
-        Blinded runs carry greek manifest slugs that match neither path,
-        so elimination is a deliberate no-op under `blinded=True` (we
-        cannot attribute the outlier to a spec without unblinding).
-        """
-        base = slugs.strip_round(worst_slug)
-        for i, s in enumerate(base_specs):
-            if s.slug and s.slug == base:
-                return i
-        idx = slugs.panel_index(worst_slug)
-        if idx is not None and 0 <= idx < len(base_specs):
-            return idx
-        return None
-
-
 _STRATEGIES: dict[str, type[Strategy]] = {
     "default": DefaultStrategy,
-    "elimination": EliminationStrategy,
 }
 
 
@@ -234,8 +78,3 @@ def strategy_for(name: str) -> Strategy:
 
 def list_strategies() -> list[str]:
     return sorted(_STRATEGIES.keys())
-
-
-# Reference these to silence linters that flag unused imports in
-# module-level type hints.
-_ = (Capsule, ReviewCapsule, ResearchCapsule)

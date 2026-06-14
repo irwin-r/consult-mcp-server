@@ -155,7 +155,14 @@ class ManifestEntry(StrictModel):
     """
 
     slug: str
-    model_id: str | None = Field(None, description="Real model ID. None when blinded, available after audit.")
+    model_id: str | None = Field(
+        None,
+        description=(
+            "Real model ID. Kept on blinded runs too, for post-hoc attribution in the "
+            "report and ledger; the synthesiser and peer panellists never see it during "
+            "the run. None only when no model resolved (unknown alias, timed-out call)."
+        ),
+    )
     persona: str | None = None
     status: Status
     finish_reason: str | None = None
@@ -272,11 +279,12 @@ class RunHandle(StrictModel):
         counts the same as a hard failure. Pre-annotation TRUNCATED
         entries (capsule=None) stay excluded, the conservative reading.
 
-        Blinded panels strip `model_id` from every entry by design, so the
-        provider-diversity check is skipped under `blinded=True` — otherwise
-        a fully-OK blinded panel would always fail `usable()`. The diversity
-        signal lives in `registry_snapshot.json` for audit; check it there
-        if needed.
+        The provider-diversity check is skipped on blinded runs by the
+        `self.blinded` short-circuit below. Diversity isn't the point of a
+        blinded run, and gating viability on it would just add noise; the
+        diversity signal still lives in `registry_snapshot.json` for audit.
+        (Manifest entries keep their real `model_id` even when blinded, so
+        this is a deliberate skip, not a consequence of stripped identities.)
         """
         n = len(self.manifest)
         if min_ok is None:

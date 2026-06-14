@@ -115,21 +115,35 @@ async def test_handle_call_tool_success_path_returns_dict(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_handle_list_tools_advertises_full_surface():
-    """Pin the five-tool surface plus each tool's required input fields.
-    Catches schema drift (e.g. dropping `prompt` from `panel`'s required
-    list) that the type system can't see."""
+async def test_handle_list_tools_advertises_default_surface():
+    """Pin the default four-tool surface plus each tool's required input
+    fields. Catches schema drift (e.g. dropping `prompt` from `panel`'s
+    required list) that the type system can't see. `sequence` is demoted
+    off the default surface (issue #59); see the enabled-flag test below."""
     from consult.mcp import server as server_mod
 
     tools = await server_mod.handle_list_tools()
     by_name = {t.name: t for t in tools}
-    assert set(by_name) == {"panel", "synthesise", "consult", "refine", "sequence"}
+    assert set(by_name) == {"panel", "synthesise", "consult", "refine"}
     assert "prompt" in by_name["panel"].inputSchema["required"]
     assert "models" in by_name["panel"].inputSchema["required"]
     assert "prompt" in by_name["consult"].inputSchema["required"]
     assert "prompt" in by_name["refine"].inputSchema["required"]
-    assert "prompts" in by_name["sequence"].inputSchema["required"]
     assert "run_id" in by_name["synthesise"].inputSchema["required"]
+
+
+@pytest.mark.asyncio
+async def test_handle_list_tools_advertises_sequence_when_enabled(monkeypatch):
+    """CONSULT_ENABLE_SEQUENCE re-advertises the demoted sequence tool (issue
+    #59). The handler stays registered regardless; this only gates the
+    advertised surface."""
+    from consult.mcp import server as server_mod
+
+    monkeypatch.setenv("CONSULT_ENABLE_SEQUENCE", "1")
+    tools = await server_mod.handle_list_tools()
+    by_name = {t.name: t for t in tools}
+    assert set(by_name) == {"panel", "synthesise", "consult", "refine", "sequence"}
+    assert "prompts" in by_name["sequence"].inputSchema["required"]
 
 
 @pytest.mark.asyncio
