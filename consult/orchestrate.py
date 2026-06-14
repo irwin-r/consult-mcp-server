@@ -19,6 +19,7 @@ import litellm
 
 from . import artifacts, capsule, registry, runner, synth, voting
 from . import attachments as attachments_mod
+from . import calibration as calibration_mod
 from .cost import CostMeter
 from .progress import ProgressEvent, SynthCompleted, SynthStarted, shift_bucket
 from .types import Capsule, ManifestEntry, ModelSpec, RunResult, Status
@@ -26,6 +27,16 @@ from .types import Capsule, ManifestEntry, ModelSpec, RunResult, Status
 logger = logging.getLogger(__name__)
 
 ProgressCallback = Callable[[ProgressEvent], Awaitable[None]]
+
+# Persona-diversity sharpening (issue #52). When a consult caller gives no
+# explicit roles, rotate this spread of decision-useful stances across the
+# panel so identical prompts stop producing correlated errors that blinding
+# cannot fix. Curated to lenses that sharpen a decision without forcing a
+# yes/no framing; `roles` or `diverse_stances=False` opts out.
+_DIVERSE_STANCES = ("staff_engineer", "contrarian", "security", "product", "future_self", "cost")
+
+# A consult is held to a two-sided synthesis when disagreement reaches this.
+_HIGH_DISAGREEMENT = 0.5
 
 
 async def _safe_emit(cb: ProgressCallback | None, event: ProgressEvent) -> None:
@@ -123,6 +134,7 @@ async def consult(
     dry_run: bool = False,
     on_progress: ProgressCallback | None = None,
     gate_synth_at_agreement: float | None = None,
+    diverse_stances: bool = True,
 ) -> RunResult:
     """Run the 3-phase hero: fanout → capsule extract → synth.
 
@@ -179,7 +191,15 @@ async def consult(
 
     # Exclude the synthesiser from the panel to avoid self-inclusion bias.
     panel_aliases = [m for m in tier_models if m != synth_alias]
-    specs = [ModelSpec(model=m, stance=roles.get(m)) for m in panel_aliases]
+    # Any explicit roles, or an opt-out, uses the caller's stances (neutral
+    # where unspecified). Otherwise rotate the diverse-stance spread.
+    if roles or not diverse_stances:
+        specs = [ModelSpec(model=m, stance=roles.get(m)) for m in panel_aliases]
+    else:
+        specs = [
+            ModelSpec(model=m, stance=_DIVERSE_STANCES[i % len(_DIVERSE_STANCES)])
+            for i, m in enumerate(panel_aliases)
+        ]
 
     # MCP progress is monotonic, so each phase's callback shifts its
     # (done, total) into the consult-wide bucket. Offsets are explicit
@@ -212,6 +232,7 @@ async def consult(
             partial=True,
             partial_reason=(handle.partial_reason or "no panellists returned usable responses"),
             synthesiser=synth_alias,
+            calibration=calibration_mod.build(handle.manifest, blinded=blinded, disagreement=None),
         )
 
     if extract_capsules:
@@ -230,6 +251,12 @@ async def consult(
     # two usable capsules to compare (e.g. extract_capsules=False, or a
     # panel where most entries failed).
     disagreement = voting.panel_disagreement(handle.manifest)
+
+    # Per-run bias-control disclosure (issue #52): blinding/shuffle facts,
+    # the disagreement score, panel health + per-status spend, and the
+    # family/privacy/stance spread. Built once here and carried on every
+    # downstream return (gated, cap-skipped, success).
+    calibration = calibration_mod.build(handle.manifest, blinded=blinded, disagreement=disagreement)
 
     # Gating decision: skip the flagship synth when the panel converged
     # tightly. Requires both a configured threshold AND a computable
@@ -275,6 +302,7 @@ async def consult(
             synthesiser="(gated)",
             disagreement=disagreement,
             synth_gated=True,
+            calibration=calibration,
         )
 
     # Cost-cap gate for the synth stage. The fanout gate only covered the
@@ -331,16 +359,27 @@ async def consult(
             ),
             synthesiser="(cap-skipped)",
             disagreement=disagreement,
+            calibration=calibration,
         )
 
     # The outer total was sized for fanout + capsules + synth, so synth's
     # `done` starts at the synth offset regardless of whether capsules ran.
     await _safe_emit(on_progress, SynthStarted(done=synth_offset, total=overall_total))
+    # Load-bearing disagreement (issue #52): a high score holds the synth to a
+    # genuinely two-sided account rather than collapsing to one recommendation.
+    directive = None
+    if disagreement is not None and disagreement >= _HIGH_DISAGREEMENT:
+        directive = (
+            f"Panel disagreement is high (score {disagreement:.2f}). Give the competing "
+            "positions roughly equal weight, and do not present a single recommendation "
+            "without stating the strongest opposing view and the conditions under which it wins."
+        )
     synth_result = await synth.synthesise(
         handle.run_id,
         by_model=synth_alias,
         anonymised=blinded,
         rubric=rubric,
+        directive=directive,
     )
     await _safe_emit(on_progress, SynthCompleted(done=overall_total, total=overall_total))
 
@@ -374,4 +413,5 @@ async def consult(
         partial_reason=(f"synthesis status={synth_result.status.value}" if synth_failed else None),
         synthesiser=synth_alias,
         disagreement=disagreement,
+        calibration=calibration,
     )

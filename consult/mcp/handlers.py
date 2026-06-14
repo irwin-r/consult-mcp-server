@@ -307,6 +307,7 @@ async def consult(args: dict[str, Any], *, on_progress: ProgressCallback | None 
         attachments=args.get("attachments"),
         dry_run=args.get("dry_run", False),
         gate_synth_at_agreement=args.get("gate_synth_at_agreement"),
+        diverse_stances=args.get("diverse_stances", True),
         on_progress=on_progress,
     )
     payload = result.model_dump()

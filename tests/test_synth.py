@@ -114,6 +114,35 @@ def test_synth_build_input_always_blinds_and_filters_failures():
     assert "rubric 2" in text  # only OK + TRUNCATED counted
 
 
+def test_synth_build_input_injects_directive():
+    """A caller directive (e.g. the high-disagreement two-sided mandate from
+    consult) leads the synth input ahead of the rubric (issue #52)."""
+    from consult.synth import _build_input
+
+    manifest = [
+        {"slug": "panelist-alpha", "model_id": "m/a", "persona": None, "confidence": 0.5, "status": "OK"},
+        {"slug": "panelist-beta", "model_id": "m/b", "persona": None, "confidence": 0.5, "status": "OK"},
+    ]
+    bodies = {"panelist-alpha": "a", "panelist-beta": "b"}
+    directive = "Panel disagreement is high (score 0.70). Give competing positions equal weight."
+
+    text, _ = _build_input(manifest, bodies, rubric="rubric {n}", directive=directive)
+    assert "## Directive" in text
+    assert "Give competing positions equal weight" in text
+    # The directive precedes the rubric so the synth reads it first.
+    assert text.index("## Directive") < text.index("rubric 2")
+
+
+def test_synth_build_input_no_directive_by_default():
+    from consult.synth import _build_input
+
+    manifest = [
+        {"slug": "panelist-alpha", "model_id": "m/a", "persona": None, "confidence": 0.5, "status": "OK"}
+    ]
+    text, _ = _build_input(manifest, {"panelist-alpha": "a"}, rubric="rubric {n}")
+    assert "## Directive" not in text
+
+
 def test_context_trim_synth_input_trims_largest_body_first():
     """When overall budget is tight, the largest body is trimmed first
     so we recover the most slack with the least per-body signal loss."""
