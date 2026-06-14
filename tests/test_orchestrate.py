@@ -495,3 +495,103 @@ async def test_consult_marks_synth_failure_as_partial(tmp_path, monkeypatch):
     assert result.partial_reason is not None
     assert "synthesis status=" in result.partial_reason
     assert result.synthesis == "# Synthesis unavailable"
+
+
+def _stance_capturing_setup(monkeypatch, tmp_path):
+    """Wire orchestrate.consult with mocks that capture the panel specs and
+    return a realistic two-panellist manifest. Returns the `captured` list."""
+    from consult import capsule as capsule_mod
+    from consult import orchestrate
+    from consult import runner as runner_mod
+    from consult import synth as synth_mod
+    from consult import voting as voting_mod
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    captured: list = []
+
+    async def fake_fanout(prompt, specs, **kwargs):
+        captured.append(list(specs))
+        paths = artifacts.create_run()
+        manifest = []
+        for s in specs:
+            entry = registry.resolve_model(s.model)
+            manifest.append(
+                ManifestEntry(
+                    slug=s.model,
+                    model_id=entry["litellm_id"],
+                    persona=s.stance,
+                    status=Status.OK,
+                    resource_uri=paths.resource_uri(s.model),
+                    body_path=str(paths.response_text(s.model)),
+                    cost_usd=0.01,
+                    cost_known=True,
+                    capsule=Capsule(position=f"{s.model} position"),
+                )
+            )
+        return RunHandle(
+            run_id=paths.run_id,
+            artifacts_dir=str(paths.root),
+            manifest=manifest,
+            cost_usd=0.01 * len(specs),
+            cost_known=True,
+            wall_ms=0,
+        )
+
+    async def fake_annotate(handle, **kwargs):
+        return handle
+
+    async def fake_synth(run_id, **kwargs):
+        return synth_mod.SynthResult(text="syn", cost_usd=0.02, cost_known=True)
+
+    monkeypatch.setattr(runner_mod, "fanout", fake_fanout)
+    monkeypatch.setattr(capsule_mod, "annotate", fake_annotate)
+    monkeypatch.setattr(synth_mod, "synthesise", fake_synth)
+    monkeypatch.setattr(voting_mod, "panel_disagreement", lambda manifest: 0.6)
+    monkeypatch.setattr(orchestrate, "_estimate_synth_cost", lambda *a, **k: (0.02, True))
+    return captured
+
+
+async def test_consult_auto_assigns_diverse_stances_and_carries_calibration(tmp_path, monkeypatch):
+    """With no roles, consult rotates the diverse-stance spread across the
+    panel, and the result carries a calibration block reflecting it (#52)."""
+    from consult import orchestrate
+
+    captured = _stance_capturing_setup(monkeypatch, tmp_path)
+    result = await orchestrate.consult("p", tier="quick")
+
+    # quick tier is [claude-haiku, gemini-pro, grok, qwen-max, kimi]; the
+    # default synthesiser (gemini-pro) is excluded from the panel.
+    specs = captured[0]
+    stances = [s.stance for s in specs]
+    assert stances == ["staff_engineer", "contrarian", "security", "product"]
+
+    cal = result.calibration
+    assert cal is not None
+    assert cal.disagreement == 0.6
+    assert cal.panellists == 4
+    assert cal.usable == 4
+    assert set(cal.stance_coverage) == {"staff_engineer", "contrarian", "security", "product"}
+    assert cal.family_diversity >= 1
+
+
+async def test_consult_roles_disable_stance_rotation(tmp_path, monkeypatch):
+    """An explicit roles map turns off the rotation; unlisted panellists are
+    neutral (stance=None)."""
+    from consult import orchestrate
+
+    captured = _stance_capturing_setup(monkeypatch, tmp_path)
+    await orchestrate.consult("p", tier="quick", roles={"grok": "security"})
+
+    by_model = {s.model: s.stance for s in captured[0]}
+    assert by_model["grok"] == "security"
+    assert by_model["claude-haiku"] is None  # unlisted => neutral, not rotated
+
+
+async def test_consult_diverse_stances_false_uses_neutral(tmp_path, monkeypatch):
+    """diverse_stances=False opts out: every panellist runs neutral."""
+    from consult import orchestrate
+
+    captured = _stance_capturing_setup(monkeypatch, tmp_path)
+    await orchestrate.consult("p", tier="quick", diverse_stances=False)
+
+    assert all(s.stance is None for s in captured[0])

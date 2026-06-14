@@ -312,6 +312,51 @@ class RunHandle(StrictModel):
         return len(providers) >= min_providers
 
 
+class Calibration(StrictModel):
+    """Per-run bias-control disclosure (issue #52).
+
+    Surfaces what the engine already does but never showed in-band: the
+    synthesiser's view is always blinded and shuffled, disagreement is scored
+    on every consult, and the panel has a measurable family / privacy-tier /
+    stance spread. A caller can read this to judge how much to trust a single
+    recommendation without digging through the run dir, and high disagreement
+    is the signal that the synthesis was held to a two-sided account.
+    """
+
+    blinded: bool = Field(
+        ..., description="Whether panellists saw each other under anonymised labels during the run."
+    )
+    synth_input_blinded: bool = Field(
+        True, description="The synthesiser always sees blind labels (Alpha/Beta/...), never real model ids."
+    )
+    synth_input_shuffled: bool = Field(
+        True, description="Panellist order is shuffled per synth call to remove position bias."
+    )
+    disagreement: float | None = Field(
+        None,
+        ge=0.0,
+        le=1.0,
+        description="Panel disagreement score; None when fewer than two usable capsules.",
+    )
+    panellists: int = Field(..., ge=0)
+    usable: int = Field(..., ge=0, description="Count of OK or TRUNCATED panellists.")
+    status_counts: dict[str, int] = Field(default_factory=dict)
+    spend_by_status: dict[str, float | None] = Field(
+        default_factory=dict,
+        description="Summed cost_usd per status; None for a status with any unpriced entry.",
+    )
+    family_diversity: int = Field(0, ge=0, description="Distinct model families among usable panellists.")
+    families: dict[str, int] = Field(
+        default_factory=dict, description="Model-family spread across usable panellists."
+    )
+    privacy_tiers: dict[str, int] = Field(
+        default_factory=dict, description="privacy_tier spread across usable panellists."
+    )
+    stance_coverage: list[str] = Field(
+        default_factory=list, description="Distinct stances assigned across usable panellists."
+    )
+
+
 class RunResult(StrictModel):
     """Returned by `consult` (the hero tool). Includes the synthesis."""
 
@@ -341,6 +386,9 @@ class RunResult(StrictModel):
     # (the synthesiser is excluded from the panel to avoid self-inclusion
     # bias). Without this, panel-shrinkage is invisible in the response.
     synthesiser: str | None = None
+    # Per-run bias-control disclosure (issue #52). None on the rare path where
+    # it couldn't be built; populated on every normal consult result.
+    calibration: Calibration | None = None
 
     @model_validator(mode="after")
     def _validate_partial(self) -> RunResult:

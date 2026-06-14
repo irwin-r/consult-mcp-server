@@ -363,7 +363,20 @@ def consult_schema() -> dict[str, Any]:
             "roles": {
                 "type": "object",
                 "additionalProperties": {"type": "string"},
-                "description": "Map model alias → stance key. Defaults to neutral.",
+                "description": (
+                    "Map model alias → stance key. Any entry here turns off the "
+                    "automatic stance rotation; unlisted panellists fall back to neutral."
+                ),
+            },
+            "diverse_stances": {
+                "type": "boolean",
+                "default": True,
+                "description": (
+                    "When no `roles` are given, rotate a spread of stances across the panel "
+                    "so identical prompts stop producing correlated errors (issue #52). The "
+                    "assignment is reported in the result's calibration block. Set false for "
+                    "an all-neutral panel."
+                ),
             },
             "attachments": {
                 "type": "array",

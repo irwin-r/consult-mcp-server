@@ -166,6 +166,7 @@ def _build_input(
     *,
     rubric: str,
     original_prompt: str | None = None,
+    directive: str | None = None,
 ) -> tuple[str, dict[str, str]]:
     """Build the synth's input text and return the de-anonymisation map.
 
@@ -198,6 +199,10 @@ def _build_input(
         body = bodies.get(slug, "")
         blocks.append(f"{label_str}\n{body.strip()}")
     parts: list[str] = []
+    # A caller directive (e.g. the high-disagreement two-sided mandate from
+    # orchestrate.consult) leads, so the synth reads it before the rubric.
+    if directive:
+        parts.append("## Directive\n\n" + directive.strip() + "\n\n---\n\n")
     if original_prompt:
         parts.append("## Original question / source\n\n" + original_prompt + "\n\n---\n\n")
     parts.append(header)
@@ -219,6 +224,7 @@ async def synthesise(
     by_model: str | None = None,
     rubric: str | None = None,
     anonymised: bool = False,
+    directive: str | None = None,
 ) -> SynthResult:
     paths = artifacts.load_run(run_id)
     manifest_payload = json.loads(await asyncio.to_thread(paths.manifest_json.read_text))
@@ -262,6 +268,7 @@ async def synthesise(
         bodies,
         rubric=rub,
         original_prompt=original_prompt,
+        directive=directive,
     )
     # Persist for reproducibility — the synth input is what the model
     # *actually* saw (blind labels in place of slugs). Threaded: this file
