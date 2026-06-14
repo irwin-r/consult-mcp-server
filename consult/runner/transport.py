@@ -402,9 +402,10 @@ async def _aresponses_as_completion(
 
     OpenAI Responses-API models (e.g. gpt-5.5-pro, gpt-5.3-codex) 404 on the
     chat-completions endpoint, so they route here instead of `acompletion`.
-    Mirrors `cli_executor.call_cli`'s SimpleNamespace adaptation. System
-    messages become `instructions`; the rest become `input`. Non-streaming
-    only — the streaming path stays on chat completions.
+    The result is adapted into a SimpleNamespace with the chat-completions
+    attributes the pipeline reads. System messages become `instructions`; the
+    rest become `input`. Non-streaming only — the streaming path stays on chat
+    completions.
     """
     instructions = "\n\n".join(m["content"] for m in messages if m.get("role") == "system") or None
     convo = [m for m in messages if m.get("role") != "system"]

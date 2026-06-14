@@ -70,12 +70,6 @@ def estimate_cost(
         except KeyError:
             all_known = False
             continue
-        # CLI panellists have no per-call dollar cost: the user's CLI
-        # auth covers usage. Estimating them as $0 is honest (not
-        # cost-unknown — that would inappropriately make the cap-check
-        # conservative for what is genuinely free at this layer).
-        if entry.get("provider") == "cli":
-            continue
         litellm_id = entry.get("litellm_id")
         if not litellm_id:
             all_known = False
@@ -129,7 +123,7 @@ def estimate_drivers(
         try:
             entry = registry.resolve_model(spec.model)
             litellm_id = entry.get("litellm_id")
-            if not litellm_id or entry.get("provider") == "cli":
+            if not litellm_id:
                 continue
             tin = litellm.token_counter(model=litellm_id, text=prompt)
             tout = max(
