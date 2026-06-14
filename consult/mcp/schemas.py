@@ -105,7 +105,12 @@ PANEL_SCHEMA = {
         "blinded": {
             "type": "boolean",
             "default": False,
-            "description": ("Anonymise slugs to panelist-alpha/beta/... and strip model_id from manifest."),
+            "description": (
+                "Anonymise the panellist labels the other panellists and the synthesiser "
+                "see (panelist-alpha/beta/...) and brand-scrub the shared question. The "
+                "returned manifest still carries real model_ids for post-hoc attribution; "
+                "blinding governs what models see during the run, not the final report."
+            ),
         },
         "attachments": {
             "type": "array",
@@ -175,7 +180,12 @@ SYNTH_SCHEMA = {
         "anonymised": {
             "type": "boolean",
             "default": False,
-            "description": "Hide real model IDs from the synthesiser input.",
+            "description": (
+                "The synthesiser's view of panellist identities is ALWAYS blinded and "
+                "shuffled, regardless of this flag. Setting it additionally brand-scrubs "
+                "the original question shown to the synthesiser. It does not change the "
+                "output, which de-blinds slugs for the human reader."
+            ),
         },
     },
 }
@@ -233,18 +243,11 @@ REFINE_SCHEMA = {
                 "summary' before the new round runs. Unknown IDs raise an error."
             ),
         },
-        "strategy": {
-            "type": "string",
-            "enum": ["default", "elimination"],
-            "default": "default",
-            "description": (
-                "Round-to-round strategy. 'default' runs the full panel "
-                "every round. 'elimination' drops the most-divergent "
-                "panellist (max-distance from the panel medoid) from "
-                "round 2 onwards — tightens the consensus signal by "
-                "removing structural outliers."
-            ),
-        },
+        # The `strategy` round-to-round hook is no longer part of the MCP
+        # surface: only the default (full panel every round) ships, and the
+        # elimination strategy was retired (issue #59). The engine keeps the
+        # extension point — refine() still accepts strategy= for library
+        # callers — but the always-default knob is dropped from the schema.
     },
 }
 

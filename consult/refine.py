@@ -901,9 +901,9 @@ async def refine(
             panel_conversations[s.slug] = list(prior_turns)
 
     for round_num in range(1, max_rounds + 1):
-        # Strategy decides which panellists run this round. The default
-        # strategy passes `specs` through unchanged; `elimination` drops
-        # the most-divergent panellist from round 2 onwards.
+        # Strategy decides which panellists run this round. Only the default
+        # strategy ships (it passes `specs` through unchanged every round); the
+        # hook stays so a future strategy can filter or reweight per round.
         round_base_specs = strategy_inst.before_round(
             round_num=round_num,
             base_specs=specs,

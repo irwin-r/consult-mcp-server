@@ -163,8 +163,7 @@
     "standard": ["claude-opus", "claude-sonnet", "gpt-pro", "gpt", "gemini-pro", "grok", "qwen-max", "kimi", "glm", "llama"],
     "deep": ["claude-opus", "claude-sonnet", "gpt-pro", "gpt", "gemini-pro", "grok", "qwen-max", "kimi", "glm", "llama", "mistral", "deepseek", "mimo", "sonar-pro"],
     "code": ["claude-opus", "gpt-codex", "gpt-mini", "gemini-pro", "deepseek"],
-    "review": ["claude-opus", "gpt-codex", "gpt-pro", "gemini-pro", "deepseek", "grok"],
-    "wide": ["gpt", "claude-opus", "claude-sonnet", "gemini-pro", "glm", "deepseek", "kimi", "qwen-max", "grok", "llama"]
+    "review": ["claude-opus", "gpt-codex", "gpt-pro", "gemini-pro", "deepseek", "grok"]
   },
   "defaults": {
     "synthesiser": "gemini-pro",

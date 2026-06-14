@@ -42,22 +42,25 @@ def mcp_session_factory():
 
 
 @pytest.mark.asyncio
-async def test_list_tools_advertises_all_five(mcp_session_factory):
-    """Every tool the engine exposes must be reachable through MCP. A new
-    tool added to `_HANDLERS` but forgotten in `handle_list_tools` would
-    silently not be advertised to clients."""
+async def test_list_tools_advertises_default_surface(mcp_session_factory):
+    """Every tool the engine exposes by default must be reachable through MCP.
+    A new tool added to `_HANDLERS` but forgotten in `handle_list_tools` would
+    silently not be advertised to clients. `sequence` is demoted off the
+    default surface (issue #59), so it isn't listed unless enabled."""
     async with mcp_session_factory() as client:
         result = await client.list_tools()
     names = {t.name for t in result.tools}
-    assert names == {"panel", "synthesise", "consult", "refine", "sequence"}
+    assert names == {"panel", "synthesise", "consult", "refine"}
 
 
 @pytest.mark.asyncio
-async def test_list_tools_carries_annotations(mcp_session_factory):
+async def test_list_tools_carries_annotations(monkeypatch, mcp_session_factory):
     """ToolAnnotations are how Claude Code / Cursor / ChatGPT dev-mode
     decide auto-approval. A regression here flips the UX for every
-    consult user; the test pins the contract.
+    consult user; the test pins the contract. Enable sequence so its
+    annotations are exercised alongside the always-on tools.
     """
+    monkeypatch.setenv("CONSULT_ENABLE_SEQUENCE", "1")
     async with mcp_session_factory() as client:
         result = await client.list_tools()
     by_name = {t.name: t for t in result.tools}

@@ -40,3 +40,19 @@ def env_int(name: str, default: int) -> int:
     except ValueError:
         logger.warning("%s=%r is not an integer; using %s", name, raw, default)
         return default
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    """Read a boolean env var. True for 1/true/yes/on, False for
+    0/false/no/off (case-insensitive); unset/blank/garbage falls back to
+    `default`."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    val = raw.strip().lower()
+    if val in {"1", "true", "yes", "on"}:
+        return True
+    if val in {"0", "false", "no", "off"}:
+        return False
+    logger.warning("%s=%r is not a boolean; using %s", name, raw, default)
+    return default

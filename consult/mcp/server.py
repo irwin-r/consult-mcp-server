@@ -54,6 +54,7 @@ from mcp.types import (
 from pydantic import AnyUrl
 
 from .. import __version__, artifacts, task_store
+from ..envutil import env_bool
 from ..progress import ProgressEvent, event_message
 from ..redact import install_redaction_filter, redact_exc, redact_traceback, scrub_exception_attrs
 from . import errors, handlers, schemas
@@ -129,7 +130,7 @@ async def handle_list_tools() -> list[Tool]:
     # disambiguation against the other four tools so the agent reliably
     # picks the right one. The shape "<one-line action>. Use when: <X>.
     # Don't use for: <Y>. Returns <Z>." is consistent across all five.
-    return [
+    tools = [
         Tool(
             name="consult",
             description=(
@@ -176,28 +177,14 @@ async def handle_list_tools() -> list[Tool]:
             annotations=_REFINE_ANN,
         ),
         Tool(
-            name="sequence",
-            description=(
-                "Run an ordered list of prompts where every prior step's synthesis is "
-                "prepended as context for the next step. "
-                "Use when: a question is too large for a single prompt (decompose → "
-                "per-subquestion → meta-synth), or for plan-then-execute workflows where "
-                "step N depends on step N-1's conclusion. "
-                "Don't use for: parallel diverse opinions on the same question (use "
-                "`consult`/`refine`) — sequence is for chained reasoning, not breadth. "
-                "Returns: {step_run_ids, final synthesis, total cost_usd}."
-            ),
-            inputSchema=schemas.SEQUENCE_SCHEMA,
-            annotations=_SEQUENCE_ANN,
-        ),
-        Tool(
             name="synthesise",
             description=(
                 "Re-synthesise an existing run via a flagship model under a (possibly "
                 "different) rubric. "
                 "Use when: you already ran `panel`/`consult`/`refine` and want a fresh "
-                "synthesis — different rubric, different synthesiser model, or to "
-                "anonymise the model IDs. "
+                "synthesis — a different rubric, a different synthesiser model, or "
+                "`anonymised=true` to brand-scrub the question shown to the synthesiser "
+                "(panellist identities are always blinded to the synth regardless). "
                 "Don't use for: fresh questions (use `consult`) or when you don't have a "
                 "prior `run_id` to feed in. "
                 "Returns: markdown text (not a structured dict)."
@@ -206,6 +193,31 @@ async def handle_list_tools() -> list[Tool]:
             annotations=_SYNTH_ANN,
         ),
     ]
+    # `sequence` is demoted off the default tool surface (issue #59): the panel
+    # review judged the always-on multi-step chain low-value relative to its
+    # schema cost. The engine and library API stay, and the handler stays
+    # registered (so an explicit call still works); it just isn't advertised
+    # unless CONSULT_ENABLE_SEQUENCE is set, so it can be revisited with usage
+    # data without re-implementing anything.
+    if env_bool("CONSULT_ENABLE_SEQUENCE"):
+        tools.append(
+            Tool(
+                name="sequence",
+                description=(
+                    "Run an ordered list of prompts where every prior step's synthesis is "
+                    "prepended as context for the next step. "
+                    "Use when: a question is too large for a single prompt (decompose → "
+                    "per-subquestion → meta-synth), or for plan-then-execute workflows where "
+                    "step N depends on step N-1's conclusion. "
+                    "Don't use for: parallel diverse opinions on the same question (use "
+                    "`consult`/`refine`) — sequence is for chained reasoning, not breadth. "
+                    "Returns: {step_run_ids, final synthesis, total cost_usd}."
+                ),
+                inputSchema=schemas.SEQUENCE_SCHEMA,
+                annotations=_SEQUENCE_ANN,
+            )
+        )
+    return tools
 
 
 # ---- Tool dispatch ----------------------------------------------------------
