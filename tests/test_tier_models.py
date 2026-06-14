@@ -39,3 +39,15 @@ def test_tier_responses_models_are_marked_for_routing():
             )
 
     assert not offenders, "tier models the engine can't call:\n  " + "\n  ".join(offenders)
+
+
+def test_gpt_pro_excluded_from_standard_tier():
+    """gpt-pro (Responses route, medium reasoning) burns its whole completion
+    budget on reasoning and truncates with an empty capsule on standard panels,
+    where it was the most expensive panellist by ~8x for zero usable value
+    (issue #67). It stays in deep/review, which opt into heavier, costlier runs.
+    """
+    tiers = registry.models_config()["tiers"]
+    assert "gpt-pro" not in tiers["standard"]
+    assert "gpt-pro" in tiers["deep"]
+    assert "gpt-pro" in tiers["review"]

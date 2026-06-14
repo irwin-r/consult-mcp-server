@@ -387,11 +387,49 @@ async def _stream_acompletion(
     # propagate to `_call_one`'s outer try/except, which surfaces the
     # panellist as Status.ERROR with a clear error string.
     try:
-        return litellm.stream_chunk_builder(chunks, messages=kwargs.get("messages"))
+        rebuilt = litellm.stream_chunk_builder(chunks, messages=kwargs.get("messages"))
     except Exception as e:
         raise RuntimeError(
             f"stream_chunk_builder failed after {len(chunks)} chunks: {type(e).__name__}: {e}"
         ) from e
+
+    # `stream_chunk_builder` drops `url_citation` annotations, so a
+    # web-grounded panellist streamed with CONSULT_STREAM=1 lost its Sources
+    # footer and its research capsules regressed to bare markers (issue #66).
+    # Recover any annotations we saw in the raw chunks and graft them onto the
+    # rebuilt message so `citations.harvest()` can still build the footer.
+    annotations = _collect_stream_annotations(chunks)
+    if annotations:
+        try:
+            message = cast(Any, rebuilt).choices[0].message
+            if not getattr(message, "annotations", None):
+                message.annotations = annotations
+        except (AttributeError, IndexError, TypeError) as e:
+            logger.debug("could not graft streamed annotations onto rebuilt response: %s", e)
+    return rebuilt
+
+
+def _collect_stream_annotations(chunks: list[Any]) -> list[Any]:
+    """Recover citation annotations that `stream_chunk_builder` discards.
+
+    OpenAI/OpenRouter deliver `url_citation` annotations on streaming chunks
+    (usually the final content chunk) via `delta.annotations`, and
+    `stream_chunk_builder` does not carry them onto the rebuilt message. Scan
+    every chunk and accumulate any annotation lists found, on either the
+    streaming `delta` or a non-delta `message`. Best-effort and total: a
+    malformed chunk is skipped, never raised.
+    """
+    collected: list[Any] = []
+    for chunk in chunks:
+        try:
+            choice = chunk.choices[0]
+        except (AttributeError, IndexError, TypeError):
+            continue
+        for holder in (getattr(choice, "delta", None), getattr(choice, "message", None)):
+            ann = getattr(holder, "annotations", None) if holder is not None else None
+            if isinstance(ann, list) and ann:
+                collected.extend(ann)
+    return collected
 
 
 async def _aresponses_as_completion(

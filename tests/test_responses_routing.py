@@ -115,3 +115,32 @@ async def test_fanout_routes_responses_model_through_aresponses(tmp_path, monkey
     assert entry.status is Status.OK
     assert entry.cost_usd == pytest.approx(0.003)
     assert entry.cost_known is True
+
+
+def test_collect_stream_annotations_recovers_from_delta_and_message():
+    """stream_chunk_builder drops url_citation annotations; the collector must
+    recover them from the streaming delta (or a non-delta message) across
+    chunks so a streamed web panellist keeps its Sources footer (issue #66).
+    """
+    from consult.runner.transport import _collect_stream_annotations
+
+    ann = [{"url_citation": {"url": "https://example.com", "title": "Example"}}]
+    chunks = [
+        SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content="hi", annotations=None))]),
+        SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content="", annotations=ann))]),
+    ]
+    assert _collect_stream_annotations(chunks) == ann
+
+
+def test_collect_stream_annotations_is_total_on_malformed_chunks():
+    """A malformed or annotation-less chunk is skipped, never raised — the
+    recovery is best-effort enrichment that must not fail a panellist.
+    """
+    from consult.runner.transport import _collect_stream_annotations
+
+    chunks = [
+        SimpleNamespace(choices=[]),  # empty choices → IndexError, skipped
+        SimpleNamespace(),  # no choices attr → AttributeError, skipped
+        SimpleNamespace(choices=[SimpleNamespace(delta=None, message=None)]),  # no holders
+    ]
+    assert _collect_stream_annotations(chunks) == []
