@@ -219,26 +219,7 @@ async def _call_one(
         try:
             async with sem if sem is not None else nullcontext():
                 messages = build_messages(per_slug_prompt, provider, prior_turns)
-                if provider == "cli":
-                    # CLI panellists bypass LiteLLM entirely: spawn the
-                    # configured executable, send the prompt on stdin,
-                    # capture stdout. Cost is zero (the CLI's own auth
-                    # covers usage); per-provider semaphore still applies
-                    # if the registry configures one for "cli".
-                    from .. import cli_executor
-
-                    cli_command = entry.get("cli_command") or []
-                    if not cli_command:
-                        raise ValueError(
-                            f"CLI provider for {spec.model!r} has no cli_command in the registry entry"
-                        )
-                    resp = await cli_executor.call_cli(
-                        cli_command,
-                        per_slug_prompt,
-                        timeout=timeout,
-                        extra_env=entry.get("cli_env"),
-                    )
-                elif is_responses:
+                if is_responses:
                     # Responses-API models 404 on chat completions; route them
                     # through the adapter. No streaming on this path.
                     resp = await _aresponses_as_completion(
@@ -287,13 +268,7 @@ async def _call_one(
             if usage:
                 tokens_in = getattr(usage, "prompt_tokens", None)
                 tokens_out = getattr(usage, "completion_tokens", None)
-            if provider == "cli":
-                # CLI panellists are free at the per-call level. Skip
-                # LiteLLM's cost lookup (it would error on the synthetic
-                # response object built by `cli_executor.call_cli`).
-                cost = 0.0
-                cost_known = True
-            elif is_responses:
+            if is_responses:
                 # The Responses adapter returns a synthetic chat-shaped object
                 # that `completion_cost` can't price; compute from token counts.
                 try:
