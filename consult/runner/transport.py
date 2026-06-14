@@ -401,7 +401,7 @@ async def _stream_acompletion(
     annotations = _collect_stream_annotations(chunks)
     if annotations:
         try:
-            message = rebuilt.choices[0].message
+            message = cast(Any, rebuilt).choices[0].message
             if not getattr(message, "annotations", None):
                 message.annotations = annotations
         except (AttributeError, IndexError, TypeError) as e:
