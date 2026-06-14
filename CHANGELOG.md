@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Until 1.0, the capsule schema and tool surface may change in minor releases.
 
+## [0.5.0](https://github.com/irwin-r/consult-mcp-server/compare/v0.4.1...v0.5.0) (2026-06-14)
+
+
+### ⚠ BREAKING CHANGES
+
+* carry drop reasons and spend in peer rank forensics ([#65](https://github.com/irwin-r/consult-mcp-server/issues/65))
+
+### Features
+
+* report the cost per usable capsule in the run_summary rollup ([bb19427](https://github.com/irwin-r/consult-mcp-server/commit/bb19427d52207bb419b64dce6bebf75ecdbcac4f))
+
+
+### Bug Fixes
+
+* accumulate re-synthesis spend instead of clobbering run cost ([1a1e24f](https://github.com/irwin-r/consult-mcp-server/commit/1a1e24fd022bb272c2c4de5b8a33f7b672f53a96))
+* carry drop reasons and spend in peer rank forensics ([#65](https://github.com/irwin-r/consult-mcp-server/issues/65)) ([be2b7e2](https://github.com/irwin-r/consult-mcp-server/commit/be2b7e27949d10206883bbc8a4f56b0ecf88ff4b))
+* carry web citation URLs into bodies and research capsules ([#68](https://github.com/irwin-r/consult-mcp-server/issues/68)) ([522cbea](https://github.com/irwin-r/consult-mcp-server/commit/522cbea7b8597c3c958a65d6d8fc92158fa8137d))
+* floor each panellist's output budget at its model budget ([8a68700](https://github.com/irwin-r/consult-mcp-server/commit/8a68700d4c522d33e5db0300765d4c5b28623986))
+* give refine results the run_summary health rollup as well ([a71567b](https://github.com/irwin-r/consult-mcp-server/commit/a71567b57f311fc85cb3a06e6b2613af3ab940a0))
+* harden the refine arbiter against verdict parse failures ([dac803b](https://github.com/irwin-r/consult-mcp-server/commit/dac803b2bd3a0dccefd8ce8139b49474e8fb875c))
+* honour dry_run on refine and sequence ([fb23167](https://github.com/irwin-r/consult-mcp-server/commit/fb23167af108ea1e919d8ce3299915e6a709376a))
+* kind-aware refine budgets and reasoning_content salvage ([6639845](https://github.com/irwin-r/consult-mcp-server/commit/66398454c5228ecf7d8ed20b296fae6afedc3628))
+* make the capsule empty-extraction retry kind-aware ([474d008](https://github.com/irwin-r/consult-mcp-server/commit/474d008e1f8418a7c5bfa0fa2cd16b94b44dbfd4))
+* pass capsule_kind through refine's round fanout ([46f5aff](https://github.com/irwin-r/consult-mcp-server/commit/46f5aff7168ac3a2620293af0f9dd9b296c738fc))
+* salvage reasoning_content when content is empty ([2b2b8df](https://github.com/irwin-r/consult-mcp-server/commit/2b2b8df709d6b602dad0f53179d85210fb3c8784))
+* stop paying for truncated panellists and harden the refine arbiter ([4f086a3](https://github.com/irwin-r/consult-mcp-server/commit/4f086a37634f82ce97fad0a033bdfffaca3d9a58))
+
+
+### Documentation
+
+* 2026-06 strategy dogfood review, plus two dogfood-found fixes ([c196b40](https://github.com/irwin-r/consult-mcp-server/commit/c196b4063f6aa17b3ff909fe43853bcd6ab299ea))
+* add the 2026-06 strategy dogfood review ([edc0faf](https://github.com/irwin-r/consult-mcp-server/commit/edc0fafdf7bb2cacff28420a6c6f6f732f4bf0e0))
+* log the 2026-06-11 strategy dogfood friction ([42861d6](https://github.com/irwin-r/consult-mcp-server/commit/42861d66c431e9dfdc52a21148c122a5256733a5))
+* log the issue 55 fix-pass friction with the probe driver ([5502940](https://github.com/irwin-r/consult-mcp-server/commit/5502940a418cb8dcf74b5a5e67f172e01c71d819))
+
 ## [0.4.1](https://github.com/irwin-r/consult-mcp-server/compare/v0.4.0...v0.4.1) (2026-06-11)
 
 

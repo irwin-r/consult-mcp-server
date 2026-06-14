@@ -37,7 +37,7 @@ compatibility contract until 1.0:
   consumers can catch
 """
 
-__version__ = "0.4.1"  # x-release-please-version
+__version__ = "0.5.0"  # x-release-please-version
 
 # Top-level engine entry points. `refine` and `sequence` are NOT re-exported
 # here on purpose: each is also the name of a submodule (`consult.refine`,
