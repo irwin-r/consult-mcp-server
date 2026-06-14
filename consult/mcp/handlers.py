@@ -336,11 +336,14 @@ async def sequence(args: dict[str, Any], *, on_progress: ProgressCallback | None
         synthesiser=args.get("synthesiser"),
         blinded=args.get("blinded", False),
         max_run_usd=args.get("max_run_usd"),
+        dry_run=args.get("dry_run", False),
         capsule_kind=args.get("capsule_kind", "decision"),
         rubric=args.get("rubric"),
         on_progress=on_progress,
     )
-    return await _augment_result(result.model_dump())
+    payload = result.model_dump()
+    # Dry runs have no artifacts to render or summarise (parity with panel/consult).
+    return payload if args.get("dry_run", False) else await _augment_result(payload)
 
 
 async def refine(args: dict[str, Any], *, on_progress: ProgressCallback | None = None) -> dict[str, Any]:
@@ -354,6 +357,7 @@ async def refine(args: dict[str, Any], *, on_progress: ProgressCallback | None =
         max_rounds=args.get("max_rounds", 3),
         blinded=args.get("blinded", False),
         max_run_usd=args.get("max_run_usd"),
+        dry_run=args.get("dry_run", False),
         synthesiser=args.get("synthesiser"),
         continuation_id=args.get("continuation_id"),
         rubric=args.get("rubric"),
@@ -364,4 +368,6 @@ async def refine(args: dict[str, Any], *, on_progress: ProgressCallback | None =
         strategy=args.get("strategy", "default"),
         on_progress=on_progress,
     )
-    return await _augment_result(result.model_dump())
+    payload = result.model_dump()
+    # Dry runs have no artifacts to render or summarise (parity with panel/consult).
+    return payload if args.get("dry_run", False) else await _augment_result(payload)

@@ -76,6 +76,17 @@ _RUBRIC_FIELD = {
     ),
 }
 
+_DRY_RUN_FIELD = {
+    "type": "boolean",
+    "default": False,
+    "description": (
+        "Estimate cost without calling any model. Returns partial=true with the "
+        "estimate in partial_reason and an empty result. For multi-round/multi-step "
+        "tools the estimate is the per-round (refine) or summed per-step (sequence) "
+        "panel cost — a floor, since rounds and prior-step context can grow it."
+    ),
+}
+
 
 # --- Tool schemas -------------------------------------------------------------
 
@@ -207,6 +218,7 @@ REFINE_SCHEMA = {
             "description": _ATTACHMENTS_FIELD_DESC,
         },
         "max_run_usd": {"type": "number"},
+        "dry_run": _DRY_RUN_FIELD,
         "synthesiser": {
             "type": "string",
             "description": "Final synthesis model. Defaults to the arbiter.",
@@ -300,6 +312,7 @@ SEQUENCE_SCHEMA = {
             "type": "number",
             "description": "Cap across the whole sequence (cumulative, not per-step).",
         },
+        "dry_run": _DRY_RUN_FIELD,
         "rubric": {
             **_RUBRIC_FIELD,
             "description": (

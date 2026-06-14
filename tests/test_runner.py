@@ -159,6 +159,48 @@ async def test_fanout_dry_run_returns_partial():
 
 
 @pytest.mark.asyncio
+async def test_fanout_dry_run_wins_over_cap(monkeypatch):
+    """A dry_run whose estimate exceeds the cap still returns the estimate —
+    the cap guards real spend, not estimates — and notes the overage so the
+    caller learns a real run would be rejected. Keeps fanout's dry_run
+    consistent with refine/sequence (FRICTION 2026-06-14): before this, the
+    cap gate sat above the dry_run gate, so an over-cap dry_run reported
+    "exceeds cap" and the "dry_run" estimate never surfaced.
+    """
+    from consult import runner as runner_mod
+    from consult.runner import fanout
+
+    monkeypatch.setattr(runner_mod, "estimate_cost", lambda *a, **kw: (0.50, True))
+
+    specs = [ModelSpec(model="claude-haiku")]
+    handle = await fanout("any prompt", specs, dry_run=True, max_run_usd=0.01)
+    assert handle.partial is True
+    assert handle.partial_reason.startswith("dry_run:")
+    assert "exceeds cap $0.01" in handle.partial_reason
+    assert "a real run would be rejected" in handle.partial_reason
+    assert handle.cost_usd == 0.0
+    assert handle.manifest == []
+
+
+@pytest.mark.asyncio
+async def test_fanout_real_run_still_rejected_over_cap(monkeypatch):
+    """The reorder must not weaken the real-run cap: a non-dry_run estimate
+    over the cap is still refused with the 'exceeds cap' message and no spend.
+    """
+    from consult import runner as runner_mod
+    from consult.runner import fanout
+
+    monkeypatch.setattr(runner_mod, "estimate_cost", lambda *a, **kw: (0.50, True))
+
+    specs = [ModelSpec(model="claude-haiku")]
+    handle = await fanout("any prompt", specs, dry_run=False, max_run_usd=0.01)
+    assert handle.partial is True
+    assert "exceeds cap $0.01" in handle.partial_reason
+    assert "dry_run" not in handle.partial_reason
+    assert handle.cost_usd == 0.0
+
+
+@pytest.mark.asyncio
 async def test_fanout_slow_tail_dropout_cancels_stragglers(tmp_path, monkeypatch):
     """Once `N - k` panellists return, slow stragglers get cancelled and
     surface as Status.TIMEOUT with a "slow-tail dropout" error. The full

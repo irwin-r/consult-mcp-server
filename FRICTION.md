@@ -261,3 +261,59 @@ Shipped the truncation-economics fix with live before/after probes
   (scores 0.60 then 0.95, converged). The same run exposed that refine
   results carried no run_summary at all — the rollup keyed on `manifest`
   while refine returns `final_manifest`. Fixed in this PR.
+
+## 2026-06-14 — dogfood pass (in-session, ~$0.10 known spend)
+
+Dogfooded the live MCP tools from inside the repo to chase the reported
+"errors / token-limit" pain. The reproduction came for free: a `dry_run`
+guard call surfaced a real bug.
+
+- [bug] **`refine` and `sequence` silently dropped `dry_run`**. Passing
+  `dry_run: true` to either tool ran the full thing at full cost: the MCP
+  schema carried no `dry_run` property, the handler never forwarded it, and
+  the engine functions had no such parameter, so the JSON field was dropped
+  with no error (same "extra fields silently dropped" class as the
+  2026-05-20 RefineResult and dropout-cost passes). Worst case on the two
+  most expensive tools (a 3-round flagship refine or a multi-step
+  sequence) could spend dollars on what the caller thought was a free
+  estimate. I tripped it myself: a `dry_run` refine I expected to be free
+  ran 2 rounds for $0.10 (run 20260614-064338-75435). RESOLVED in this PR:
+  `dry_run` is now threaded end to end (schema + handler + engine). Refine
+  prices one round (panel + arbiter) and reports the per-round estimate
+  plus the worst case across `max_rounds`; sequence sums each step's panel
+  estimate (a floor, since per-step synth and prior-step context growth
+  aren't priced). Both return early with `partial=true`, no run dir, no
+  spend. Five tests added, including in-process MCP-adapter tests that
+  drive the real server object end to end (the layer where the flag was
+  actually being dropped).
+- [meta] **Arbiter hardening still holds.** The accidental refine
+  (gemini-pro arbiter, 2 rounds, scores 0.7 then 0.8) parsed both verdicts
+  first try with no `json_parse_failed`. Second clean live arbiter run
+  since the #57 hardening.
+- [env] **Flagship truncation is expensive to regenerate.** Standard tier
+  dry-runs at $2.12; a 3-flagship gpt-pro panel at $1.81 worst case. Rather
+  than pay to re-trigger reasoning-burn truncation, note that the evidence
+  already sits on disk: 1,282 run dirs under `~/.consult/runs`, e.g. the
+  $1.26 standard run 20260611-042818-67174 carries 12 truncated/length
+  panellists. Live truncation repro should reuse these, not re-buy them.
+- [meta] **The MCP server runs a snapshot of the code at spawn time.** A
+  working-tree edit (this fix) is invisible to the already-connected
+  `mcp__consult__*` tools until the server restarts, so the fix was
+  validated through the in-process adapter test rather than a live tool
+  call. Worth remembering before "I fixed it, let me re-run the tool live."
+- [bug] **Live re-test (fresh server) surfaced a dry_run/cap ordering
+  inconsistency.** The validation agent ran the fixed tools against a
+  restarted server (refine/sequence dry_run both returned `dry_run:`
+  estimates, zero spend, confirmed loaded). Its consult regression check,
+  though, hit `estimated cost $0.04 exceeds cap $0.01` instead of a
+  `dry_run:` reason: in `runner/fanout.py` the `estimate > cap` gate sat
+  ABOVE the `if dry_run` gate, so an over-cap dry_run reported the cap
+  rejection and the estimate never surfaced. consult still refused to
+  spend (cost_usd 0), so no money was at risk, but the behaviour diverged
+  from the just-fixed refine/sequence, which return the estimate before any
+  cap enforcement. RESOLVED in this PR: dry_run now precedes the cap gate in
+  fanout, and when the estimate exceeds the cap the message appends "(exceeds
+  cap $X; a real run would be rejected)" so the cap signal isn't lost. Two
+  tests lock it: over-cap dry_run yields the estimate; over-cap real run is
+  still refused. The cap-first ordering was pre-existing, not introduced by
+  the dry_run work — the live re-test is what exposed it.

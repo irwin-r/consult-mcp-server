@@ -717,9 +717,9 @@ async def fanout(
     else:
         paths = existing_paths
 
-    # Estimate cost up front; if dry_run, return immediately with empty
-    # manifest. When `prior_turns` is set (continuation), include their
-    # text in the token count so the cap check sees the real input size.
+    # Estimate cost up front. When `prior_turns` is set (continuation),
+    # include their text in the token count so the cap check sees the real
+    # input size.
     cost_input = prompt
     if prior_turns:
         cost_input = concat_turn_text(prior_turns) + "\n" + prompt
@@ -737,10 +737,34 @@ async def fanout(
         if existing_paths is None or not paths.manifest_json.exists():
             artifacts.write_manifest(paths, handle.model_dump())
 
+    # dry_run is checked BEFORE the cap gate: a dry_run answers "what would
+    # this cost", and the cap guards real spend — a dry_run never spends, so
+    # an over-cap estimate must still surface as an estimate, not as a cap
+    # rejection. (When it does exceed the cap, the message says so, so the
+    # caller still learns a real run would be refused.) This keeps fanout's
+    # dry_run consistent with refine/sequence, which return their estimate
+    # before any cap enforcement. The cap gate below only fires for real runs.
+    if dry_run:
+        suffix = "" if all_known else " (some prices unknown — actual cost may differ)"
+        cap_note = f" (exceeds cap ${cap:.2f}; a real run would be rejected)" if estimate > cap else ""
+        handle = RunHandle(
+            run_id=paths.run_id,
+            artifacts_dir=str(paths.root),
+            manifest=[],
+            cost_usd=0.0,
+            cost_known=all_known,
+            wall_ms=0,
+            partial=True,
+            partial_reason=f"dry_run: estimated cost ${estimate:.4f}{suffix}{cap_note}",
+            blinded=blinded,
+        )
+        _persist_partial_handle(handle)
+        return handle
+
     if estimate > cap:
         # When some prices are unknown, `estimate` is only the known-priced
         # portion; the actual run could cost more. Surface that so the cap
-        # message isn't misleading low. Mirrors the dry_run branch below.
+        # message isn't misleading low. Mirrors the dry_run branch above.
         suffix = "" if all_known else " (known-priced portion only; some unknown)"
         # Name the panellists driving the estimate so the rejection is
         # actionable (raise the cap, or drop the named models) rather than
@@ -765,21 +789,6 @@ async def fanout(
             wall_ms=0,
             partial=True,
             partial_reason=(f"estimated cost ${estimate:.2f}{suffix} exceeds cap ${cap:.2f}{drivers_note}"),
-            blinded=blinded,
-        )
-        _persist_partial_handle(handle)
-        return handle
-    if dry_run:
-        suffix = "" if all_known else " (some prices unknown — actual cost may differ)"
-        handle = RunHandle(
-            run_id=paths.run_id,
-            artifacts_dir=str(paths.root),
-            manifest=[],
-            cost_usd=0.0,
-            cost_known=all_known,
-            wall_ms=0,
-            partial=True,
-            partial_reason=f"dry_run: estimated cost ${estimate:.4f}{suffix}",
             blinded=blinded,
         )
         _persist_partial_handle(handle)

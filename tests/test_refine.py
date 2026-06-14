@@ -1909,3 +1909,55 @@ def test_arbiter_unscoreable_json_retries_then_reports_no_score(monkeypatch):
     assert calls["n"] == 2
     assert verdict.parsed_ok is False
     assert verdict.score == 0.0
+
+
+@pytest.mark.asyncio
+async def test_refine_dry_run_estimates_without_fanout(monkeypatch):
+    """dry_run must price the panel + arbiter and return early — never call
+    fanout, never spend. Regression for the silently dropped `dry_run` flag
+    (FRICTION 2026-06-14): the MCP refine schema carried no dry_run, so the
+    flag was dropped and the full multi-round panel ran anyway.
+    """
+    from consult import runner as runner_mod
+
+    monkeypatch.setattr(runner_mod, "estimate_cost", lambda *a, **kw: (0.5, True))
+
+    async def boom_fanout(*a, **kw):
+        raise AssertionError("dry_run must not call fanout")
+
+    monkeypatch.setattr(runner_mod, "fanout", boom_fanout)
+
+    result = await refine_mod.refine(
+        "should we ship X?",
+        [ModelSpec(model="claude-haiku"), ModelSpec(model="grok")],
+        max_rounds=3,
+        dry_run=True,
+    )
+    assert result.partial is True
+    assert "dry_run" in (result.partial_reason or "")
+    assert result.cost_usd == 0.0
+    assert result.cost_known is True
+    assert result.rounds_completed == 0
+    assert result.final_manifest == []
+    assert result.verdicts == []
+    # per-round = panel(0.5) + arbiter(0.5) = 1.0; worst case across 3 rounds = 3.0
+    assert "3.0000" in result.partial_reason
+
+
+@pytest.mark.asyncio
+async def test_refine_dry_run_marks_cost_unknown_on_partial_pricing(monkeypatch):
+    """When a panellist's price is unknown, the dry_run estimate carries
+    cost_known=False and says so — mirrors fanout's dry_run honesty.
+    """
+    from consult import runner as runner_mod
+
+    monkeypatch.setattr(runner_mod, "estimate_cost", lambda *a, **kw: (0.1, False))
+
+    result = await refine_mod.refine(
+        "Q?",
+        [ModelSpec(model="claude-haiku")],
+        dry_run=True,
+    )
+    assert result.partial is True
+    assert result.cost_known is False
+    assert "some prices unknown" in result.partial_reason

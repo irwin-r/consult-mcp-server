@@ -89,6 +89,7 @@ async def sequence(
     synthesiser: str | None = None,
     blinded: bool = False,
     max_run_usd: float | None = None,
+    dry_run: bool = False,
     capsule_kind: str = "decision",
     rubric: str | None = None,
     on_progress: runner.ProgressCallback | None = None,
@@ -109,6 +110,34 @@ async def sequence(
     # boundary; an inline-burned panel would be wasted spend.
     registry.resolve_model(synth_alias)
     cap = max_run_usd if max_run_usd is not None else registry.default_max_run_usd()
+
+    # Dry run: price every step's panel and return without spending. The
+    # estimate sums per-step fanout cost over the bare step bodies — it
+    # excludes per-step synth and the prior-step context that grows later
+    # steps, so it's a floor. Before this branch, the MCP `sequence` schema
+    # carried no `dry_run`, so a caller's flag was silently dropped and the
+    # full multi-step chain ran anyway (FRICTION 2026-06-14). Mirrors the
+    # panel/consult dry_run path.
+    if dry_run:
+        total_est = 0.0
+        all_known = True
+        for body in prompts:
+            est, known = await runner.aestimate_cost(specs, body, capsule_kind=capsule_kind)
+            total_est += est
+            all_known = all_known and known
+        suffix = "" if all_known else " (some prices unknown — actual cost may differ)"
+        return SequenceResult(
+            steps=[],
+            final_synthesis="(dry run — no steps executed; see partial_reason)",
+            cost_usd=0.0,
+            cost_known=all_known,
+            wall_ms=0,
+            partial=True,
+            partial_reason=(
+                f"dry_run: estimated panel cost ~${total_est:.4f} across {len(prompts)} step(s); "
+                f"excludes per-step synth and prior-step context growth{suffix}"
+            ),
+        )
 
     start = time.time()
     steps: list[SequenceStep] = []

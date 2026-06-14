@@ -458,3 +458,35 @@ async def test_sequence_persists_cost_on_synth_failure(tmp_path, monkeypatch):
     step_paths = artifacts.load_run(result.steps[0].run_id)
     manifest_on_disk = json.loads(step_paths.manifest_json.read_text())
     assert abs(manifest_on_disk["cost_usd"] - 0.04) < 1e-9
+
+
+@pytest.mark.asyncio
+async def test_sequence_dry_run_estimates_without_fanout(monkeypatch):
+    """dry_run sums each step's panel estimate and returns early — never calls
+    fanout/synth, never spends. Regression for the silently dropped dry_run
+    flag (FRICTION 2026-06-14): the MCP sequence schema carried no dry_run, so
+    the flag was dropped and the full multi-step chain ran anyway.
+    """
+    from consult import runner as runner_mod
+    from consult import sequence as sequence_mod
+
+    monkeypatch.setattr(runner_mod, "estimate_cost", lambda *a, **kw: (0.3, True))
+
+    async def boom_fanout(*a, **kw):
+        raise AssertionError("dry_run must not call fanout")
+
+    monkeypatch.setattr(runner_mod, "fanout", boom_fanout)
+
+    result = await sequence_mod.sequence(
+        ["step one", "step two", "step three"],
+        [ModelSpec(model="claude-haiku")],
+        dry_run=True,
+    )
+    assert result.partial is True
+    assert "dry_run" in (result.partial_reason or "")
+    assert result.cost_usd == 0.0
+    assert result.cost_known is True
+    assert result.steps == []
+    # 3 steps × 0.3 = 0.9
+    assert "0.9000" in result.partial_reason
+    assert "3 step(s)" in result.partial_reason

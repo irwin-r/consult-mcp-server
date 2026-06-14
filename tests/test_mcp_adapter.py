@@ -593,3 +593,36 @@ async def test_augment_result_summarises_refine_final_manifest():
     assert result["run_summary"]["usable_capsules"] == 1
     assert result["run_summary"]["cost_per_usable_capsule"] == pytest.approx(0.2)
     assert result["run_summary"]["no_value"][0]["slug"] == "b"
+
+
+@pytest.mark.asyncio
+async def test_call_refine_dry_run_succeeds_without_spending(mcp_session_factory):
+    """The MCP refine schema must carry dry_run and the handler must honour it.
+    Before this fix the flag was dropped at the schema/handler boundary and a
+    full multi-round panel ran anyway (FRICTION 2026-06-14). dry_run goes
+    through the real cost estimator (pricing table, no model calls), so this is
+    safe to run in CI.
+    """
+    async with mcp_session_factory() as client:
+        result = await client.call_tool(
+            "refine",
+            {"prompt": "any", "models": [{"model": "claude-haiku"}], "dry_run": True},
+        )
+    assert result.structuredContent is not None
+    assert result.structuredContent.get("partial") is True
+    assert "dry_run" in (result.structuredContent.get("partial_reason") or "")
+
+
+@pytest.mark.asyncio
+async def test_call_sequence_dry_run_succeeds_without_spending(mcp_session_factory):
+    """Same contract as refine: sequence's dry_run must be advertised in the
+    schema and honoured by the handler rather than silently dropped.
+    """
+    async with mcp_session_factory() as client:
+        result = await client.call_tool(
+            "sequence",
+            {"prompts": ["a", "b"], "models": [{"model": "claude-haiku"}], "dry_run": True},
+        )
+    assert result.structuredContent is not None
+    assert result.structuredContent.get("partial") is True
+    assert "dry_run" in (result.structuredContent.get("partial_reason") or "")

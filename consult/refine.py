@@ -729,6 +729,7 @@ async def refine(
     max_rounds: int = 3,
     blinded: bool = False,
     max_run_usd: float | None = None,
+    dry_run: bool = False,
     synthesiser: str | None = None,
     continuation_id: str | None = None,
     rubric: str | None = None,
@@ -788,6 +789,40 @@ async def refine(
     registry.resolve_model(arbiter_alias)
     if synth_alias != arbiter_alias:
         registry.resolve_model(synth_alias)
+
+    # Dry run: price one round (panel + arbiter) and return without spending
+    # or creating a run dir. Refine's spend scales with rounds, so report
+    # both the per-round estimate and the worst case across max_rounds.
+    # Before this branch, the MCP `refine` schema carried no `dry_run`, so a
+    # caller's flag was silently dropped and the full multi-round panel ran
+    # anyway — exactly the "extra fields silently dropped" trap this repo has
+    # hit before (FRICTION 2026-06-14). Mirrors the panel/consult dry_run path.
+    if dry_run:
+        panel_est, panel_known = await runner.aestimate_cost(specs, prompt, capsule_kind=resolved_kind)
+        arb_est, arb_known = await runner.aestimate_cost(
+            [ModelSpec(model=arbiter_alias)], prompt, capsule_kind=resolved_kind
+        )
+        per_round = panel_est + arb_est
+        all_known = panel_known and arb_known
+        suffix = "" if all_known else " (some prices unknown — actual cost may differ)"
+        return RefineResult(
+            run_id=artifacts.new_run_id(),
+            rounds_completed=0,
+            final_manifest=[],
+            verdicts=[],
+            synthesis="",
+            converged=False,
+            threshold=threshold,
+            cost_usd=0.0,
+            cost_known=all_known,
+            wall_ms=0,
+            partial=True,
+            partial_reason=(
+                f"dry_run: estimated ${per_round:.4f}/round (panel + arbiter); "
+                f"refine runs up to {max_rounds} round(s) → up to ~${per_round * max_rounds:.4f}{suffix}"
+            ),
+            continuation_of=continuation_id,
+        )
 
     paths = artifacts.create_run()
     # Threaded like fanout's run-init: a continuation prompt embeds the
