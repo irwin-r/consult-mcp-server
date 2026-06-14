@@ -160,7 +160,7 @@
   "tiers": {
     "nano": ["claude-haiku", "gemini-flash", "gpt-nano"],
     "quick": ["claude-haiku", "gemini-pro", "grok", "qwen-max", "kimi"],
-    "standard": ["claude-opus", "claude-sonnet", "gpt-pro", "gpt", "gemini-pro", "grok", "qwen-max", "kimi", "glm", "llama"],
+    "standard": ["claude-opus", "claude-sonnet", "gpt", "gemini-pro", "grok", "qwen-max", "kimi", "glm", "llama"],
     "deep": ["claude-opus", "claude-sonnet", "gpt-pro", "gpt", "gemini-pro", "grok", "qwen-max", "kimi", "glm", "llama", "mistral", "deepseek", "mimo", "sonar-pro"],
     "code": ["claude-opus", "gpt-codex", "gpt-mini", "gemini-pro", "deepseek"],
     "review": ["claude-opus", "gpt-codex", "gpt-pro", "gemini-pro", "deepseek", "grok"],
