@@ -95,3 +95,43 @@ def test_quick_check_passes_with_a_key(isolated_env, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert rc == 0
     assert "OK: ready to serve" in out
+
+
+def test_check_pricing_flags_first_party_but_not_aggregator(monkeypatch):
+    """The canary fails (non-zero) on an unpriced first-party model, since the
+    cap and ledger then run blind, but only warns on an unpriced aggregator
+    model, which is expected (issue #57)."""
+    fake_models = {
+        "models": {
+            "claude-opus": {"litellm_id": "anthropic/claude-x", "privacy_tier": "first_party"},
+            "grok": {"litellm_id": "openrouter/x-ai/grok-x", "privacy_tier": "aggregator"},
+            "gemini-pro": {"litellm_id": "gemini/gemini-x", "privacy_tier": "first_party"},
+        }
+    }
+    monkeypatch.setattr(doctor.registry, "models_config", lambda: fake_models)
+    # Only the gemini id is priced; the anthropic (first-party) and grok
+    # (aggregator) ids are not.
+    monkeypatch.setattr(doctor, "_has_pricing", lambda lid: lid == "gemini/gemini-x")
+
+    lines, fails = doctor._check_pricing()
+    text = "\n".join(lines)
+    # One unpriced first-party model => fail count 1.
+    assert fails == 1
+    assert "first-party model claude-opus" in text
+    assert "aggregator model grok" in text
+    # The aggregator miss must not count toward the fail total.
+    assert "first-party model grok" not in text
+
+
+def test_check_pricing_all_priced_passes(monkeypatch):
+    fake_models = {
+        "models": {
+            "claude-opus": {"litellm_id": "anthropic/claude-x", "privacy_tier": "first_party"},
+        }
+    }
+    monkeypatch.setattr(doctor.registry, "models_config", lambda: fake_models)
+    monkeypatch.setattr(doctor, "_has_pricing", lambda lid: True)
+
+    lines, fails = doctor._check_pricing()
+    assert fails == 0
+    assert any("priced: 1/1" in line for line in lines)
