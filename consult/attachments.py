@@ -167,6 +167,23 @@ def render_attachment(item: Any) -> str:
                 f"[ERROR: diff {len(content)} chars exceeds "
                 f"CONSULT_ATTACHMENT_MAX_BYTES={cap}]\n"
             )
+        # An empty diff (base..head resolve to no changes — e.g. a review run
+        # whose branch has no commit yet, so HEAD == base) would otherwise
+        # render as a blank ```diff fence. Reviewers then can't tell "nothing
+        # changed" from "the prompt forgot the diff" and rubber-stamp a verdict
+        # off the surrounding prose (issue #76). Surface it as a directive
+        # marker instead. The check runs AFTER the size cap so a whitespace-only
+        # blob is already bounded before `.strip()` touches it. No fence, so the
+        # block parser/trimmer ignores it, same as the [ERROR: ...] cases above.
+        # Scoped to git_diff; empty file attachments are tracked separately.
+        if not content.strip():
+            return (
+                f"\n## {label}\n"
+                f"[WARNING: git diff {base}..{head} produced no output. There are "
+                f"no changes between these refs to review. Do not infer a review "
+                f"or verdict from the surrounding prompt text; report that the diff "
+                f"is empty and there is nothing to review.]\n"
+            )
     elif isinstance(item, dict) and item.get("path"):
         path = item["path"]
         label = item.get("label")

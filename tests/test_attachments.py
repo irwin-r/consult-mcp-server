@@ -148,6 +148,78 @@ def test_attachment_git_diff_size_cap(monkeypatch, tmp_path):
     assert "x" * 200 not in out
 
 
+def test_attachment_git_diff_empty_renders_warning_not_blank_fence(monkeypatch):
+    """An empty diff (base..head with no changes) must render a directive
+    WARNING marker, not a blank ```diff fence.
+
+    A blank fence lets reviewers rubber-stamp a verdict off the surrounding
+    prose because they can't tell "nothing changed" from "the prompt forgot
+    the diff" (issue #76).
+    """
+    from consult import attachments
+
+    monkeypatch.setattr(
+        attachments.sources,
+        "resolve_git_diff",
+        lambda base, head, repo_path: "",
+    )
+    out = attachments.render_attachment({"source": "git_diff", "base": "main", "head": "HEAD"})
+    assert "[WARNING:" in out
+    assert "main..HEAD" in out
+    assert "nothing to review" in out
+    # No code fence — an empty diff must not render as a blank ```diff block,
+    # and the no-fence marker stays invisible to the block parser/trimmer.
+    assert "```" not in out
+
+
+def test_attachment_git_diff_whitespace_only_renders_warning(monkeypatch):
+    """A whitespace-only diff is treated as empty (after the size cap, so the
+    `.strip()` can't be turned into an OOM vector)."""
+    from consult import attachments
+
+    monkeypatch.setattr(
+        attachments.sources,
+        "resolve_git_diff",
+        lambda base, head, repo_path: "   \n\n  \t\n",
+    )
+    out = attachments.render_attachment({"source": "git_diff", "base": "v1", "head": "v2"})
+    assert "[WARNING:" in out
+    assert "v1..v2" in out
+
+
+def test_attachment_git_diff_empty_uses_custom_label(monkeypatch):
+    """The WARNING header reuses a caller's custom label, and the body still
+    names the actual refs so the empty range is identifiable."""
+    from consult import attachments
+
+    monkeypatch.setattr(
+        attachments.sources,
+        "resolve_git_diff",
+        lambda base, head, repo_path: "",
+    )
+    out = attachments.render_attachment(
+        {"source": "git_diff", "base": "main", "head": "HEAD", "label": "the change"}
+    )
+    assert "## the change" in out
+    assert "git diff main..HEAD" in out
+
+
+def test_attachment_git_diff_nonempty_renders_normal_block(monkeypatch):
+    """A non-empty diff is unchanged: a normal ```diff fenced block, no
+    WARNING. Guards the empty-check against false positives."""
+    from consult import attachments
+
+    monkeypatch.setattr(
+        attachments.sources,
+        "resolve_git_diff",
+        lambda base, head, repo_path: "diff --git a/x b/x\n+line\n",
+    )
+    out = attachments.render_attachment({"source": "git_diff", "base": "main", "head": "HEAD"})
+    assert "[WARNING:" not in out
+    assert "```diff" in out
+    assert "+line" in out
+
+
 def test_persist_inlined_attachments_writes_and_uri_resolves(tmp_path, monkeypatch):
     """Persistence writes each block's content to attachments/<safe-name>
     and the returned URI is resolvable via parse_resource_uri."""
