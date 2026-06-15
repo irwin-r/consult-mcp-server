@@ -33,6 +33,30 @@ def _ok_entry(
     )
 
 
+def _truncated_entry(
+    slug: str,
+    model_id: str,
+    position: str,
+    *,
+    recommendation: str = "",
+    key_points: list[str] | None = None,
+) -> ManifestEntry:
+    """A TRUNCATED panellist whose capsule was cut off mid-extraction.
+    Often only `position` survives before the output-token cap lands."""
+    return ManifestEntry(
+        slug=slug,
+        model_id=model_id,
+        status=Status.TRUNCATED,
+        resource_uri=f"consult://x/{slug}",
+        body_path=f"/x/{slug}",
+        capsule=Capsule(
+            position=position,
+            recommendation=recommendation,
+            key_points=key_points or [],
+        ),
+    )
+
+
 def test_medoid_singleton_group_returns_the_only_slug():
     """A group of one entry trivially yields that entry's slug."""
     manifest = [_ok_entry("solo-0", "anthropic/x", "use approach A")]
@@ -227,6 +251,66 @@ def test_panel_disagreement_clamps_to_unit_interval():
     score = panel_disagreement(manifest)
     assert score is not None
     assert 0.0 <= score <= 1.0
+
+
+def test_panel_disagreement_excludes_truncated_partial_capsules():
+    """A TRUNCATED capsule carrying only a stance fragment must not pull the
+    score toward false agreement. Two OK panellists genuinely disagree; three
+    truncated entries whose fragments echo one of them are ignored, so the
+    score is identical to the OK-only computation and stays high."""
+    ok_only = [
+        _ok_entry("a-0", "x/a", "do A immediately"),
+        _ok_entry("b-0", "y/b", "abandon the project entirely"),
+    ]
+    baseline = panel_disagreement(ok_only)
+    assert baseline is not None and baseline > 0.5
+
+    # Under the old usable-incl-TRUNCATED logic these three "do A" fragments
+    # would flood the pairwise set with high-similarity pairs and crush the
+    # score toward 0 — a degraded panel reading as false consensus.
+    with_truncated = ok_only + [
+        _truncated_entry("t-0", "z/c", "do A immediately"),
+        _truncated_entry("t-1", "z/d", "do A immediately"),
+        _truncated_entry("t-2", "z/e", "do A immediately"),
+    ]
+    score = panel_disagreement(with_truncated)
+    assert score == baseline, "truncated entries leaked into the disagreement score"
+
+
+def test_panel_disagreement_all_truncated_returns_none():
+    """A wholly-degraded panel (every panellist TRUNCATED) yields None, not a
+    fragment-derived score. None fails closed, so the flagship synth runs."""
+    manifest = [
+        _truncated_entry("t-0", "x/a", "approach X"),
+        _truncated_entry("t-1", "y/b", "approach X"),
+        _truncated_entry("t-2", "z/c", "approach Y"),
+    ]
+    assert panel_disagreement(manifest) is None
+
+
+def test_panel_disagreement_one_ok_plus_truncated_returns_none():
+    """Fewer than two COMPLETE capsules → None, even when truncated entries
+    bring the old usable count to two or more."""
+    manifest = [
+        _ok_entry("a-0", "x/a", "do X"),
+        _truncated_entry("t-0", "y/b", "do X"),
+        _truncated_entry("t-1", "z/c", "do X"),
+    ]
+    assert panel_disagreement(manifest) is None
+
+
+def test_medoid_still_tolerates_truncated_entries():
+    """The disagreement fix excludes TRUNCATED, but medoid voting must keep
+    tolerating them — a truncated best-available representative is still
+    useful for routing, so the two functions diverge on purpose."""
+    manifest = [
+        _truncated_entry("t-0", "x/same", "approach X with detail"),
+        _truncated_entry("t-1", "x/same", "approach X with more detail"),
+        _truncated_entry("t-2", "x/same", "wildly different approach Z"),
+    ]
+    out = medoid_slugs(manifest)
+    chosen = out[(0, "x/same")]
+    assert chosen in {"t-0", "t-1"}, f"outlier picked: {chosen}"
 
 
 def test_medoid_handles_review_capsules():

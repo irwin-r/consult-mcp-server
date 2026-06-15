@@ -147,17 +147,28 @@ def medoid_slugs(manifest: list[ManifestEntry]) -> dict[tuple[int, str], str]:
 def panel_disagreement(manifest: list[ManifestEntry]) -> float | None:
     """Compute a panel-wide disagreement score in [0, 1].
 
-    0.0 = perfect agreement (all usable capsules say the same thing).
+    0.0 = perfect agreement (all complete capsules say the same thing).
     1.0 = no two panellists agree on anything.
 
-    Formula: `1 - mean(pairwise similarity)` across every usable
-    (Status.OK / TRUNCATED) capsule pair. Same feature-extraction +
+    Formula: `1 - mean(pairwise similarity)` across every COMPLETE
+    (Status.OK) capsule pair, using the same feature-extraction +
     similarity logic as `medoid_slugs` — `difflib.SequenceMatcher.ratio()`
     over the capsule's structured fields.
 
+    TRUNCATED capsules are excluded here even though `medoid_slugs` keeps
+    them. A capsule cut off at the output-token cap often carries only its
+    first field (a `position` with no `recommendation` or `key_points`);
+    two such fragments score spuriously high similarity and pull the score
+    toward false agreement, precisely on the degraded panels where the
+    recovery synth matters most. Medoid voting tolerates TRUNCATED (it only
+    needs a best-available representative); disagreement scoring needs a
+    reliable signal, so it requires complete capsules.
+
     Returns `None` (not 0.0 or 1.0) when the panel has fewer than two
-    usable capsules — there is no pair to compare. Callers must handle
-    `None` rather than treating it as full agreement.
+    complete capsules — there is no reliable pair to compare. This fails
+    closed: a `None` score never trips `gate_synth_at_agreement`, so the
+    flagship synth still runs. Callers must handle `None` rather than
+    treating it as full agreement.
 
     Used by `orchestrate.consult(gate_synth_at_agreement=...)` to decide
     whether the flagship synth is worth the spend, per MAgICoRe / FrugalGPT:
@@ -165,7 +176,7 @@ def panel_disagreement(manifest: list[ManifestEntry]) -> float | None:
     ⇒ flagship synth earns its cost. The metric is also exposed on
     `RunResult.disagreement` so callers can route on it themselves.
     """
-    features = [_feature_string(e) for e in manifest if _feature_string(e)]
+    features = [_feature_string(e) for e in manifest if e.status == Status.OK and _feature_string(e)]
     if len(features) < 2:
         return None
     sims: list[float] = []
