@@ -220,6 +220,68 @@ def test_attachment_git_diff_nonempty_renders_normal_block(monkeypatch):
     assert "+line" in out
 
 
+def test_attachment_git_diff_size_cap_wins_over_empty_check(monkeypatch):
+    """The size cap runs BEFORE the `.strip()` empty check, so a whitespace
+    blob over the cap hits [ERROR: ...], not [WARNING: ...].
+
+    This is the ordering the fix comment asserts: bound the input before
+    `.strip()` touches it, so an oversized whitespace blob can't be an OOM
+    vector dressed up as an empty diff.
+    """
+    from consult import attachments
+
+    monkeypatch.setenv("CONSULT_ATTACHMENT_MAX_BYTES", "100")
+    monkeypatch.setattr(
+        attachments.sources,
+        "resolve_git_diff",
+        lambda base, head, repo_path: " " * 5000,
+    )
+    out = attachments.render_attachment({"source": "git_diff", "base": "main", "head": "HEAD"})
+    assert "[ERROR: diff" in out
+    assert "[WARNING:" not in out
+
+
+def test_attachment_git_diff_empty_does_not_abort_other_attachments(monkeypatch, tmp_path):
+    """One empty git_diff among valid attachments must not swallow the
+    others. inline_attachments renders each independently, so the WARNING
+    and the valid file both reach the prompt."""
+    from consult import attachments
+
+    monkeypatch.setattr(
+        attachments.sources,
+        "resolve_git_diff",
+        lambda base, head, repo_path: "",
+    )
+    good = tmp_path / "keep.txt"
+    good.write_text("real content here\n")
+
+    out = attachments.inline_attachments(
+        "question",
+        [{"source": "git_diff", "base": "main", "head": "HEAD"}, str(good)],
+    )
+    assert "[WARNING:" in out
+    assert "real content here" in out
+
+
+def test_attachment_git_diff_empty_warning_evades_block_parser(monkeypatch):
+    """The unfenced WARNING must not be picked up as an attachment block,
+    so the trimmer and the on-disk persister leave it alone. Proves the
+    no-fence claim directly rather than by inspection."""
+    from consult import attachments
+
+    monkeypatch.setattr(
+        attachments.sources,
+        "resolve_git_diff",
+        lambda base, head, repo_path: "",
+    )
+    prompt = attachments.inline_attachments(
+        "question",
+        [{"source": "git_diff", "base": "main", "head": "HEAD"}],
+    )
+    assert "[WARNING:" in prompt
+    assert attachments.extract_inlined_blocks(prompt) == []
+
+
 def test_persist_inlined_attachments_writes_and_uri_resolves(tmp_path, monkeypatch):
     """Persistence writes each block's content to attachments/<safe-name>
     and the returned URI is resolvable via parse_resource_uri."""
