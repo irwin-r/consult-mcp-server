@@ -7,6 +7,81 @@ describe the loop that writes this.
 
 ---
 
+## 2026-06-15 — Disagreement scoring excludes truncated capsules
+
+**Shipped.** `voting.panel_disagreement` scored over both `Status.OK` and
+`Status.TRUNCATED` capsules. A truncated capsule is cut at the output-token cap
+and often carries only its `position` field. Two such short fragments score high
+SequenceMatcher similarity and drag the score toward false agreement, on exactly
+the degraded panels where the recovery synth matters most. The score now uses
+complete `Status.OK` capsules only. The existing `None` contract (fewer than two
+comparable capsules) now fires when fewer than two OK capsules exist, which fails
+closed so the flagship synth still runs. `medoid_slugs` and `_feature_string` are
+left unchanged, so medoid voting keeps tolerating truncated entries for
+best-available routing. One production line, an expanded docstring, four tests.
+
+**How it surfaced.** Four scout lanes (correctness, tests, security, dead code)
+plus deep verification. Every agent-flagged "critical" washed out: the task_store
+cancel/complete race is already guarded in `complete`/`fail`; the synth cost-cap
+unknown-pricing branch is documented intended policy; slow-tail recovery-by-slug
+is safe because `state` is per-fanout-call; the "unredacted secrets in
+responses/<slug>.json" success path carries a completion object, not the request
+auth header, which is the threat model `redact.py` actually covers; the
+`(real cost + cost_known=False)` test gap tests a combo no fanout path produces.
+The disagreement skew was the one candidate with teeth, and the plan panel
+confirmed it is real.
+
+**Validation.** Pure in-process scoring logic, so no provider contract to probe.
+A mutation check is the proof: reverting the one-line filter fails the three new
+disagreement tests (one reads 0.26, false low-disagreement) and leaves the medoid
+test green. Both live panel calls this cycle (8-way plan, 4-way diff) had zero
+TRUNCATED entries, so the OK-only path returned the same score the old code would
+have (0.91 and 0.86), confirming the change is behaviour-neutral on healthy
+panels. Full suite 471 passing, ruff clean.
+
+**Panel — plan (standard/consensus, ~$0.47 known):** disagreement 0.91, a genuine
+split. 7 of 7 usable panellists agreed the skew is a real mechanism; the split was
+only whether a mature codebase should ship the fix. Three personas (gemini-pro
+security, qwen-max future_self, claude-sonnet staff_engineer) converged on the
+identical 3-line `Status.OK` filter from different angles. claude-sonnet then
+declined to ship it on churn grounds, which is the honest staff-engineer call, but
+the security framing (a token-exhaustion attacker can drive disagreement to 0 and
+bypass the gate, and the fix fails closed) plus the precondition check tipped it to
+ship. The panel set one hard gate: verify every `disagreement` consumer handles
+`None`. I did, before building.
+
+**Panel — diff (code/code_review, ~$0.17 known x2):** the first review attached an
+EMPTY diff because the work was staged but not committed, so `git_diff base=main
+head=HEAD` resolved to nothing. Three of four reviewers reviewed my prose
+description and rubber-stamped SHIP; only gemini-pro caught that the attachment was
+empty. I committed and re-ran. The real review went 4/4 SHIP, RISK low, MERGE yes,
+no blockers. Dismissed findings, each with reason: the double `_feature_string`
+call is pre-existing and behaviour-neutral (panel agreed not worth touching); the
+`Status.OK` enum-brittleness is already documented in the expanded docstring;
+strict float `==` in the exclusion test is the stronger regression signal (3 of 4
+reviewers defended it over `pytest.approx`); the downstream `None` grep was done
+pre-build.
+
+**Consult behaviour found.** The empty-diff footgun above is a real one: the manual's
+step-6 review recipe (`base: main, head: HEAD`) silently reviews nothing when the
+branch has no commit yet, and most panellists won't notice. Filed an issue to make
+the `git_diff` attachment resolver surface a warning when `base..head` is empty,
+rather than handing a reviewer a blank. Also noted: `kimi` slow-tail timed out at
+180s on the plan call, already captured in `run_summary.no_value`.
+
+**Panel spend this cycle:** ~$0.81 known-priced (plan $0.47, two diff reviews
+$0.17 + $0.17); several OpenRouter panellists unpriced.
+
+**Considered, not done this cycle:**
+- gpt's design idea to split `disagreement` from an `evidence_quality` /
+  `disagreement_basis_count` signal in the calibration block. The right long-term
+  move, too big for this cycle, left as a design note for a future one.
+- A walrus rewrite of the `panel_disagreement` comprehension to drop the
+  pre-existing double `_feature_string` call. Behaviour-neutral micro-optimisation,
+  out of scope for a correctness fix.
+
+---
+
 ## 2026-06-12 — Web citation URLs reach bodies and research capsules
 
 **Shipped.** Issue #61. Web-grounded panellists (sonar-pro) cite sources as
