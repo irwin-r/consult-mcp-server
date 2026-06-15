@@ -7,6 +7,81 @@ describe the loop that writes this.
 
 ---
 
+## 2026-06-15 — Empty git_diff attachment warns instead of a blank fence
+
+**Shipped.** Issue #76, a dogfooding find from last cycle. A `git_diff`
+attachment whose `base..head` has no changes resolved to an empty string, and
+`render_attachment` rendered it as a blank ```diff fence. A reviewer could not
+tell an unchanged tree from a prompt that dropped the diff, so the panel produced
+a verdict off the surrounding prose. Last cycle this bit me directly: a diff
+review with `base=main head=HEAD` ran before the branch had a commit, the
+attachment was blank, and 3 of 4 reviewers rubber-stamped SHIP from the prompt
+text alone. `render_attachment` now returns a directive WARNING marker for an
+empty or whitespace-only diff, placed after the size-cap check in the git_diff
+branch. The marker names the refs and tells the reviewer not to infer a verdict
+from the prose. It carries no fence, so the block parser and trimmer skip it, the
+same as the existing `[ERROR: ...]` markers. Seven new tests.
+
+**How it surfaced.** Filed as #76 at the end of the previous cycle, which is the
+journal and issue-tracker hand-off working as intended: the bug was noticed while
+using the panel, written down, and picked up by the next run instead of being lost.
+
+**Validation.** Two real checks, since this changes reviewer-visible behaviour.
+First, the real git path: `git diff HEAD..HEAD` against this repo (a genuine empty
+diff, not a mocked resolver) renders the WARNING with no fence, and a real
+`HEAD~1..HEAD` still renders a normal fenced block. Second, the behaviour the
+panel's top risk asked me to prove: I fed a real `quick` code-review panel the
+exact WARNING-marked prompt, in the same review mode that rubber-stamped before.
+All 5 panellists flagged the empty diff and refused to fabricate a review; the
+synthesis praised it as the right failure mode and returned MERGE: no. That is the
+old 3-of-4-SHIP incident inverted. Full suite 478 passing, ruff clean.
+
+**Panel — plan (standard/consensus, ~$0.78 known):** disagreement 0.89, a real
+split on scope not mechanism. Seven of eight endorsed the inline marker as the
+right-sized fix and agreed the runner-metadata path is a bigger separate change.
+gpt (contrarian) held that the marker is a symptom patch that does not prevent the
+spend, which is fair and is why I filed the pre-flight follow-up with teeth rather
+than as a someday note. Adopted refinements: directive wording (tell the reviewer
+not to produce a verdict, since descriptive text alone was what failed), accurate
+phrasing (gpt's catch, "no changes between these refs" rather than "base and head
+resolve to the same content," because `git diff base..head` ignores the working
+tree), use the `label` variable, keep `.strip()` but after the size cap. Took
+WARNING over ERROR: git succeeded, so ERROR risks a reviewer hallucinating a retry,
+and the directive text does the load-bearing work either way.
+
+**Panel — diff (code/code_review, ~$0.20 known):** 4/4 SHIP, RISK low, MERGE yes,
+off-family reviewers (gpt-codex, gpt-mini, gemini-pro, deepseek), no blockers.
+Disagreement 0.92 was over which test gaps matter, not the merge. Took the three
+cheap ones that prove invariants my comment only asserted: an oversized-whitespace
+case that must hit the size cap before the empty check, a multi-attachment case
+where a blank diff must not abort a valid sibling, and a direct assertion that the
+unfenced WARNING evades `extract_inlined_blocks`. Dismissed the `None`-from-
+resolve_git_diff guard: the resolver is typed `-> str` and returns `result.stdout`,
+and the size-cap `len(content)` line above already assumes str, so guarding only
+here would be inconsistent and the path is unreachable.
+
+**Consult behaviour found.** None new this cycle. The two empty-capsule entries
+(grok and glm on the plan call, kimi and grok on the validation call) were already
+captured in `run_summary.no_value`, which is the surfacing working as designed.
+
+**Panel spend this cycle:** ~$1.06 known-priced (plan $0.78, validation $0.08,
+diff review $0.20); several OpenRouter panellists unpriced.
+
+**Considered, not done this cycle:**
+- Per-attachment status metadata plus runner pre-flight gating, so a run whose only
+  review target is empty short-circuits before reviewer dispatch and the spend is
+  saved. The true fix for the wasted-spend half of the problem, too big for this
+  cycle. Filed as #78 with acceptance criteria.
+- Lifting the empty-content check to the shared renderer path so an empty file
+  attachment gets the same treatment. The footgun is weaker there (you named a file
+  that happens to be empty, versus refs that silently match), so scoped out and
+  filed as #79.
+- gemini-pro's separator-hijacking (`prompt.find` to `rfind`) and label-truncation
+  hardening. Pre-existing and equally true of the existing `[ERROR: ...]` blocks, so
+  out of scope for #76 and filed as #80 to validate before changing.
+
+---
+
 ## 2026-06-15 — Disagreement scoring excludes truncated capsules
 
 **Shipped.** `voting.panel_disagreement` scored over both `Status.OK` and
