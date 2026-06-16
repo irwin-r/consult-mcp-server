@@ -7,6 +7,77 @@ describe the loop that writes this.
 
 ---
 
+## 2026-06-16 — Empty file attachment warns instead of a blank fence
+
+**Shipped.** Issue #79, the follow-up to last cycle's #81. The empty-attachment
+WARNING was scoped to the git_diff branch, so an empty plain file or `data`
+attachment still rendered as a blank fence and a reviewer could rubber-stamp a
+verdict off the surrounding prose. `render_attachment` now warns on any empty or
+whitespace-only file with a file-specific marker (an empty file is a valid
+artifact state, so the wording avoids the diff's "nothing to review" framing).
+Ten new tests cover the bare string, `{path}`, `{path, label}`, `kind="data"`,
+whitespace-only, non-empty, multi-attachment, parser-evasion, and size-cap cases.
+
+**How it surfaced.** This was orphaned work. A prior cycle wrote the #79 change
+into the working tree but crashed before it branched, committed, or wrote a single
+test. I found the uncommitted diff on main with no PR, traced it to issue #79,
+moved it onto the existing `fix/si-empty-file-attachment-warning` branch, put it
+through the panel, and finished it properly. The panel earned the cycle: it found
+a real bypass the orphaned code shipped.
+
+**The bypass the plan review caught.** The orphaned change guarded the new check
+with `kind != "git_diff"`. gemini-pro (security, confidence 1.0) and gpt
+(contrarian) showed that guard discriminates on caller-supplied metadata, not
+control-flow origin. A `{path}` dict that a non-schema library caller tags
+`kind="git_diff"` routes through the file branch, fails the guard, and renders the
+exact blank ```diff fence #79 removes. The real git_diff source branch already
+returns early on empty content, so any empty content reaching the shared tail is
+provably from a file branch. Dropping the guard for a bare `if not content.strip()`
+is strictly safer and closes the hole. I adopted it and added a regression test for
+the `{path, kind="git_diff"}` shape.
+
+**Validation.** Pure rendering, no provider call or async fan-out, so no load test
+applies. I ran a real-file end-to-end check (not mocks): a real empty file, a real
+non-empty file, the adversarial `kind="git_diff"` empty file, a whitespace-only
+file, and a two-attachment prompt where the unfenced WARNING reaches the prompt yet
+only the valid file parses as a block. All five passed. Full suite 488 passing (10
+new), ruff clean.
+
+**Panel, plan (standard/consensus, ~$0.49 known):** disagreement 0.87, 7 of 8
+usable (kimi timed out). All seven endorsed per-branch markers over the issue's
+suggested single unified marker, on the semantic split: an empty diff is missing
+review evidence, an empty file is a valid state, so the wording must differ. The
+weighted recommendation was to drop the `kind != "git_diff"` guard, which I took.
+Consensus also held that an empty `data` attachment should still warn (grok alone
+dissented), and that the wording must stay file-specific.
+
+**Panel, diff (code/code_review, ~$0.25 known):** 4 of 4 SHIP, RISK low, MERGE yes,
+off-family reviewers (gpt-codex, gpt-mini, gemini-pro, deepseek), no blockers.
+Disagreement 0.87 was over which minor nits matter, not the merge. I took the
+comment-trim suggestion that two reviewers raised (the rationale block was 14
+lines). I confirmed gpt-codex's one test-gap concern was already covered by the
+existing non-empty git_diff render test, so no test was added for it.
+
+**Consult behaviour found.** kimi timed out on the plan call (slow-tail dropout
+after 180s) and was correctly surfaced in `run_summary.no_value`, the same
+mechanism working as designed. Nothing new to file.
+
+**Panel spend this cycle:** ~$0.74 known-priced (plan ~$0.49, diff ~$0.25);
+several OpenRouter panellists unpriced.
+
+**Considered, not done this cycle:**
+- #78, pre-flight empty-attachment gating before reviewer dispatch. The durable
+  fix that stops the spend, but it needs a per-attachment status structure the
+  runner does not have yet, so it is a larger change. Left for a dedicated cycle.
+- #83, the label-dropping inconsistency in the file ERROR markers (filed this
+  cycle from the plan review). Small, but it is the error path, not the empty path,
+  so it stayed out of this PR to keep the diff focused.
+- #80, separator detection and label/path interpolation hardening. Added the
+  security reviewer's `path`-interpolation point as a comment. Needs an exploit
+  test before changing behaviour, so not bundled here.
+
+---
+
 ## 2026-06-15 — Empty git_diff attachment warns instead of a blank fence
 
 **Shipped.** Issue #76, a dogfooding find from last cycle. A `git_diff`
