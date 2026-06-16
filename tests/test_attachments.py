@@ -282,6 +282,178 @@ def test_attachment_git_diff_empty_warning_evades_block_parser(monkeypatch):
     assert attachments.extract_inlined_blocks(prompt) == []
 
 
+def test_attachment_empty_file_renders_warning_not_blank_fence(tmp_path, monkeypatch):
+    """A bare-string path to an empty file renders a directive WARNING marker,
+    not a blank fence. Generalizes the git_diff empty-warning to plain files
+    (issue #79), so a reviewer can't rubber-stamp a verdict off prose."""
+    from consult import attachments
+
+    monkeypatch.delenv("CONSULT_TRUSTED_REPO_ROOTS", raising=False)
+    empty = tmp_path / "empty.py"
+    empty.write_text("")
+
+    out = attachments.render_attachment(str(empty))
+    assert "[WARNING:" in out
+    assert "is empty or contains only whitespace" in out
+    # File wording must NOT borrow the diff-specific framing.
+    assert "nothing to review" not in out
+    # No fence — an empty file must not render as a blank ``` block, and the
+    # no-fence marker stays invisible to the block parser/trimmer.
+    assert "```" not in out
+
+
+def test_attachment_empty_file_dict_renders_warning_with_label(tmp_path, monkeypatch):
+    """A `{path, label}` dict pointing at an empty file warns and reuses the
+    caller's label in the header (`## label: path`)."""
+    from consult import attachments
+
+    monkeypatch.delenv("CONSULT_TRUSTED_REPO_ROOTS", raising=False)
+    empty = tmp_path / "config.yaml"
+    empty.write_text("")
+
+    out = attachments.render_attachment({"path": str(empty), "label": "the config"})
+    assert "[WARNING:" in out
+    assert f"## the config: {empty}" in out
+    assert "```" not in out
+
+
+def test_attachment_whitespace_only_file_renders_warning(tmp_path, monkeypatch):
+    """A file holding only whitespace is treated as empty (the `.strip()` runs
+    after `_read_text_safely` has already size-capped the content)."""
+    from consult import attachments
+
+    monkeypatch.delenv("CONSULT_TRUSTED_REPO_ROOTS", raising=False)
+    blank = tmp_path / "blank.txt"
+    blank.write_text("   \n\n  \t\n")
+
+    out = attachments.render_attachment(str(blank))
+    assert "[WARNING:" in out
+    assert "```" not in out
+
+
+def test_attachment_empty_data_kind_renders_warning(tmp_path, monkeypatch):
+    """An empty `kind="data"` attachment warns too (issue #79 covers file AND
+    data attachments). Stops the model inferring rows/schema from the prose."""
+    from consult import attachments
+
+    monkeypatch.delenv("CONSULT_TRUSTED_REPO_ROOTS", raising=False)
+    empty = tmp_path / "rows.csv"
+    empty.write_text("")
+
+    out = attachments.render_attachment({"path": str(empty), "kind": "data"})
+    assert "[WARNING:" in out
+    assert "```" not in out
+
+
+def test_attachment_nonempty_file_renders_normal_block(tmp_path, monkeypatch):
+    """A non-empty file is unchanged: a normal fenced block, no WARNING. Guards
+    the empty-check against false positives."""
+    from consult import attachments
+
+    monkeypatch.delenv("CONSULT_TRUSTED_REPO_ROOTS", raising=False)
+    real = tmp_path / "real.py"
+    real.write_text("print('hi')\n")
+
+    out = attachments.render_attachment({"path": str(real), "kind": "source"})
+    assert "[WARNING:" not in out
+    assert "```" in out
+    assert "print('hi')" in out
+
+
+def test_attachment_path_dict_kind_git_diff_empty_warns_not_blank_diff_fence(tmp_path, monkeypatch):
+    """A {path} dict that a non-schema library caller tags kind="git_diff" must
+    still warn on empty content, NOT fall through to a blank ```diff fence.
+
+    The git_diff *source* branch (item["source"] == "git_diff") returns early on
+    empty content, so the only way kind=="git_diff" reaches the shared tail is a
+    file-branch dict carrying that kind. Dropping the old `kind != "git_diff"`
+    tail guard closed this bypass (raised in the #79 plan review): the guard
+    discriminated on caller-supplied metadata and reintroduced the exact footgun
+    #79 removes for that one malformed shape."""
+    from consult import attachments
+
+    monkeypatch.delenv("CONSULT_TRUSTED_REPO_ROOTS", raising=False)
+    empty = tmp_path / "empty.patch"
+    empty.write_text("")
+
+    out = attachments.render_attachment({"path": str(empty), "kind": "git_diff"})
+    assert "[WARNING:" in out
+    assert "```diff" not in out
+    assert "```" not in out
+
+
+def test_attachment_empty_file_wording_distinct_from_empty_diff(monkeypatch, tmp_path):
+    """The two empty markers stay semantically separate: the file warning never
+    says "nothing to review", and the diff warning never says "is empty or
+    contains only whitespace". Locks the per-branch split against drift."""
+    from consult import attachments
+
+    monkeypatch.delenv("CONSULT_TRUSTED_REPO_ROOTS", raising=False)
+    empty = tmp_path / "empty.py"
+    empty.write_text("")
+    file_out = attachments.render_attachment(str(empty))
+
+    monkeypatch.setattr(
+        attachments.sources,
+        "resolve_git_diff",
+        lambda base, head, repo_path: "",
+    )
+    diff_out = attachments.render_attachment({"source": "git_diff", "base": "main", "head": "HEAD"})
+
+    assert "nothing to review" in diff_out
+    assert "nothing to review" not in file_out
+    assert "is empty or contains only whitespace" in file_out
+    assert "is empty or contains only whitespace" not in diff_out
+
+
+def test_attachment_empty_file_does_not_abort_other_attachments(tmp_path, monkeypatch):
+    """One empty file among valid attachments must not swallow the others.
+    inline_attachments renders each independently, so the WARNING and the valid
+    file both reach the prompt."""
+    from consult import attachments
+
+    monkeypatch.delenv("CONSULT_TRUSTED_REPO_ROOTS", raising=False)
+    empty = tmp_path / "empty.py"
+    empty.write_text("")
+    good = tmp_path / "keep.txt"
+    good.write_text("real content here\n")
+
+    out = attachments.inline_attachments("question", [str(empty), str(good)])
+    assert "[WARNING:" in out
+    assert "real content here" in out
+
+
+def test_attachment_empty_file_warning_evades_block_parser(tmp_path, monkeypatch):
+    """The unfenced empty-file WARNING must not be picked up as an attachment
+    block, so the trimmer and the on-disk persister leave it alone."""
+    from consult import attachments
+
+    monkeypatch.delenv("CONSULT_TRUSTED_REPO_ROOTS", raising=False)
+    empty = tmp_path / "empty.py"
+    empty.write_text("")
+
+    prompt = attachments.inline_attachments("question", [str(empty)])
+    assert "[WARNING:" in prompt
+    assert attachments.extract_inlined_blocks(prompt) == []
+
+
+def test_attachment_oversized_whitespace_file_is_error_not_warning(tmp_path, monkeypatch):
+    """The size cap (in `_read_text_safely`, via stat) runs before content is
+    read, so an oversized whitespace file hits [ERROR: ...], not [WARNING: ...].
+    Mirrors the git_diff size-cap-wins ordering for the file path."""
+    from consult import attachments
+
+    monkeypatch.delenv("CONSULT_TRUSTED_REPO_ROOTS", raising=False)
+    monkeypatch.setenv("CONSULT_ATTACHMENT_MAX_BYTES", "10")
+    blank = tmp_path / "big_blank.txt"
+    blank.write_text(" " * 5000)
+
+    out = attachments.render_attachment(str(blank))
+    assert "[ERROR:" in out
+    assert "CONSULT_ATTACHMENT_MAX_BYTES=10" in out
+    assert "[WARNING:" not in out
+
+
 def test_persist_inlined_attachments_writes_and_uri_resolves(tmp_path, monkeypatch):
     """Persistence writes each block's content to attachments/<safe-name>
     and the returned URI is resolvable via parse_resource_uri."""
