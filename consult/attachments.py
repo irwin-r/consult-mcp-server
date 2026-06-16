@@ -195,8 +195,26 @@ def render_attachment(item: Any) -> str:
     else:
         return f"\n[ERROR: malformed attachment spec: {item!r}]\n"
 
-    fence_lang = _KIND_FENCE_LANG.get(kind or "", "")
     header = f"## {label}: {path}" if label else f"# {path}"
+    # An empty or whitespace-only file renders a directive marker, not a blank
+    # ```fence, the same rubber-stamp footgun the git_diff branch above guards
+    # against (#76), now generalized to file attachments (#79). The git_diff
+    # branch already returned on empty content above, so anything empty here came
+    # from a file branch; a bare check with no `kind` guard means a {path} dict a
+    # non-schema caller tags kind="git_diff" still warns rather than rendering a
+    # blank ```diff fence. The wording stays file-specific: an empty file is a
+    # valid artifact state (e.g. __init__.py), unlike an empty diff, so it must
+    # not say "nothing to review". Unfenced, so the block parser and persister
+    # skip it, same as the [ERROR: ...] markers. `_read_text_safely` size-capped
+    # `content` before this `.strip()`, so a whitespace-only blob is bounded.
+    if not content.strip():
+        return (
+            f"\n{header}\n"
+            f"[WARNING: attachment {path} is empty or contains only whitespace. "
+            f"Report that it is empty; do not infer its contents from the "
+            f"surrounding prompt text.]\n"
+        )
+    fence_lang = _KIND_FENCE_LANG.get(kind or "", "")
     return f"\n{header}\n```{fence_lang}\n{content}\n```\n"
 
 
@@ -231,6 +249,12 @@ ATTACHMENT_SEPARATOR = "\n\n--- ATTACHMENTS ---\n"
 # triple-backtick. Source files rarely contain literal triple-backticks;
 # attached markdown could trip this, but a slightly-short block is a
 # softer failure mode than mis-parsing the whole prompt.
+#
+# The `[ERROR: ...]` and `[WARNING: ...]` markers (unreadable file, empty
+# diff, empty file) carry no fence on purpose, so this regex skips them and
+# `persist_inlined_attachments` writes no artifact for them. That's intended:
+# a failed or empty attachment has no content worth persisting, and a reader
+# learns its state from the marker in the prompt, not from a 0-byte file.
 _BLOCK_RE = re.compile(
     r"(?P<header>^#{1,2} [^\n]+)\n```(?P<lang>[^\n]*)\n(?P<content>.*?)\n```",
     re.DOTALL | re.MULTILINE,
