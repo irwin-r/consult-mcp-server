@@ -317,3 +317,114 @@ guard call surfaced a real bug.
   tests lock it: over-cap dry_run yields the estimate; over-cap real run is
   still refused. The cap-first ordering was pre-existing, not introduced by
   the dry_run work — the live re-test is what exposed it.
+
+## 2026-07-13 — third dogfood pass (two production refine runs on an e-commerce architecture question)
+
+Two real `refine` runs (9-model standard panel, ~$1.5 and ~$1.1) plus one
+zero-panellist failure. Every item below observed live; fixes landed in
+this pass.
+
+- [ux] ~~**Stale example model names in the Claude Code skill doc killed a
+  run.**~~ RESOLVED. `~/.claude/skills/consult/SKILL.md` showed
+  `gpt-5` / `gemini-2.5-pro` / `opus-4.7` in its refine example. Passing
+  them: `opus-4.7` raised Unknown model per-panellist, `gemini-2.5-pro`
+  fell through raw-ID routing to Vertex (missing SDK), `gpt-5` went to
+  OpenAI raw and timed out at 180s. Net: 3 minutes, $0, zero panellists.
+  Skill doc now lists the registry aliases and points at tiers.
+- [ux] ~~**Unknown aliases only failed per-panellist, mid-run.**~~ RESOLVED:
+  `panel`/`refine`/`sequence` handlers now resolve every alias up front
+  and return the `unknown_model` envelope with close-match hints, the full
+  alias list, and the tier names before any provider call.
+- [ux] ~~**Skill docs promised `tier` on panel/refine; only consult had
+  it.**~~ RESOLVED: `panel` and `refine` accept `tier` as an alternative
+  to `models` (anyOf in the schema, expansion in the handler).
+- [bug] ~~**Synthesis had no fallback: one Gemini 503 left "Synthesis
+  unavailable" on a converged 9-model run** (20260713-045311).~~ RESOLVED:
+  `defaults.synthesiser_fallbacks` (packaged: `["claude-sonnet"]`) is
+  tried in order after the primary fails/empties; all attempts billed and
+  itemised in the sentinel when everything fails.
+- [bug] ~~**Arbiter non-JSON (twice) aborted the refine loop at round 1**
+  (20260713-050837: same overloaded Gemini as arbiter).~~ RESOLVED: after
+  the parse-retry on the primary, the arbiter falls back through
+  `synthesiser_fallbacks` before scoring the round 0.
+- [bug] ~~**Reasoning burn: gpt spent 12k output tokens, $0.37, and
+  returned a zero-byte TRUNCATED body** (20260713-050837, gpt-2.r1).~~
+  RESOLVED: `_call_one` retries an empty-body length-truncation once with
+  a doubled budget, sums both attempts' spend/tokens, and notes the retry
+  in the manifest entry.
+- [ux] **KeyError envelopes carried the quoted repr** (`'Unknown model:
+  opus-4.7'`). RESOLVED: server unwraps `args[0]`.
+- [meta] ~~**Long-form prompts overwhelm per-model output budgets.**~~ The
+  second run asked for an agent-executable build spec; 4 of 9 panellists
+  hit finish_reason=length (opus/sonnet at 8k, gpt at 12k, kimi at 12k)
+  and glm hit slow-tail dropout at 180s while still writing. The capsule
+  extractor recovered most of them, but tier budgets are sized for
+  decision capsules, not 10-page deliverables. RESOLVED two ways:
+  (1) `max_output_tokens` on panel/refine/consult/sequence raises every
+  panellist's grant (single `output_budget()` derivation shared with the
+  cost estimators so the cap gate prices the real ceiling); (2) a
+  truncated-with-body response is auto-continued once — the model gets
+  its partial answer back as an assistant turn and carries on from the
+  cut, bodies stitched, both calls billed, noted in the manifest
+  (`CONSULT_CONTINUE_ON_TRUNCATION=0` to disable). `run_summary` now
+  carries `truncation_advice` naming the knob. STILL OPEN: the 180s
+  slow-tail dropout doesn't know about continuations — a panellist mid-
+  continuation can still be dropped if it's in the last 20% of the panel;
+  raise CONSULT_TAIL_DROPOUT_S for long-form runs.
+
+## 2026-07-13 — fourth dogfood pass (9-model review refine on the ecommerce codebase, run 20260713-091722-76480)
+
+$4.40, 2 rounds, converged 0.85 — but 5 of 9 round-1 capsules and grok's
+round-2 capsule came back EMPTY despite 15-20KB of well-structured findings
+in every response body, and two panellists timed out. Diagnosed from the run
+artifacts; fixes landed in this pass.
+
+- [bug] ~~**Tool-call envelope nesting silently emptied capsules.**~~
+  RESOLVED. claude-haiku via Anthropic tool-use (`response_format`
+  emulation) sometimes returns `{"parameter": {...capsule...}}`. The
+  known-fields filter in `_extract_one` dropped the single unknown key and
+  built a VALID empty capsule — no error, no log, findings gone (confidence
+  still backfilled from the body, which made it look like a deliberate
+  abstain). The empty-extraction retry then failed the same way, so the
+  round-1 arbiter scored coverage 0.5 and blamed the panellists ("failed to
+  extract parseable findings"), forcing a second round that roughly doubled
+  run cost. Reproduced live against the archived grok-4.r1 body (9.4KB
+  reply, wrapped, findings=0 after filter). Fix: `_unwrap_capsule_data`
+  descends through known envelope keys and single-key dict wrappers
+  (bounded) on both the first attempt and the retry; two regression tests
+  cover the exact live shape.
+- [config] ~~**claude-sonnet's 180s timeout is too short for big review
+  prompts.**~~ RESOLVED: 180 → 300 (parity with gpt/gemini flagships).
+  Non-streaming calls are all-or-nothing, and sonnet-5's 8000-token
+  thinking budget alone can burn most of 180s on a ~100KB prompt — it
+  returned 0 bytes in BOTH rounds while every 240s+ peer finished.
+- [config] ~~**Slow-tail dropout cancelled a working straggler inside its
+  own budget.**~~ RESOLVED: default grace 180 → 300. kimi (360s per-spec
+  timeout) was cancelled at 292s while presumably still generating; the
+  dropout should catch hangs, not slow-but-working panellists. STILL OPEN:
+  a progress-aware dropout (only cancel stragglers whose stream has
+  stalled) would be strictly better, but needs streaming on by default;
+  today `CONSULT_STREAM=1` is opt-in.
+- [bug] ~~**All-or-nothing capsule validation dropped whole capsules over
+  one bad enum.**~~ RESOLVED (found on the fifth dogfood run,
+  20260713-095511-17732: even with envelope unwrapping in place, 3 of 8
+  capsules extracted empty). claude-haiku emitted `category:
+  "architecture"` on one finding out of six; the strict Pydantic build
+  discarded all six. Fix: `_salvage_review_findings` validates PER
+  FINDING, coerces common severity/category aliases
+  (critical→blocker, architecture→maintainability, compliance→correctness,
+  ...), parses string line ranges ("80-92"), normalises the verdict, and
+  drops only the individually hopeless entries with a warning log.
+- [ux] ~~**Slow-tail dropout was blind to progress and to per-model
+  budgets.**~~ RESOLVED three ways. (1) kimi and kimi-code per-spec
+  timeouts raised 360 -> 600 (kimi hit its own ceiling on the fifth run
+  after surviving the dropout). (2) The dropout is now progress-aware:
+  stream chunks, the empty-body retry, and a truncation continuation all
+  record per-slug activity, and stragglers with a signal inside
+  CONSULT_TAIL_ACTIVITY_WINDOW_S (default 120s, 0 disables) keep running
+  while silent ones are cancelled on the old schedule; per-spec timeouts
+  still bound everything. Task start deliberately does not count, so
+  non-streaming panels without continuations behave exactly as before.
+  (3) This also closes the earlier STILL OPEN note about panellists being
+  dropped mid-continuation. Practical upshot: CONSULT_STREAM=1 now buys
+  dropout immunity for any panellist that is actually producing tokens.

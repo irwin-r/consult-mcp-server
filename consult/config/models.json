@@ -2,7 +2,7 @@
   "$schema": "consult/models",
   "models": {
     "claude-opus": {
-      "litellm_id": "anthropic/claude-opus-4-7",
+      "litellm_id": "anthropic/claude-opus-4-8",
       "default_budget_tokens": 8000,
       "default_timeout_s": 240,
       "provider": "anthropic",
@@ -10,9 +10,9 @@
       "privacy_tier": "first_party"
     },
     "claude-sonnet": {
-      "litellm_id": "anthropic/claude-sonnet-4-6",
+      "litellm_id": "anthropic/claude-sonnet-5",
       "default_budget_tokens": 8000,
-      "default_timeout_s": 180,
+      "default_timeout_s": 300,
       "provider": "anthropic",
       "family": "claude",
       "privacy_tier": "first_party"
@@ -36,7 +36,7 @@
       "privacy_tier": "first_party"
     },
     "gpt": {
-      "litellm_id": "openai/gpt-5.5",
+      "litellm_id": "openai/gpt-5.6-sol",
       "default_budget_tokens": 12000,
       "default_timeout_s": 300,
       "provider": "openai",
@@ -44,7 +44,7 @@
       "privacy_tier": "first_party"
     },
     "gpt-mini": {
-      "litellm_id": "openai/gpt-5.4-mini",
+      "litellm_id": "openai/gpt-5.6-luna",
       "default_budget_tokens": 8000,
       "default_timeout_s": 180,
       "provider": "openai",
@@ -77,7 +77,7 @@
       "privacy_tier": "first_party"
     },
     "gemini-flash": {
-      "litellm_id": "gemini/gemini-3.1-flash-lite",
+      "litellm_id": "gemini/gemini-3.5-flash",
       "default_budget_tokens": 8000,
       "default_timeout_s": 120,
       "provider": "google",
@@ -85,7 +85,7 @@
       "privacy_tier": "first_party"
     },
     "grok": {
-      "litellm_id": "openrouter/x-ai/grok-4.3",
+      "litellm_id": "openrouter/x-ai/grok-4.5",
       "default_budget_tokens": 12000,
       "default_timeout_s": 240,
       "provider": "openrouter",
@@ -127,13 +127,21 @@
     "kimi": {
       "litellm_id": "openrouter/moonshotai/kimi-k2.6",
       "default_budget_tokens": 12000,
-      "default_timeout_s": 360,
+      "default_timeout_s": 600,
+      "provider": "openrouter",
+      "family": "moonshot",
+      "privacy_tier": "aggregator"
+    },
+    "kimi-code": {
+      "litellm_id": "openrouter/moonshotai/kimi-k2.7-code",
+      "default_budget_tokens": 12000,
+      "default_timeout_s": 600,
       "provider": "openrouter",
       "family": "moonshot",
       "privacy_tier": "aggregator"
     },
     "glm": {
-      "litellm_id": "openrouter/z-ai/glm-5.1",
+      "litellm_id": "openrouter/z-ai/glm-5.2",
       "default_budget_tokens": 12000,
       "default_timeout_s": 360,
       "provider": "openrouter",
@@ -158,15 +166,67 @@
     }
   },
   "tiers": {
-    "nano": ["claude-haiku", "gemini-flash", "gpt-nano"],
-    "quick": ["claude-haiku", "gemini-pro", "grok", "qwen-max", "kimi"],
-    "standard": ["claude-opus", "claude-sonnet", "gpt", "gemini-pro", "grok", "qwen-max", "kimi", "glm", "llama"],
-    "deep": ["claude-opus", "claude-sonnet", "gpt-pro", "gpt", "gemini-pro", "grok", "qwen-max", "kimi", "glm", "llama", "mistral", "deepseek", "mimo", "sonar-pro"],
-    "code": ["claude-opus", "gpt-codex", "gpt-mini", "gemini-pro", "deepseek"],
-    "review": ["claude-opus", "gpt-codex", "gpt-pro", "gemini-pro", "deepseek", "grok"]
+    "nano": [
+      "claude-haiku",
+      "gemini-flash",
+      "gpt-nano"
+    ],
+    "quick": [
+      "claude-haiku",
+      "gemini-pro",
+      "grok",
+      "qwen-max",
+      "kimi"
+    ],
+    "standard": [
+      "claude-opus",
+      "claude-sonnet",
+      "gpt",
+      "gemini-pro",
+      "grok",
+      "qwen-max",
+      "kimi",
+      "glm",
+      "llama"
+    ],
+    "deep": [
+      "claude-opus",
+      "claude-sonnet",
+      "gpt-pro",
+      "gpt",
+      "gemini-pro",
+      "grok",
+      "qwen-max",
+      "kimi",
+      "glm",
+      "llama",
+      "mistral",
+      "deepseek",
+      "mimo",
+      "sonar-pro"
+    ],
+    "code": [
+      "claude-opus",
+      "gpt-codex",
+      "gpt-mini",
+      "gemini-pro",
+      "deepseek",
+      "kimi-code"
+    ],
+    "review": [
+      "claude-opus",
+      "gpt-codex",
+      "gpt-pro",
+      "gemini-pro",
+      "deepseek",
+      "grok"
+    ]
   },
   "defaults": {
     "synthesiser": "gemini-pro",
+    "synthesiser_fallbacks": [
+      "claude-sonnet"
+    ],
     "capsule_extractor": "claude-haiku",
     "max_run_usd": 5.0,
     "concurrency": {
