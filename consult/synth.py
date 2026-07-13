@@ -281,100 +281,138 @@ async def synthesise(
     if label_to_slug:
         (paths.root / "blind_map.json").write_text(json.dumps(label_to_slug, indent=2, sort_keys=True))
 
-    synth_alias = by_model or registry.default_synthesiser()
-    entry = registry.resolve_model(synth_alias)
-    litellm_id = entry.get("litellm_id")
-    if not litellm_id:
-        raise ValueError(f"synthesiser {synth_alias!r} must be an API model, not a CLI panellist")
-    budget = max(entry.get("default_budget_tokens", 16000), 16000)
-    timeout = entry.get("default_timeout_s", 300)
-    provider = entry.get("provider", "")
+    primary_alias = by_model or registry.default_synthesiser()
+    # Fallback chain: the requested (or default) synthesiser first, then the
+    # configured cross-provider fallbacks. A single provider outage at the
+    # synthesis step used to fail the run's final artifact even though the
+    # panel it summarises was fine (FRICTION 2026-07-13: a Gemini 503 left
+    # "Synthesis unavailable" on an otherwise-clean 9-model refine). The
+    # chain automates the "retry with a different model" advice the old
+    # sentinel handed back to the caller.
+    candidates = [primary_alias]
+    for fallback_alias in registry.synthesiser_fallbacks():
+        if fallback_alias not in candidates:
+            candidates.append(fallback_alias)
+
+    # Spend accumulates across attempts: a billed-but-empty primary plus a
+    # successful fallback are BOTH real provider charges.
+    cost_value = 0.0
+    cost_known = True
+    attempt_notes: list[str] = []
+    all_empty = True
+    content: str | None = None
+    synth_alias = primary_alias
 
     # Containment: a synthesiser failure must not tear down the parent request
     # (consult / refine). Persist a clear sentinel to synthesis.md so the run
     # artifact directory remains consistent.
-    try:
-        resp = cast(
-            Any,
-            await asyncio.wait_for(
-                litellm.acompletion(
-                    model=litellm_id,
-                    messages=build_messages(synth_input, provider),
-                    max_completion_tokens=budget,
+    for candidate_idx, candidate in enumerate(candidates):
+        try:
+            entry = registry.resolve_model(candidate)
+        except KeyError:
+            if candidate_idx == 0:
+                raise
+            # A typo'd fallback in models.json must not mask the primary failure.
+            logger.warning("synth fallback alias %r not in registry; skipping", candidate)
+            attempt_notes.append(f"`{candidate}`: unknown registry alias")
+            all_empty = False
+            continue
+        litellm_id = entry.get("litellm_id")
+        if not litellm_id:
+            if candidate_idx == 0:
+                raise ValueError(f"synthesiser {candidate!r} must be an API model, not a CLI panellist")
+            attempt_notes.append(f"`{candidate}`: not an API model")
+            all_empty = False
+            continue
+        budget = max(entry.get("default_budget_tokens", 16000), 16000)
+        timeout = entry.get("default_timeout_s", 300)
+        provider = entry.get("provider", "")
+        if candidate_idx > 0:
+            logger.warning("synthesiser falling back to %s after %s", litellm_id, attempt_notes[-1])
+
+        try:
+            resp = cast(
+                Any,
+                await asyncio.wait_for(
+                    litellm.acompletion(
+                        model=litellm_id,
+                        messages=build_messages(synth_input, provider),
+                        max_completion_tokens=budget,
+                    ),
+                    timeout=timeout,
                 ),
-                timeout=timeout,
-            ),
-        )
-    except Exception as e:
-        logger.warning("synth call failed (%s): %s", litellm_id, redact_exc(e))
-        text = (
-            f"# Synthesis unavailable\n\n"
-            f"The synthesiser (`{litellm_id}`) failed: `{redact_exc(e, limit=300)}`.\n\n"
-            f"The panel manifest is still available at the run's artifacts. "
-            f"Retry `synthesise(run_id, by_model=...)` with a different model."
-        )
-        (paths.root / "synthesis.md").write_text(text)
-        # No completion was returned, so there's nothing reliable to price.
-        # cost_known=False mirrors the partial-cost convention elsewhere.
-        return SynthResult(
-            text=text,
-            cost_usd=0.0,
-            cost_known=False,
-            status=SynthStatus.FAILED,
-        )
+            )
+        except Exception as e:
+            logger.warning("synth call failed (%s): %s", litellm_id, redact_exc(e))
+            # No completion was returned, but the provider may have billed a
+            # partial call. cost_known=False mirrors the partial-cost
+            # convention elsewhere.
+            cost_known = False
+            attempt_notes.append(f"`{litellm_id}`: `{redact_exc(e, limit=300)}`")
+            all_empty = False
+            continue
 
-    # Look up cost even on the empty-content path: provider billed for the
-    # call regardless of whether output was usable. Independent try block so
-    # a price-table miss never discards the synthesis text.
-    try:
-        cost = litellm.completion_cost(completion_response=resp)
-        cost_known = cost is not None
-        cost_value = float(cost) if cost is not None else 0.0
-    except Exception as ce:  # noqa: BLE001
-        logger.warning("synth cost lookup failed for %s: %s", litellm_id, redact_exc(ce))
-        cost_value = 0.0
-        cost_known = False
+        # Look up cost even on the empty-content path: provider billed for the
+        # call regardless of whether output was usable. Independent try block so
+        # a price-table miss never discards the synthesis text.
+        try:
+            cost = litellm.completion_cost(completion_response=resp)
+            if cost is None:
+                cost_known = False
+            else:
+                cost_value += float(cost)
+        except Exception as ce:  # noqa: BLE001
+            logger.warning("synth cost lookup failed for %s: %s", litellm_id, redact_exc(ce))
+            cost_known = False
 
-    # Defensive extraction: most providers follow OpenAI's `choices[0].message`
-    # shape, but a non-conformant response (or a future SDK regression) would
-    # otherwise raise AttributeError/IndexError straight out of synthesise,
-    # bypassing the unavailable-sentinel path that callers expect.
-    try:
-        content = resp.choices[0].message.content
-        finish = getattr(resp.choices[0], "finish_reason", None)
-    except (AttributeError, IndexError, KeyError, TypeError) as e:
-        logger.warning("synth response shape unexpected for %s: %s", litellm_id, redact_exc(e))
-        text = (
-            f"# Synthesis unavailable\n\n"
-            f"The synthesiser (`{litellm_id}`) returned an unexpected response "
-            f"shape: `{redact_exc(e, limit=200)}`. "
-            f"Retry `synthesise(run_id, by_model=...)` with a different model."
-        )
+        # Defensive extraction: most providers follow OpenAI's `choices[0].message`
+        # shape, but a non-conformant response (or a future SDK regression) would
+        # otherwise raise AttributeError/IndexError straight out of synthesise,
+        # bypassing the unavailable-sentinel path that callers expect.
+        try:
+            candidate_content = resp.choices[0].message.content
+            finish = getattr(resp.choices[0], "finish_reason", None)
+        except (AttributeError, IndexError, KeyError, TypeError) as e:
+            logger.warning("synth response shape unexpected for %s: %s", litellm_id, redact_exc(e))
+            attempt_notes.append(f"`{litellm_id}`: unexpected response shape (`{redact_exc(e, limit=200)}`)")
+            all_empty = False
+            continue
+        if not candidate_content or not candidate_content.strip():
+            logger.warning(
+                "synth produced empty content (finish_reason=%s) for %s",
+                finish,
+                litellm_id,
+            )
+            attempt_notes.append(f"`{litellm_id}`: returned no content (finish_reason=`{finish}`)")
+            continue
+
+        content = candidate_content
+        synth_alias = candidate
+        break
+
+    if content is None:
+        attempts_md = "\n".join(f"- {note}" for note in attempt_notes)
+        if all_empty:
+            text = (
+                f"# Synthesis empty\n\n"
+                f"Every synthesiser attempt returned no content:\n\n{attempts_md}\n\n"
+                f"Retry with a larger budget or a different model."
+            )
+            status = SynthStatus.EMPTY
+        else:
+            text = (
+                f"# Synthesis unavailable\n\n"
+                f"Every synthesiser attempt failed:\n\n{attempts_md}\n\n"
+                f"The panel manifest is still available at the run's artifacts. "
+                f"Retry `synthesise(run_id, by_model=...)` with a different model."
+            )
+            status = SynthStatus.FAILED
         (paths.root / "synthesis.md").write_text(text)
         return SynthResult(
             text=text,
             cost_usd=cost_value,
             cost_known=cost_known,
-            status=SynthStatus.FAILED,
-        )
-    if not content or not content.strip():
-        logger.warning(
-            "synth produced empty content (finish_reason=%s) for %s",
-            finish,
-            litellm_id,
-        )
-        text = (
-            f"# Synthesis empty\n\n"
-            f"The synthesiser (`{litellm_id}`) returned no content "
-            f"(finish_reason=`{finish}`). "
-            f"Retry with a larger budget or a different model."
-        )
-        (paths.root / "synthesis.md").write_text(text)
-        return SynthResult(
-            text=text,
-            cost_usd=cost_value,
-            cost_known=cost_known,
-            status=SynthStatus.EMPTY,
+            status=status,
         )
 
     text = content.strip()

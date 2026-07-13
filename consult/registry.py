@@ -164,6 +164,25 @@ def default_synthesiser() -> str:
     return models_config().get("defaults", {}).get("synthesiser", "gemini-pro")
 
 
+def synthesiser_fallbacks() -> list[str]:
+    """Aliases tried, in order, when a judge-role call (synthesiser or
+    refine arbiter — the roles share `defaults.synthesiser`) fails or
+    returns nothing usable.
+
+    Sourced from `models.json:defaults.synthesiser_fallbacks`. The
+    packaged default is a single cross-provider fallback so a provider
+    outage (e.g. the 2026-07-13 Gemini 503s that killed a run's synthesis
+    and aborted a refine loop) degrades to a different vendor instead of
+    failing the run's final step. Non-string entries are dropped rather
+    than raising — a malformed config shouldn't take the fallback path
+    down with it.
+    """
+    raw = models_config().get("defaults", {}).get("synthesiser_fallbacks", ["claude-sonnet"])
+    if not isinstance(raw, list):
+        return []
+    return [alias for alias in raw if isinstance(alias, str) and alias]
+
+
 def default_capsule_extractor() -> str:
     return models_config().get("defaults", {}).get("capsule_extractor", "claude-haiku")
 

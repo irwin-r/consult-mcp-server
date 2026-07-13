@@ -22,9 +22,9 @@ def _ok(slug: str, model_id: str, persona: str | None, cost: float) -> ManifestE
 
 def test_calibration_summarises_panel_diversity_and_spend():
     manifest = [
-        _ok("claude-opus-0", "anthropic/claude-opus-4-7", "security", 0.02),
-        _ok("gpt-1", "openai/gpt-5.5", "product", 0.03),
-        _ok("grok-2", "openrouter/x-ai/grok-4.3", "contrarian", 0.01),
+        _ok("claude-opus-0", "anthropic/claude-opus-4-8", "security", 0.02),
+        _ok("gpt-1", "openai/gpt-5.6-sol", "product", 0.03),
+        _ok("grok-2", "openrouter/x-ai/grok-4.5", "contrarian", 0.01),
     ]
     cal = calibration.build(manifest, blinded=True, disagreement=0.6)
 
@@ -48,10 +48,10 @@ def test_calibration_marks_status_spend_unknown_when_unpriced():
     """A status with any unpriced entry reports None spend rather than
     silently understating it."""
     manifest = [
-        _ok("a", "anthropic/claude-opus-4-7", None, 0.02),
+        _ok("a", "anthropic/claude-opus-4-8", None, 0.02),
         ManifestEntry(
             slug="b",
-            model_id="openrouter/x-ai/grok-4.3",
+            model_id="openrouter/x-ai/grok-4.5",
             persona=None,
             status=Status.TIMEOUT,
             error="timed out",

@@ -5,11 +5,34 @@ from __future__ import annotations
 import logging
 import os
 import re
+from typing import Any
 
 from .. import slugs
+from ..capsule import MAX_TOKENS_BY_KIND
 from ..types import ModelSpec
 
 logger = logging.getLogger(__name__)
+
+
+def output_budget(entry: dict[str, Any], capsule_kind: str, max_output_tokens: int | None = None) -> int:
+    """The output-token grant for one panellist call.
+
+    max(kind cap, model default, caller override) — the kind cap is what
+    the TASK needs (a review must fit ~20-30 findings whether haiku or
+    opus writes it), the model default is what the MODEL needs (reasoning
+    models burn thousands of completion tokens before any text lands),
+    and `max_output_tokens` is what the CALLER knows the deliverable
+    needs (a build spec doesn't fit a decision-sized grant — 2026-07-13:
+    4 of 9 panellists hit finish_reason=length writing one).
+
+    Single derivation shared by `_call_one` and the cost estimators so the
+    max_run_usd gate always prices the same ceiling that's actually granted.
+    """
+    return max(
+        MAX_TOKENS_BY_KIND.get(capsule_kind, MAX_TOKENS_BY_KIND["decision"]),
+        entry.get("default_budget_tokens", 0),
+        max_output_tokens or 0,
+    )
 
 
 # CONTRACT: capsule.py:_CONFIDENCE and the capsule extractor prompt depend on

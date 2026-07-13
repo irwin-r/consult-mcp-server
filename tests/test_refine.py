@@ -1842,9 +1842,11 @@ def test_arbiter_retries_once_on_non_json_and_sums_cost(monkeypatch):
     assert verdict.cost_usd == pytest.approx(0.002)  # both attempts billed
 
 
-def test_arbiter_double_parse_failure_aborts_with_both_costs(monkeypatch):
-    """Two unparseable replies keep the existing abort semantics (score 0.0,
-    json_parse_failed) while still accounting for both billed calls."""
+def test_arbiter_double_parse_failure_falls_back_then_aborts_with_all_costs(monkeypatch):
+    """When every candidate (primary + configured fallback) returns
+    unparseable text, the verdict keeps the abort semantics (score 0.0,
+    json_parse_failed) and every billed call is accounted: 2 attempts on
+    the primary (nudge retry) + 2 on the fallback."""
     import asyncio
 
     from consult.refine import _ask_arbiter
@@ -1859,16 +1861,17 @@ def test_arbiter_double_parse_failure_aborts_with_both_costs(monkeypatch):
     monkeypatch.setattr("consult.refine.litellm.completion_cost", lambda completion_response=None: 0.001)
 
     verdict = asyncio.run(_ask_arbiter("Q?", round_num=1, manifest=[], arbiter_alias="claude-haiku"))
-    assert calls["n"] == 2
+    assert calls["n"] == 4
     assert verdict.parsed_ok is False
     assert verdict.error == "json_parse_failed"
     assert verdict.score == 0.0
-    assert verdict.cost_usd == pytest.approx(0.002)
+    assert verdict.cost_usd == pytest.approx(0.004)
 
 
-def test_arbiter_call_exception_does_not_retry(monkeypatch):
-    """A transport-level failure on the first attempt stays terminal — the
-    parse retry is for formatting, not for outages."""
+def test_arbiter_call_exception_skips_parse_retry_and_falls_back(monkeypatch):
+    """A transport-level failure gets no parse-retry on the same model (the
+    nudge is for formatting, not outages) — the chain moves straight to the
+    fallback arbiter, which here also dies: exactly one call per candidate."""
     import asyncio
 
     from consult.refine import _ask_arbiter
@@ -1882,10 +1885,39 @@ def test_arbiter_call_exception_does_not_retry(monkeypatch):
     monkeypatch.setattr("consult.refine.litellm.acompletion", fake_acompletion)
 
     verdict = asyncio.run(_ask_arbiter("Q?", round_num=1, manifest=[], arbiter_alias="claude-haiku"))
-    assert calls["n"] == 1
+    assert calls["n"] == 2  # one per candidate, no nudge retries
     assert verdict.parsed_ok is False
     assert verdict.score == 0.0
     assert verdict.cost_known is False
+
+
+def test_arbiter_falls_back_to_second_model_after_primary_parse_failure(monkeypatch):
+    """Run 20260713-050837: the default arbiter returned non-JSON twice and
+    the refine loop aborted at round 1. The fallback arbiter must recover
+    the round: primary fails both attempts, the configured fallback's
+    verdict parses and scores."""
+    import asyncio
+
+    from consult.refine import _ask_arbiter
+
+    calls = {"n": 0, "models": []}
+
+    async def fake_acompletion(**kw):
+        calls["n"] += 1
+        calls["models"].append(kw["model"])
+        if calls["n"] <= 2:
+            return _arbiter_resp("prose, not JSON")
+        return _arbiter_resp(_VALID_ARBITER_JSON)
+
+    monkeypatch.setattr("consult.refine.litellm.acompletion", fake_acompletion)
+    monkeypatch.setattr("consult.refine.litellm.completion_cost", lambda completion_response=None: 0.001)
+
+    verdict = asyncio.run(_ask_arbiter("Q?", round_num=1, manifest=[], arbiter_alias="claude-haiku"))
+    assert calls["n"] == 3
+    # Third call went to a different model than the first two.
+    assert calls["models"][2] != calls["models"][0]
+    assert verdict.parsed_ok is True
+    assert verdict.cost_usd == pytest.approx(0.003)  # every attempt billed
 
 
 def test_arbiter_unscoreable_json_retries_then_reports_no_score(monkeypatch):

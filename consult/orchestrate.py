@@ -132,6 +132,7 @@ async def consult(
     rubric: str | None = None,
     attachments: list | None = None,
     dry_run: bool = False,
+    max_output_tokens: int | None = None,
     on_progress: ProgressCallback | None = None,
     gate_synth_at_agreement: float | None = None,
     diverse_stances: bool = True,
@@ -217,6 +218,7 @@ async def consult(
         max_run_usd=max_run_usd,
         on_progress=shift_bucket(on_progress, fanout_offset, overall_total),
         capsule_kind=capsule_kind,
+        max_output_tokens=max_output_tokens,
     )
     if handle.partial or not handle.manifest:
         # Return a real `RunResult` so the partial response has the same shape

@@ -64,6 +64,9 @@ def test_provider_caps_temperature_blocks_gemini_and_opus():
     assert provider_caps.supports_temperature("gpt-4") is True
     assert provider_caps.supports_temperature("anthropic/claude-sonnet-4-6") is True
     assert provider_caps.supports_temperature("anthropic/claude-opus-4-7") is False
+    assert provider_caps.supports_temperature("anthropic/claude-opus-4-8") is False
+    assert provider_caps.supports_temperature("anthropic/claude-sonnet-5") is False
+    assert provider_caps.supports_temperature("anthropic/claude-fable-5") is False
     assert provider_caps.supports_temperature("openrouter/google/gemini-3.1-pro-preview") is False
     assert provider_caps.supports_temperature("gemini/gemini-3.1-pro-preview") is False
 

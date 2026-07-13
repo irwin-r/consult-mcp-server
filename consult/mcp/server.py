@@ -292,7 +292,11 @@ async def _run_handler_with_envelopes(
     except ValueError as e:
         return errors.envelope(errors.ErrorCode.INVALID_INPUT, str(e))
     except KeyError as e:
-        return errors.envelope(errors.ErrorCode.UNKNOWN_MODEL, str(e))
+        # str() on a KeyError is the quoted repr of its message
+        # ("'Unknown model: x'"); unwrap args[0] so the envelope carries
+        # the message itself.
+        message = str(e.args[0]) if e.args else str(e)
+        return errors.envelope(errors.ErrorCode.UNKNOWN_MODEL, message)
     except FileNotFoundError as e:
         return errors.envelope(errors.ErrorCode.RUN_NOT_FOUND, str(e))
     except Exception as e:  # noqa: BLE001
