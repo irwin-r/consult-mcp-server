@@ -322,6 +322,34 @@ def build_messages(
     return turns
 
 
+def apply_web_search(kwargs: dict[str, Any], entry: registry.ModelEntry) -> dict[str, Any]:
+    """Mutate `kwargs` to request provider-native web search for a
+    `supports_web` registry entry; return `kwargs` for chaining.
+
+    Dispatch by entry shape (issue #92 PR 1):
+    - Perplexity sonar models search unconditionally — no parameter needed.
+    - `mode=responses` (OpenAI Responses API) takes the `web_search` tool;
+      `_aresponses_as_completion` forwards `tools` through.
+    - Everything else gets LiteLLM's `web_search_options` mapping (Gemini
+      grounding today; other chat providers as they're annotated).
+
+    No-op for entries without `supports_web`, so a caller can apply it
+    across a mixed panel without branching. Search fees are billed by the
+    provider on top of tokens and are NOT in `estimate_cost` — estimates
+    stay floors (the evidence pass owns the ledger line items).
+    """
+    if not entry.get("supports_web"):
+        return kwargs
+    litellm_id = (entry.get("litellm_id") or "").lower()
+    if "sonar" in litellm_id:
+        return kwargs
+    if entry.get("mode") == "responses":
+        kwargs.setdefault("tools", [{"type": "web_search"}])
+        return kwargs
+    kwargs.setdefault("web_search_options", {})
+    return kwargs
+
+
 _STREAM_PARTIAL_INTERVAL_S_DEFAULT = 1.0
 
 
@@ -460,6 +488,10 @@ async def _aresponses_as_completion(
         kwargs["instructions"] = instructions
     if extra.get("reasoning_effort"):
         kwargs["reasoning"] = {"effort": extra["reasoning_effort"]}
+    # `tools` passes through — the Responses API takes web search (and any
+    # future built-in tool) as a tools entry, set by `apply_web_search`.
+    if extra.get("tools"):
+        kwargs["tools"] = extra["tools"]
     # Other chat-shaped params in `extra` (e.g. temperature) are intentionally
     # dropped: the Responses API rejects several of them.
 
