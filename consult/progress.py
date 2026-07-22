@@ -138,6 +138,20 @@ class PhaseStarted(_BaseProgressEvent):
     phase: Literal["fanout", "capsules", "synth"]
 
 
+class ResearchPhase(_BaseProgressEvent):
+    """A research-loop phase boundary (issue #92).
+
+    `round=0` is the round-0 brief; rounds 1+ cycle plan → execute →
+    judge. `(done, total)` carry (rounds completed, max_rounds) so a
+    task-mode statusMessage can render coarse loop progress without
+    parsing the phase string.
+    """
+
+    kind: Literal["research_phase"] = "research_phase"
+    phase: Literal["brief", "plan", "execute", "judge"]
+    round: int = Field(..., ge=0)
+
+
 class Heartbeat(_BaseProgressEvent):
     """Periodic liveness pulse during a long fanout.
 
@@ -172,6 +186,7 @@ ProgressEvent = Annotated[
     | SequenceStepStarted
     | SequenceStepCompleted
     | PhaseStarted
+    | ResearchPhase
     | Heartbeat,
     Field(discriminator="kind"),
 ]
@@ -286,6 +301,10 @@ def event_message(event: ProgressEvent) -> str:
         return f"step {event.step} complete"
     if isinstance(event, PhaseStarted):
         return f"phase: {event.phase}"
+    if isinstance(event, ResearchPhase):
+        if event.phase == "brief":
+            return "research: drafting the brief"
+        return f"research r{event.round}/{event.total}: {event.phase}"
     if isinstance(event, Heartbeat):
         # ≥ prefix marks the running total as a lower bound when any
         # completed panellist had a pricing-table miss — same convention
