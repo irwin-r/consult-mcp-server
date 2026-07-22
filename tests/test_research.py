@@ -73,9 +73,15 @@ def rig(tmp_path, monkeypatch):
         question, *, tier="standard", capsule_kind="decision", max_run_usd=None, max_output_tokens=None, **kw
     ):
         calls.append({"question": question, "tier": tier, "max_run_usd": max_run_usd, **kw})
+        run_id = f"sub-{len(calls)}"
+        synthesis = f"ANSWER to: {question}"
+        # Persist like a real sub-run so journal replay can re-read bodies.
+        sub_dir = tmp_path / run_id
+        sub_dir.mkdir(exist_ok=True)
+        (sub_dir / "synthesis.md").write_text(synthesis)
         return SimpleNamespace(
-            run_id=f"sub-{len(calls)}",
-            synthesis=f"ANSWER to: {question}",
+            run_id=run_id,
+            synthesis=synthesis,
             cost_usd=0.1,
             cost_known=True,
             partial=False,
@@ -591,3 +597,161 @@ async def test_evidence_item_feeds_later_rounds_not_sections(rig):
     assert "https://ex.example/prices" in question
     # The dossier body is the consult answer, not an empty evidence body.
     assert "ANSWER to: write both sections" in result.dossier
+
+
+class CrashingDirector(ScriptedDirector):
+    """Raises on the Nth call of one label — simulates a mid-run crash."""
+
+    def __init__(self, crash_label, crash_on_call, **kw):
+        super().__init__(**kw)
+        self.crash_label = crash_label
+        self.crash_on_call = crash_on_call
+        self.label_counts: dict = {}
+
+    async def __call__(self, prompt, alias, *, label, **kw2):
+        n = self.label_counts.get(label, 0) + 1
+        self.label_counts[label] = n
+        if label == self.crash_label and n == self.crash_on_call:
+            raise RuntimeError("director crashed")
+        return await super().__call__(prompt, alias, label=label, **kw2)
+
+
+def _crashed_run_id(tmp_path):
+    return next(p.name for p in tmp_path.iterdir() if (p / "journal.jsonl").exists())
+
+
+JUDGE_R1_GAP = {
+    "section_status": {"niche": "accepted", "brand": "draft"},
+    "blocking_gaps": [{"id": "g1-1", "text": "brand voice missing", "section_id": "brand"}],
+}
+REPLAN_R2 = {"items": [{"id": "r2-1", "kind": "consult", "question": "fix brand", "section_ids": ["brand"]}]}
+
+
+@pytest.mark.asyncio
+async def test_crash_then_resume_completes_without_reexecution(rig):
+    crashing = CrashingDirector("plan", 2, brief=BRIEF_DATA, plans=[PLAN_R1], judges=[JUDGE_R1_GAP])
+    rig.monkeypatch.setattr(research, "_director_json", crashing)
+    with pytest.raises(RuntimeError, match="director crashed"):
+        await research.research("goal", max_rounds=4)
+    run_id = _crashed_run_id(rig.tmp)
+    assert len(rig.consult_calls) == 2  # round 1 executed before the crash
+
+    resumed_director = ScriptedDirector(plans=[REPLAN_R2], judges=[JUDGE_ACCEPT])
+    rig.monkeypatch.setattr(research, "_director_json", resumed_director)
+    result = await research.research("goal", max_rounds=4, continuation_id=run_id)
+
+    assert result.converged is True
+    assert result.run_id == run_id
+    assert result.rounds_completed == 2
+    # Only round 2 executed on resume; round 1's items were replayed.
+    assert len(rig.consult_calls) == 3
+    # Round-1 bodies came back from the sub-run dirs, round 2 ran live.
+    assert "ANSWER to: Pick the niche." in result.dossier
+    assert "ANSWER to: fix brand" in result.dossier
+    # Meters: replayed (brief+plan+judge = .03 director, items .2) plus
+    # resumed (plan+judge = .02 director, item .1).
+    assert result.cost_usd == pytest.approx(0.05 + 0.2 + 0.1)
+    manifest = json.loads((rig.tmp / run_id / "manifest.json").read_text())
+    assert manifest["cost_usd"] == pytest.approx(0.05)
+    assert manifest["total_cost_usd"] == pytest.approx(result.cost_usd)
+    # The resume itself is journaled.
+    assert "resumed" in _journal_phases(rig.tmp, run_id)
+    # Brief was NOT re-generated on resume.
+    assert resumed_director.calls.count("brief") == 0
+
+
+@pytest.mark.asyncio
+async def test_resume_restores_evidence_packs(rig):
+    from consult import evidence as evidence_mod
+
+    async def fake_gather(question, **kw):
+        pack_dir = rig.tmp / "ev-run-1" / "evidence"
+        pack_dir.mkdir(parents=True, exist_ok=True)
+        record = {
+            "url": "https://ex.example/prices",
+            "title": "Price survey",
+            "claims": ["rivals charge nine dollars"],
+            "model_id": "fake/sonar-pro",
+            "slug": "sonar-pro-1",
+            "gathered_at": "2026-07-22T00:00:00+00:00",
+        }
+        (pack_dir / "evidence.jsonl").write_text(json.dumps(record) + "\n")
+        return evidence_mod.EvidencePack(
+            run_id="ev-run-1",
+            records=[
+                evidence_mod.EvidenceRecord.model_validate(
+                    {k: v for k, v in record.items() if k != "gathered_at"}
+                )
+            ],
+            cost_usd=0.05,
+        )
+
+    rig.monkeypatch.setattr(evidence_mod, "gather_evidence", fake_gather)
+    ev_plan = {"items": [{"id": "r1-ev", "kind": "evidence", "question": "prices", "section_ids": ["niche"]}]}
+    crashing = CrashingDirector("plan", 2, brief=BRIEF_DATA, plans=[ev_plan], judges=[JUDGE_R1_GAP])
+    rig.monkeypatch.setattr(research, "_director_json", crashing)
+    with pytest.raises(RuntimeError):
+        await research.research("goal", max_rounds=4)
+    run_id = _crashed_run_id(rig.tmp)
+
+    resumed_director = ScriptedDirector(plans=[REPLAN_R2], judges=[JUDGE_ACCEPT])
+    rig.monkeypatch.setattr(research, "_director_json", resumed_director)
+    result = await research.research("goal", max_rounds=4, continuation_id=run_id)
+
+    assert result.converged is True
+    # The replayed pack rode into the resumed round's question.
+    question = rig.consult_calls[-1]["question"]
+    assert "BEGIN UNTRUSTED WEB EVIDENCE" in question
+    assert "https://ex.example/prices" in question
+
+
+@pytest.mark.asyncio
+async def test_resume_refuses_completed_runs(rig):
+    director = ScriptedDirector(brief=BRIEF_DATA, plans=[PLAN_R1], judges=[JUDGE_ACCEPT])
+    rig.monkeypatch.setattr(research, "_director_json", director)
+    done = await research.research("goal")
+    assert done.converged is True
+
+    with pytest.raises(ValueError, match="completed"):
+        await research.research("goal", continuation_id=done.run_id)
+
+
+@pytest.mark.asyncio
+async def test_resume_refuses_a_different_goal(rig):
+    crashing = CrashingDirector("plan", 2, brief=BRIEF_DATA, plans=[PLAN_R1], judges=[JUDGE_R1_GAP])
+    rig.monkeypatch.setattr(research, "_director_json", crashing)
+    with pytest.raises(RuntimeError):
+        await research.research("goal", max_rounds=4)
+    run_id = _crashed_run_id(rig.tmp)
+
+    with pytest.raises(ValueError, match="different goal"):
+        await research.research("something else entirely", continuation_id=run_id)
+
+
+def test_apply_verdict_reducer_resolves_and_stalls():
+    from consult.types import ResearchVerdict
+
+    brief = Brief.model_validate(
+        {"assumptions": [], "sections": [{"id": "a", "title": "A", "goal": "g", "acceptance": "x"}]}
+    )
+    vs = research._LoopState()
+    v1 = ResearchVerdict(
+        round=1,
+        section_status={"a": "draft"},
+        blocking_gaps=[ResearchGap(id="g1", text="thin", section_id="a")],
+    )
+    assert research._apply_verdict(vs, v1, brief) is None
+    v2 = ResearchVerdict(
+        round=2,
+        section_status={"a": "draft"},
+        blocking_gaps=[ResearchGap(id="g2", text="still thin", section_id="a")],
+    )
+    assert research._apply_verdict(vs, v2, brief) is None
+    assert vs.resolved_gap_ids == {"g1"}  # g1 stopped being reported
+    v3 = ResearchVerdict(
+        round=3,
+        section_status={"a": "draft"},
+        blocking_gaps=[ResearchGap(id="g2", text="still thin", section_id="a")],
+    )
+    assert research._apply_verdict(vs, v3, brief) == "stalled"
+    assert len(vs.verdicts) == 3

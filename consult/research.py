@@ -32,9 +32,11 @@ with unknown pricing refuses the round rather than spending blind.
 `max_run_usd=None` opts into uncapped; stall detection never turns off.
 
 Durable state: `journal.jsonl` in the parent run dir records each phase
-boundary (brief, plan, item results, assembly, verdict) so a crashed run
-can be replayed to its last committed round (resume lands with issue #92
-PR 5). `brief.json`, `dossier.md`, and `verdicts.json` are written as they
+boundary (brief, plan, item results, assembly, verdict — director costs
+included) and is the substrate for `continuation_id` resume: committed
+rounds replay through the same `_apply_verdict` reducer the live loop
+uses, and the in-flight round restarts fresh, losing at most one round.
+`brief.json`, `dossier.md`, and `verdicts.json` are written as they
 change; sub-runs are ordinary sibling runs, and the parent's manifest
 carries only director-side spend so daily ledger totals don't double-count.
 """
@@ -47,6 +49,7 @@ import json
 import logging
 import re
 import time
+from dataclasses import dataclass, field
 from typing import Any, cast
 
 import litellm
@@ -514,6 +517,56 @@ def _render_gaps(gaps: list[ResearchGap]) -> str:
     return "\n".join(f"- [{g.id}] ({g.section_id or 'general'}) {g.text}" for g in gaps)
 
 
+# ---- Verdict reducer ---------------------------------------------------------
+
+
+@dataclass
+class _LoopState:
+    """The verdict-driven loop state, mutated only by `_apply_verdict`.
+
+    One reducer serves both the live loop and journal replay (resume), so
+    a resumed run's gap bookkeeping, stall counters, and judge-failure
+    tracking are byte-identical to having lived through the rounds.
+    """
+
+    statuses: dict[str, str] = field(default_factory=dict)
+    resolved_gap_ids: set[str] = field(default_factory=set)
+    open_gaps: list[ResearchGap] = field(default_factory=list)
+    verdicts: list[ResearchVerdict] = field(default_factory=list)
+    stall: int = 0
+    judge_failures: int = 0
+    progress_prev: tuple[int, int] | None = None
+
+
+def _apply_verdict(state: _LoopState, verdict: ResearchVerdict, brief: Brief) -> str | None:
+    """Fold one verdict into the loop state; return the stop signal it
+    implies: "accepted", "stalled", "judge_dead", or None to continue."""
+    state.verdicts.append(verdict)
+    if not verdict.parsed_ok:
+        state.judge_failures += 1
+        return "judge_dead" if state.judge_failures >= 2 else None
+    state.judge_failures = 0
+    state.statuses = dict(verdict.section_status)
+    # A gap the judge stopped reporting is resolved — permanently.
+    reported = {g.id for g in verdict.blocking_gaps}
+    state.resolved_gap_ids |= {g.id for g in state.open_gaps if g.id not in reported}
+    state.open_gaps = list(verdict.blocking_gaps)
+    if verdict.accepted(brief):
+        return "accepted"
+    # Stall: no newly accepted section AND no drop in blocking gaps, two
+    # rounds running.
+    accepted_n = sum(1 for s in state.statuses.values() if s == "accepted")
+    progress = (accepted_n, -len(state.open_gaps))
+    improved = (
+        state.progress_prev is None
+        or progress[0] > state.progress_prev[0]
+        or progress[1] > state.progress_prev[1]
+    )
+    state.stall = 0 if improved else state.stall + 1
+    state.progress_prev = progress
+    return "stalled" if state.stall >= 2 else None
+
+
 # ---- Journal -----------------------------------------------------------------
 
 
@@ -531,6 +584,162 @@ def _journal_write(paths: artifacts.RunPaths, record: dict[str, Any]) -> None:
 
 async def _journal(paths: artifacts.RunPaths, **record: Any) -> None:
     await asyncio.to_thread(_journal_write, paths, record)
+
+
+# ---- Resume (journal replay) -------------------------------------------------
+
+
+def _load_journal(paths: artifacts.RunPaths) -> list[dict[str, Any]]:
+    """Parse journal.jsonl, skipping malformed lines with a warning — one
+    corrupt record must not make an expensive run unresumable."""
+    journal_path = paths.root / "journal.jsonl"
+    if not journal_path.exists():
+        return []
+    records: list[dict[str, Any]] = []
+    for i, line in enumerate(journal_path.read_text().splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            records.append(json.loads(line))
+        except json.JSONDecodeError as e:
+            logger.warning("journal line %d unparseable (%s); skipping", i, e)
+    return records
+
+
+def _read_subrun_synthesis(run_id: str | None) -> str | None:
+    """Best-effort read of a sub-run's synthesis body for section replay.
+    A pruned or missing sub-run degrades that section to missing (the
+    director re-plans it) rather than failing the resume."""
+    if not run_id:
+        return None
+    try:
+        text = (artifacts.load_run(run_id).root / "synthesis.md").read_text()
+        return text if text.strip() else None
+    except (OSError, ValueError) as e:
+        logger.warning("resume: could not read sub-run %s synthesis (%s)", run_id, e)
+        return None
+
+
+def _read_evidence_pack(run_id: str | None, cost_usd: float | None, cost_known: bool):
+    """Rebuild an EvidencePack from a pass run dir's evidence JSONL."""
+    if not run_id:
+        return None
+    try:
+        lines = (artifacts.load_run(run_id).root / "evidence" / "evidence.jsonl").read_text().splitlines()
+        records = []
+        for line in lines:
+            row = json.loads(line)
+            row.pop("gathered_at", None)
+            records.append(evidence.EvidenceRecord.model_validate(row))
+        if not records:
+            return None
+        return evidence.EvidencePack(
+            run_id=run_id, records=records, cost_usd=cost_usd or 0.0, cost_known=cost_known
+        )
+    except (OSError, ValueError, json.JSONDecodeError) as e:
+        logger.warning("resume: could not rebuild evidence pack from %s (%s)", run_id, e)
+        return None
+
+
+@dataclass
+class _ResumeState:
+    vs: _LoopState
+    sections: dict[str, dict[str, Any]]
+    packs: list[Any]
+    rounds: list[ResearchRound]
+    next_round: int
+
+
+def _replay_journal(
+    records: list[dict[str, Any]],
+    brief: Brief,
+    meter: CostMeter,
+    director_meter: CostMeter,
+) -> _ResumeState:
+    """Reconstruct loop state from the journal, replaying committed rounds
+    through the same `_apply_verdict` reducer the live loop uses.
+
+    A round is committed iff its verdict record exists; an in-flight round
+    contributes its journaled spend to the meters (the money is gone) but
+    none of its state — resume re-plans that round from scratch, losing at
+    most one round of work by design. Section bodies re-read from sub-run
+    dirs; evidence packs re-read from their pass run dirs; both degrade
+    gracefully when artifacts were pruned.
+    """
+    vs = _LoopState()
+    sections: dict[str, dict[str, Any]] = {}
+    packs: list[Any] = []
+    rounds: list[ResearchRound] = []
+    last_round_seen = 0
+
+    def _accrue(rec: dict[str, Any], *, director: bool) -> None:
+        cost = rec.get("cost_usd")
+        known = bool(rec.get("cost_known", cost is not None))
+        meter.add(cost or 0.0, known)
+        if director:
+            director_meter.add(cost or 0.0, known)
+
+    by_round: dict[int, dict[str, Any]] = {}
+    for rec in records:
+        phase = rec.get("phase")
+        if phase in ("brief", "brief_failed"):
+            _accrue(rec, director=True)
+            continue
+        if phase == "resumed":
+            continue
+        round_num = int(rec.get("round") or 0)
+        last_round_seen = max(last_round_seen, round_num)
+        bucket = by_round.setdefault(round_num, {"items": None, "results": [], "verdict": None})
+        if phase == "plan":
+            _accrue(rec, director=True)
+            bucket["items"] = rec.get("items") or []
+        elif phase == "item_result":
+            result = rec.get("result") or {}
+            meter.add(result.get("cost_usd") or 0.0, bool(result.get("cost_known", True)))
+            bucket["results"].append(result)
+        elif phase == "verdict":
+            # Judge cost rides inside the verdict dump.
+            v = rec.get("verdict") or {}
+            director_meter.add(v.get("cost_usd") or 0.0, bool(v.get("cost_known", True)))
+            meter.add(v.get("cost_usd") or 0.0, bool(v.get("cost_known", True)))
+            bucket["verdict"] = v
+
+    for round_num in sorted(by_round):
+        bucket = by_round[round_num]
+        if bucket["verdict"] is None or bucket["items"] is None:
+            continue  # in-flight round: spend accrued above, state discarded
+        items = [WorkItem.model_validate(raw) for raw in bucket["items"]]
+        items_by_id = {i.id: i for i in items}
+        results = [WorkItemResult.model_validate(raw) for raw in bucket["results"]]
+        for res in results:
+            if res.status != "ok":
+                continue
+            item = items_by_id.get(res.item_id)
+            if item is None:
+                continue
+            if item.kind == "evidence":
+                pack = _read_evidence_pack(res.run_id, res.cost_usd, res.cost_known)
+                if pack is not None:
+                    packs.append(pack)
+                continue
+            body = _read_subrun_synthesis(res.run_id)
+            if body is None:
+                continue
+            for sid in item.section_ids:
+                sections[sid] = {"body": body, "run_id": res.run_id, "round": round_num}
+        verdict = ResearchVerdict.model_validate(bucket["verdict"])
+        rounds.append(ResearchRound(round=round_num, work_items=items, results=results, verdict=verdict))
+        signal = _apply_verdict(vs, verdict, brief)
+        if signal in ("accepted", "stalled", "judge_dead"):
+            raise ValueError(
+                f"nothing to resume: the journal already reaches {signal!r} at round {round_num}"
+            )
+
+    committed = rounds[-1].round if rounds else 0
+    # An in-flight round (journaled plan, no verdict) restarts AT its own
+    # number; otherwise continue after the last committed round.
+    next_round = last_round_seen if last_round_seen > committed else committed + 1
+    return _ResumeState(vs=vs, sections=sections, packs=packs, rounds=rounds, next_round=next_round)
 
 
 # ---- Execution ---------------------------------------------------------------
@@ -689,6 +898,7 @@ async def research(
     max_parallel_items: int = 3,
     max_output_tokens: int | None = None,
     model_timeout_floor_s: float | None = DEFAULT_MODEL_TIMEOUT_FLOOR_S,
+    continuation_id: str | None = None,
     on_progress: ProgressCallback | None = None,
 ) -> ResearchResult:
     """Run the director loop until the dossier passes the frozen brief.
@@ -704,6 +914,14 @@ async def research(
     wastes more than the wall-clock it saves. Pass None to keep the
     registry's interactive-scale timeouts. Heartbeats and the progress
     log keep long waits observable.
+
+    `continuation_id` resumes a CRASHED run from its journal: committed
+    rounds replay through the same reducer the live loop uses (section
+    bodies re-read from sub-run dirs, evidence packs from their pass
+    dirs, both meters restored), and the in-flight round restarts from a
+    fresh plan — at most one round of work is lost. Completed runs refuse
+    to resume (feedback-driven extension is a later feature), and the
+    prompt must match the original goal.
     """
     if max_rounds < 1:
         raise ValueError("max_rounds must be >= 1")
@@ -712,15 +930,49 @@ async def research(
     registry.resolve_model(director_alias)
     registry.resolve_tier(tier)
 
-    paths = artifacts.create_run()
-    await asyncio.to_thread(paths.prompt_txt.write_text, prompt)
-    await asyncio.to_thread(
-        paths.registry_snapshot.write_text, json.dumps(registry.models_config(), indent=2)
-    )
-
     start = time.time()
     meter = CostMeter()  # everything: director + sub-runs (the API total)
     director_meter = CostMeter()  # director calls only (the parent manifest's spend)
+
+    resume_state: _ResumeState | None = None
+    brief: Brief | None = None
+    if continuation_id is not None:
+        paths = artifacts.load_run(continuation_id)
+        stored_prompt = ""
+        if paths.prompt_txt.exists():
+            stored_prompt = paths.prompt_txt.read_text()
+        if prompt.strip() and stored_prompt.strip() and prompt.strip() != stored_prompt.strip():
+            raise ValueError(
+                f"continuation_id {continuation_id} was started with a different goal; "
+                "resume must re-send the original prompt (or an empty one)"
+            )
+        brief_path = paths.root / "brief.json"
+        if not brief_path.exists():
+            raise ValueError(f"run {continuation_id} never produced a brief; start a fresh run instead")
+        if paths.manifest_json.exists():
+            prior = json.loads(paths.manifest_json.read_text())
+            aborted = prior.get("partial_reason") == "run aborted before finalise"
+            if prior.get("stop_reason") and not aborted:
+                raise ValueError(
+                    f"run {continuation_id} completed ({prior['stop_reason']}); "
+                    "resume recovers crashed runs only"
+                )
+        brief = Brief.model_validate(json.loads(brief_path.read_text()))
+        resume_state = _replay_journal(_load_journal(paths), brief, meter, director_meter)
+        await _journal(paths, phase="resumed", next_round=resume_state.next_round)
+        logger.info(
+            "resuming run %s at round %d (%d committed round(s), $%.2f replayed spend)",
+            continuation_id,
+            resume_state.next_round,
+            len(resume_state.rounds),
+            meter.total,
+        )
+    else:
+        paths = artifacts.create_run()
+        await asyncio.to_thread(paths.prompt_txt.write_text, prompt)
+        await asyncio.to_thread(
+            paths.registry_snapshot.write_text, json.dumps(registry.models_config(), indent=2)
+        )
 
     async def _emit(event: ProgressEvent) -> None:
         append_progress_log(paths.root, event)
@@ -758,61 +1010,60 @@ async def research(
             },
         )
 
-    # ---- Round 0: the frozen brief ------------------------------------------
-    await _emit(ResearchPhase(done=0, total=max_rounds, phase="brief", round=0))
-    data, cost, cost_known, err = await _director_json(
-        _BRIEF_PROMPT.format(goal=prompt),
-        director_alias,
-        label="brief",
-        timeout_floor_s=model_timeout_floor_s,
-    )
-    meter.add(cost or 0.0, cost_known)
-    director_meter.add(cost or 0.0, cost_known)
-    brief: Brief | None = None
-    if data is not None:
-        try:
-            brief = _parse_brief(data)
-        except ValueError as e:
-            err = f"brief invalid: {e}"
-    if brief is None:
-        reason = f"director failed to produce a brief: {err}"
-        await _journal(paths, phase="brief_failed", error=reason, cost_usd=cost, cost_known=cost_known)
-        result = _result(
-            brief=None,
-            rounds_completed=0,
-            partial=True,
-            partial_reason=reason,
-            stop_reason="director_error",
+    # ---- Round 0: the frozen brief (skipped on resume) -----------------------
+    if resume_state is None:
+        # ---- Round 0: the frozen brief ------------------------------------------
+        await _emit(ResearchPhase(done=0, total=max_rounds, phase="brief", round=0))
+        data, cost, cost_known, err = await _director_json(
+            _BRIEF_PROMPT.format(goal=prompt),
+            director_alias,
+            label="brief",
+            timeout_floor_s=model_timeout_floor_s,
         )
-        # Even a failed brief billed a director call; the manifest must exist
-        # so the ledger sees the spend.
-        await asyncio.to_thread(_write_parent_manifest, result.model_dump(exclude={"dossier"}))
-        return result
-    await asyncio.to_thread((paths.root / "brief.json").write_text, json.dumps(brief.model_dump(), indent=2))
-    await _journal(paths, phase="brief", brief=brief.model_dump(), cost_usd=cost, cost_known=cost_known)
+        meter.add(cost or 0.0, cost_known)
+        director_meter.add(cost or 0.0, cost_known)
+        if data is not None:
+            try:
+                brief = _parse_brief(data)
+            except ValueError as e:
+                err = f"brief invalid: {e}"
+        if brief is None:
+            reason = f"director failed to produce a brief: {err}"
+            await _journal(paths, phase="brief_failed", error=reason, cost_usd=cost, cost_known=cost_known)
+            result = _result(
+                brief=None,
+                rounds_completed=0,
+                partial=True,
+                partial_reason=reason,
+                stop_reason="director_error",
+            )
+            # Even a failed brief billed a director call; the manifest must exist
+            # so the ledger sees the spend.
+            await asyncio.to_thread(_write_parent_manifest, result.model_dump(exclude={"dossier"}))
+            return result
+        await asyncio.to_thread(
+            (paths.root / "brief.json").write_text, json.dumps(brief.model_dump(), indent=2)
+        )
+        await _journal(paths, phase="brief", brief=brief.model_dump(), cost_usd=cost, cost_known=cost_known)
+    assert brief is not None  # both branches above guarantee it
 
     # ---- Rounds --------------------------------------------------------------
-    sections: dict[str, dict[str, Any]] = {}
-    statuses: dict[str, str] = {}
-    resolved_gap_ids: set[str] = set()
-    open_gaps: list[ResearchGap] = []
-    verdicts: list[ResearchVerdict] = []
-    rounds: list[ResearchRound] = []
-    packs: list[evidence.EvidencePack] = []
-    stall = 0
-    judge_failures = 0
-    progress_prev: tuple[int, int] | None = None
+    vs = resume_state.vs if resume_state else _LoopState()
+    sections: dict[str, dict[str, Any]] = resume_state.sections if resume_state else {}
+    rounds: list[ResearchRound] = list(resume_state.rounds) if resume_state else []
+    packs: list[evidence.EvidencePack] = list(resume_state.packs) if resume_state else []
+    first_round = resume_state.next_round if resume_state else 1
     stop_reason = "max_rounds"
     partial_reason: str | None = None
     item_sem = asyncio.Semaphore(max(1, max_parallel_items))
     loop_completed = False
 
     try:
-        for round_num in range(1, max_rounds + 1):
+        for round_num in range(first_round, max_rounds + 1):
             # Plan — fail-closed. The dossier state carries an evidence tally so
             # the director knows whether grounding already happened.
             await _emit(ResearchPhase(done=round_num - 1, total=max_rounds, phase="plan", round=round_num))
-            dossier_state = _render_dossier_state(brief, sections, statuses)
+            dossier_state = _render_dossier_state(brief, sections, vs.statuses)
             gathered = evidence.merged_records(packs)
             if gathered:
                 dossier_state += (
@@ -823,7 +1074,7 @@ async def research(
                 max_rounds=max_rounds,
                 brief=_render_brief(brief),
                 dossier_state=dossier_state,
-                gaps=_render_gaps(open_gaps),
+                gaps=_render_gaps(vs.open_gaps),
             )
             data, cost, cost_known, err = await _director_json(
                 plan_prompt, director_alias, label="plan", timeout_floor_s=model_timeout_floor_s
@@ -942,8 +1193,8 @@ async def research(
                 round_num=round_num,
                 brief=_render_brief(brief),
                 dossier=_render_dossier(brief, sections, provenance=False, clip=True),
-                resolved=", ".join(sorted(resolved_gap_ids)) or "(none)",
-                prior_gaps=_render_gaps(open_gaps),
+                resolved=", ".join(sorted(vs.resolved_gap_ids)) or "(none)",
+                prior_gaps=_render_gaps(vs.open_gaps),
             )
             data, cost, cost_known, err = await _director_json(
                 judge_prompt, director_alias, label="judge", timeout_floor_s=model_timeout_floor_s
@@ -963,44 +1214,23 @@ async def research(
                     data,
                     brief,
                     round_num,
-                    resolved_gap_ids,
+                    vs.resolved_gap_ids,
                     cost_usd=cost,
                     cost_known=cost_known,
                     sections_with_content=set(sections),
                 )
-            verdicts.append(verdict)
             rounds.append(ResearchRound(round=round_num, work_items=items, results=results, verdict=verdict))
             await _journal(paths, phase="verdict", round=round_num, verdict=verdict.model_dump())
 
-            if not verdict.parsed_ok:
-                judge_failures += 1
-                if judge_failures >= 2:
-                    stop_reason = "director_error"
-                    partial_reason = f"judge failed twice in a row (last: {verdict.error})"
-                    break
-                continue
-            judge_failures = 0
-            statuses = dict(verdict.section_status)
-
-            # A gap the judge stopped reporting is resolved — permanently.
-            reported = {g.id for g in verdict.blocking_gaps}
-            resolved_gap_ids |= {g.id for g in open_gaps if g.id not in reported}
-            open_gaps = list(verdict.blocking_gaps)
-
-            if verdict.accepted(brief):
+            signal = _apply_verdict(vs, verdict, brief)
+            if signal == "judge_dead":
+                stop_reason = "director_error"
+                partial_reason = f"judge failed twice in a row (last: {verdict.error})"
+                break
+            if signal == "accepted":
                 stop_reason = "accepted"
                 break
-
-            # Stall: no newly accepted section AND no drop in blocking gaps,
-            # two rounds running.
-            accepted_n = sum(1 for s in statuses.values() if s == "accepted")
-            progress = (accepted_n, -len(open_gaps))
-            improved = (
-                progress_prev is None or progress[0] > progress_prev[0] or progress[1] > progress_prev[1]
-            )
-            stall = 0 if improved else stall + 1
-            progress_prev = progress
-            if stall >= 2:
+            if signal == "stalled":
                 stop_reason = "stalled"
                 break
 
@@ -1016,7 +1246,7 @@ async def research(
                 )
             with contextlib.suppress(Exception):
                 (paths.root / "verdicts.json").write_text(
-                    json.dumps([v.model_dump() for v in verdicts], indent=2)
+                    json.dumps([v.model_dump() for v in vs.verdicts], indent=2)
                 )
             with contextlib.suppress(Exception):
                 _write_parent_manifest(
@@ -1033,18 +1263,18 @@ async def research(
     await asyncio.to_thread((paths.root / "dossier.md").write_text, dossier)
     await asyncio.to_thread(
         (paths.root / "verdicts.json").write_text,
-        json.dumps([v.model_dump() for v in verdicts], indent=2),
+        json.dumps([v.model_dump() for v in vs.verdicts], indent=2),
     )
 
     result = _result(
         brief=brief,
         rounds_completed=len(rounds),
         rounds=rounds,
-        verdicts=verdicts,
+        verdicts=vs.verdicts,
         dossier=dossier,
         converged=stop_reason == "accepted",
         stop_reason=stop_reason,
-        open_gaps=open_gaps,
+        open_gaps=vs.open_gaps,
         partial=partial_reason is not None,
         partial_reason=partial_reason,
     )

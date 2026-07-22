@@ -464,6 +464,7 @@ async def research(args: dict[str, Any], *, on_progress: ProgressCallback | None
         director=args.get("director"),
         max_rounds=args.get("max_rounds", 6),
         max_output_tokens=args.get("max_output_tokens"),
+        continuation_id=args.get("continuation_id"),
         on_progress=on_progress,
         **cap_kwargs,
     )
