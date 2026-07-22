@@ -49,6 +49,7 @@ class ModelEntry(TypedDict, total=False):
     reasoning_effort: str
     max_input_tokens: int
     pricing: dict[str, float]
+    supports_web: bool
 
 
 def _deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
@@ -147,6 +148,20 @@ def resolve_tier(tier: str) -> list[str]:
     if tier not in tiers:
         raise UnknownModelError(f"Unknown tier: {tier}. Available: {list(tiers)}")
     return list(tiers[tier])
+
+
+def web_capable_models() -> list[str]:
+    """Aliases whose entry declares provider-native web search
+    (`supports_web: true` in models.json or a user overlay).
+
+    The flag is consult's own source of truth rather than LiteLLM's
+    supports_web_search table, because registry entries newer than the
+    shipped tables (the gap-fill case) would otherwise all read as
+    non-web. The transport turns the capability on per call; this helper
+    is how the evidence pass (issue #92) selects its workers.
+    """
+    models = models_config().get("models", {})
+    return sorted(a for a, e in models.items() if isinstance(e, dict) and e.get("supports_web") is True)
 
 
 def resolve_stance(key_or_prompt: str | None) -> str:

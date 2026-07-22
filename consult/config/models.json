@@ -42,6 +42,7 @@
       "family": "gpt",
       "reasoning_effort": "medium",
       "privacy_tier": "first_party",
+      "supports_web": true,
       "max_input_tokens": 1050000,
       "pricing": {
         "input_usd_per_mtok": 30.0,
@@ -95,7 +96,8 @@
       "default_timeout_s": 300,
       "provider": "google",
       "family": "gemini",
-      "privacy_tier": "first_party"
+      "privacy_tier": "first_party",
+      "supports_web": true
     },
     "gemini-flash": {
       "litellm_id": "gemini/gemini-3.6-flash",
@@ -104,6 +106,7 @@
       "provider": "google",
       "family": "gemini",
       "privacy_tier": "first_party",
+      "supports_web": true,
       "max_input_tokens": 1048576,
       "pricing": {
         "input_usd_per_mtok": 1.5,
@@ -143,6 +146,7 @@
       "provider": "openrouter",
       "family": "perplexity",
       "privacy_tier": "aggregator",
+      "supports_web": true,
       "max_input_tokens": 200000,
       "pricing": {
         "input_usd_per_mtok": 3.0,

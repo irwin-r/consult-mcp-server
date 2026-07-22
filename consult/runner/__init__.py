@@ -58,6 +58,7 @@ from .transport import (  # noqa: F401
     _stream_acompletion,
     _stream_partial_interval_s,
     _transient_error_classes,
+    apply_web_search,
     build_messages,
     configure_litellm,
 )

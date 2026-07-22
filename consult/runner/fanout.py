@@ -49,6 +49,7 @@ from .transport import (
     _format_error_message,
     _get_provider_sems,
     _stream_acompletion,
+    apply_web_search,
     build_messages,
     configure_litellm,
 )
@@ -97,6 +98,7 @@ async def _call_one(
     prior_turns: list[dict[str, Any]] | None = None,
     capsule_kind: str = "decision",
     max_output_tokens: int | None = None,
+    web_search: bool = False,
 ) -> ManifestEntry:
     # An unknown alias must fail this single panellist, not the whole panel.
     # `asyncio.gather` without return_exceptions=True would otherwise cancel
@@ -146,6 +148,14 @@ async def _call_one(
     extra: dict[str, Any] = {}
     if "reasoning_effort" in entry:
         extra["reasoning_effort"] = entry["reasoning_effort"]
+    # Provider-native web search, requested per call and honoured only for
+    # `supports_web` entries. Silent no-op (debug log) otherwise, so a
+    # mixed panel with one web-capable model doesn't fail the rest.
+    if web_search:
+        if entry.get("supports_web"):
+            apply_web_search(extra, entry)
+        else:
+            logger.debug("web_search requested but %s lacks supports_web; ignoring", litellm_id)
 
     await _write_text_async(paths.prompt_for(slug), per_slug_prompt)
     start = time.time()
@@ -765,6 +775,7 @@ async def fanout(
     prior_turns_by_slug: dict[str, list[dict[str, Any]]] | None = None,
     max_concurrency: int | None = None,
     max_output_tokens: int | None = None,
+    web_search: bool = False,
 ) -> RunHandle:
     """Parallel fan-out. Creates a fresh run by default. Pass `existing_paths`
     to write into an existing run dir (used by `refine` to keep all rounds
@@ -787,6 +798,11 @@ async def fanout(
     answer) — round-1 question + answer become a stable prefix that
     Anthropic's prompt cache can reuse across rounds, instead of the
     monolithic refinement prompt that changes every round.
+
+    `web_search=True` requests provider-native web search for every
+    panellist whose registry entry carries `supports_web`; other
+    panellists run unchanged. Search fees are provider-billed on top of
+    tokens and are not part of `estimate_cost` (estimates stay floors).
 
     `max_concurrency` (or `CONSULT_MAX_CONCURRENCY` env var) caps the
     *total* number of panellists in flight at once. The existing
@@ -1122,6 +1138,7 @@ async def fanout(
                 prior_turns=pt,
                 capsule_kind=capsule_kind,
                 max_output_tokens=max_output_tokens,
+                web_search=web_search,
             )
             state.record_completed(entry)
             await _safe_notify(
