@@ -7,6 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Until 1.0, the capsule schema and tool surface may change in minor releases.
 
+## [0.6.0](https://github.com/irwin-r/consult-mcp-server/compare/v0.5.0...v0.6.0) (2026-07-22)
+
+
+### ⚠ BREAKING CHANGES
+
+* the wide tier, the refine elimination strategy (and the refine schema's strategy field), and the always-on sequence tool are gone from the default surface. Set CONSULT_ENABLE_SEQUENCE=1 to restore sequence.
+* provider=cli registry entries are no longer supported. The default surface is unaffected since no packaged config used it.
+
+### Features
+
+* add a per-run calibration block and diverse panel stances ([#73](https://github.com/irwin-r/consult-mcp-server/issues/73)) ([e113040](https://github.com/irwin-r/consult-mcp-server/commit/e113040f402b1e5e3fbb164933c67f6de39a75cc))
+* add a weekly registry freshness canary ([#72](https://github.com/irwin-r/consult-mcp-server/issues/72)) ([d57bb1d](https://github.com/irwin-r/consult-mcp-server/commit/d57bb1dbe8331943bf56d6e6ae4c2eaa72bb0bf0))
+* add the evidence pass and wire it into the research loop ([#97](https://github.com/irwin-r/consult-mcp-server/issues/97)) ([c4270f2](https://github.com/irwin-r/consult-mcp-server/commit/c4270f2e258fa7a102ceb6b6f46631ec038bc68d))
+* add the research engine core with a director loop ([#93](https://github.com/irwin-r/consult-mcp-server/issues/93)) ([61e8111](https://github.com/irwin-r/consult-mcp-server/commit/61e81111b03dc611ddd57ca237c62ff19b0496d9))
+* auto-continue truncated panellists and progress-aware dropout ([284d3bf](https://github.com/irwin-r/consult-mcp-server/commit/284d3bf25f6401fca6d0cb5d054783537bce33bb))
+* expose the research tool on the MCP surface behind an env gate ([#96](https://github.com/irwin-r/consult-mcp-server/issues/96)) ([d20f1b8](https://github.com/irwin-r/consult-mcp-server/commit/d20f1b800c9fa4f66743329709f1494c0a947a7b))
+* flag web-capable registry models and wire provider search options ([#95](https://github.com/irwin-r/consult-mcp-server/issues/95)) ([4c2f3dd](https://github.com/irwin-r/consult-mcp-server/commit/4c2f3ddaff6f80ce45b32a07e25146cf60e23336))
+* gap-fill litellm price tables from registry pricing blocks ([696e2d3](https://github.com/irwin-r/consult-mcp-server/commit/696e2d36c480f0b4f4375c58f0bc461575f7601e))
+* refresh the model registry for the 2026-07 releases ([8e5bf86](https://github.com/irwin-r/consult-mcp-server/commit/8e5bf867380dfdcda838a88d8d0dc225ab28d018))
+* render research runs in the viewer and document the tool ([#100](https://github.com/irwin-r/consult-mcp-server/issues/100)) ([857c640](https://github.com/irwin-r/consult-mcp-server/commit/857c640e480d8aa400209403835a81a439a1368a))
+* resolve aliases up front and accept tier on panel and refine ([4dfbf30](https://github.com/irwin-r/consult-mcp-server/commit/4dfbf30c89c0d08c4286a190b53db8e8aea11a29))
+* resume a crashed research run from its journal by continuation id ([#99](https://github.com/irwin-r/consult-mcp-server/issues/99)) ([6601c67](https://github.com/irwin-r/consult-mcp-server/commit/6601c675be70ea0790ff98ac5b23e7d40dbde45e))
+
+
+### Bug Fixes
+
+* bump the mcp floor and relock six advisory-flagged dependencies ([421b3a2](https://github.com/irwin-r/consult-mcp-server/commit/421b3a2526d2959507718715ae474b522ea4ad21))
+* count output-capped doctor pings as a live provider ([ca07399](https://github.com/irwin-r/consult-mcp-server/commit/ca07399bfb3b05ed560bb10199a6da01869e6acd))
+* drop gpt-pro from standard tier and recover streamed citations ([#69](https://github.com/irwin-r/consult-mcp-server/issues/69)) ([c5efd4a](https://github.com/irwin-r/consult-mcp-server/commit/c5efd4af9a38de54210e7032da4a288ebe22afc2))
+* harden the research loop per review and make sub-runs patient ([#98](https://github.com/irwin-r/consult-mcp-server/issues/98)) ([f60737c](https://github.com/irwin-r/consult-mcp-server/commit/f60737c165fb2640f8c2cbcf795a7a1c551d4a48))
+* recover capsules from tool-call envelopes and off-enum findings ([198f55d](https://github.com/irwin-r/consult-mcp-server/commit/198f55d955e4c1d0dab933257920eafb5a28dbd9))
+* satisfy pyright on the output budget and estimate kwargs types ([3476f45](https://github.com/irwin-r/consult-mcp-server/commit/3476f458e563622c7567ba159bca0557d100d6d1))
+* score panel disagreement over complete capsules only ([#77](https://github.com/irwin-r/consult-mcp-server/issues/77)) ([633a983](https://github.com/irwin-r/consult-mcp-server/commit/633a9838791aefaa351d1babc237344155839683))
+* warn on empty file attachment instead of a blank fence ([#84](https://github.com/irwin-r/consult-mcp-server/issues/84)) ([f74e428](https://github.com/irwin-r/consult-mcp-server/commit/f74e4282cd1e6a9cf07eb9885dd05131cf3416f4))
+* warn on empty git_diff attachment instead of a blank fence ([#81](https://github.com/irwin-r/consult-mcp-server/issues/81)) ([8c4cca2](https://github.com/irwin-r/consult-mcp-server/commit/8c4cca2fa785d15cfd0088f0acfbda4bbfa6f429))
+
+
+### Documentation
+
+* log the registry refresh smoke findings ([4f991a4](https://github.com/irwin-r/consult-mcp-server/commit/4f991a4cb8465261c0970b046e27c504f753ad46))
+* log the research crash-resume dogfood and evidence validation ([56f671f](https://github.com/irwin-r/consult-mcp-server/commit/56f671f7228cb8204df26dc28761a0164087e92e))
+* log the stale-registry friction from the refine dogfood run ([cd720d2](https://github.com/irwin-r/consult-mcp-server/commit/cd720d21bff9fd8c796642e35f2dad38d52051ca))
+* refresh the README for the merged tier and tool changes ([#75](https://github.com/irwin-r/consult-mcp-server/issues/75)) ([dee5694](https://github.com/irwin-r/consult-mcp-server/commit/dee5694a1d2ec82147161078a5029ce9faa133ac))
+
+
+### Miscellaneous Chores
+
+* delete the CLI-as-panellist transport and record an ADR ([#71](https://github.com/irwin-r/consult-mcp-server/issues/71)) ([1f1b1ed](https://github.com/irwin-r/consult-mcp-server/commit/1f1b1ed237940f3bcfd0ac0e045db87f17a4cbbd))
+* prune the wide tier, elimination strategy, and default sequence tool ([#70](https://github.com/irwin-r/consult-mcp-server/issues/70)) ([db8eb5d](https://github.com/irwin-r/consult-mcp-server/commit/db8eb5d5edb5ce27bdb21d41cb427ec5a717a074))
+
 ## [0.5.0](https://github.com/irwin-r/consult-mcp-server/compare/v0.4.1...v0.5.0) (2026-06-14)
 
 
