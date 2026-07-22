@@ -92,6 +92,7 @@ async def sequence(
     dry_run: bool = False,
     capsule_kind: str = "decision",
     rubric: str | None = None,
+    max_output_tokens: int | None = None,
     on_progress: runner.ProgressCallback | None = None,
 ) -> SequenceResult:
     """Run `prompts` as a chain where step i sees every prior step's synthesis."""
@@ -167,10 +168,13 @@ async def sequence(
         step_base = (i - 1) * (panel_n * 2 + 1)
         full_prompt = _step_prompt(i, total, prior_syntheses, body)
 
+        step_est_kwargs: dict = {"capsule_kind": capsule_kind}
+        if max_output_tokens is not None:
+            step_est_kwargs["max_output_tokens"] = max_output_tokens
         estimate, est_known = await runner.aestimate_cost(
             specs,
             full_prompt,
-            capsule_kind=capsule_kind,
+            **step_est_kwargs,
         )
         if meter.total + estimate > cap:
             partial_reason = (
@@ -207,6 +211,7 @@ async def sequence(
                 progress_done,
             ),
             capsule_kind=capsule_kind,
+            max_output_tokens=max_output_tokens,
         )
         if handle.partial or not handle.manifest:
             # Roll the partial fanout's spend into the running total before

@@ -1243,9 +1243,10 @@ def test_max_input_tokens_unknown_returns_none(monkeypatch):
     assert runner._max_input_tokens("vendor/totally-new-model", {}) is None
 
 
-def test_slow_tail_dropout_default_is_180s():
-    """Default bumped from 30s to 180s — long-context wide-panel runs were
-    losing real signal (kimi/qwen often take 60-180s on ~200K input)."""
+def test_slow_tail_dropout_default_is_300s():
+    """Default bumped 30s -> 180s -> 300s. 180s cancelled kimi at 292s on the
+    2026-07-13 review run while it was inside its own 360s per-spec budget;
+    the dropout is a hang guard, not a working-straggler killer."""
     # The default lives in runner.fanout's body; verify by reading the
     # source rather than executing the path (which would need a full fanout).
     import inspect
@@ -1253,7 +1254,7 @@ def test_slow_tail_dropout_default_is_180s():
     from consult import runner
 
     src = inspect.getsource(runner.fanout)
-    assert 'env_float("CONSULT_TAIL_DROPOUT_S", 180.0)' in src
+    assert 'env_float("CONSULT_TAIL_DROPOUT_S", 300.0)' in src
 
 
 @pytest.mark.asyncio
@@ -1678,3 +1679,340 @@ async def test_call_one_no_footer_without_citation_metadata(tmp_path, monkeypatc
     saved = paths.response_text("haiku-0").read_text()
     assert saved == "Plain answer, no web grounding."
     assert FOOTER_DELIM not in saved
+
+
+@pytest.mark.asyncio
+async def test_call_one_retries_empty_truncated_body_with_doubled_budget(tmp_path, monkeypatch):
+    """A reasoning model that burns its whole output grant thinking comes
+    back finish_reason=length with an empty body — billed, zero value (run
+    20260713-050837: gpt spent 12k output tokens on nothing). `_call_one`
+    must retry once with a doubled budget and bill both attempts.
+    """
+    import litellm
+
+    from consult.runner import _call_one
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    paths = artifacts.create_run()
+
+    calls = {"n": 0, "budgets": []}
+
+    def _resp(content: str, finish: str):
+        class _Msg:
+            tool_calls = None
+
+        _Msg.content = content
+
+        class _Choice:
+            message = _Msg()
+            finish_reason = finish
+
+        class _Usage:
+            prompt_tokens = 100
+            completion_tokens = 4000
+
+        class _Resp:
+            choices = [_Choice()]
+            usage = _Usage()
+
+            def model_dump(self):
+                return {"_stub": True}
+
+        return _Resp()
+
+    async def fake_acompletion(**kw):
+        calls["n"] += 1
+        calls["budgets"].append(kw["max_completion_tokens"])
+        if calls["n"] == 1:
+            return _resp("", "length")
+        return _resp("recovered\n\nCONFIDENCE: 0.7\nKEY_REASON: x", "stop")
+
+    monkeypatch.setattr(litellm, "acompletion", fake_acompletion)
+    monkeypatch.setattr(litellm, "completion_cost", lambda **_: 0.01)
+
+    entry = await _call_one(ModelSpec(model="claude-haiku"), "haiku-0", "prompt", paths)
+    assert calls["n"] == 2
+    assert calls["budgets"][1] == calls["budgets"][0] * 2
+    assert entry.status is Status.OK
+    assert entry.cost_usd == pytest.approx(0.02)  # both attempts billed
+    assert entry.note is not None and "retried once" in entry.note
+    assert entry.tokens_out == 8000  # summed across attempts
+
+
+@pytest.mark.asyncio
+async def test_call_one_empty_truncation_retries_only_once(tmp_path, monkeypatch):
+    """If the doubled-budget retry ALSO comes back empty-truncated, the
+    entry stays TRUNCATED after exactly two calls — no runaway loop.
+    """
+    import litellm
+
+    from consult.runner import _call_one
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    paths = artifacts.create_run()
+
+    calls = {"n": 0}
+
+    def _resp():
+        class _Msg:
+            content = ""
+            tool_calls = None
+
+        class _Choice:
+            message = _Msg()
+            finish_reason = "length"
+
+        class _Resp:
+            choices = [_Choice()]
+            usage = None
+
+            def model_dump(self):
+                return {"_stub": True}
+
+        return _Resp()
+
+    async def fake_acompletion(**kw):
+        calls["n"] += 1
+        return _resp()
+
+    monkeypatch.setattr(litellm, "acompletion", fake_acompletion)
+    monkeypatch.setattr(litellm, "completion_cost", lambda **_: 0.01)
+
+    entry = await _call_one(ModelSpec(model="claude-haiku"), "haiku-0", "prompt", paths)
+    assert calls["n"] == 2
+    assert entry.status is Status.TRUNCATED
+    assert entry.note is not None and "retried once" in entry.note
+
+
+def _stub_resp(content: str, finish: str):
+    """Minimal LiteLLM-shaped response for continuation tests."""
+
+    class _Msg:
+        tool_calls = None
+
+    _Msg.content = content
+
+    class _Choice:
+        message = _Msg()
+        finish_reason = finish
+
+    class _Usage:
+        prompt_tokens = 100
+        completion_tokens = 500
+
+    class _Resp:
+        choices = [_Choice()]
+        usage = _Usage()
+
+        def model_dump(self):
+            return {"_stub": True}
+
+    return _Resp()
+
+
+@pytest.mark.asyncio
+async def test_call_one_continues_truncated_body_and_stitches(tmp_path, monkeypatch):
+    """finish_reason=length with a non-empty body gets ONE continuation call:
+    the model sees its partial answer as an assistant turn, the bodies are
+    stitched, the entry lands OK, and both calls are billed. This is the
+    'stop losing the tail of long responses' fix (2026-07-13: 4 of 9
+    panellists truncated writing a build spec).
+    """
+    import litellm
+
+    from consult.runner import _call_one
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    paths = artifacts.create_run()
+
+    calls = {"n": 0, "messages": []}
+
+    async def fake_acompletion(**kw):
+        calls["n"] += 1
+        calls["messages"].append(kw["messages"])
+        if calls["n"] == 1:
+            return _stub_resp("The plan begins with", "length")
+        return _stub_resp(" the repo layout. Done.", "stop")
+
+    monkeypatch.setattr(litellm, "acompletion", fake_acompletion)
+    monkeypatch.setattr(litellm, "completion_cost", lambda **_: 0.01)
+
+    entry = await _call_one(ModelSpec(model="claude-haiku"), "haiku-0", "prompt", paths)
+    assert calls["n"] == 2
+    # Continuation call carries the partial answer as an assistant turn plus
+    # the continue nudge as the final user turn.
+    cont_messages = calls["messages"][1]
+    assert cont_messages[-2]["role"] == "assistant"
+    assert cont_messages[-2]["content"] == "The plan begins with"
+    assert cont_messages[-1]["role"] == "user"
+    assert "cut off" in cont_messages[-1]["content"]
+    assert entry.status is Status.OK
+    saved = paths.response_text("haiku-0").read_text()
+    assert saved == "The plan begins with the repo layout. Done."
+    assert entry.cost_usd == pytest.approx(0.02)
+    assert entry.note is not None and "continued once" in entry.note
+    # The continuation's raw response is persisted alongside the first.
+    assert (paths.responses / "haiku-0.continuation.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_call_one_continuation_disabled_by_env(tmp_path, monkeypatch):
+    """CONSULT_CONTINUE_ON_TRUNCATION=0 keeps the old single-call behaviour."""
+    import litellm
+
+    from consult.runner import _call_one
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    monkeypatch.setenv("CONSULT_CONTINUE_ON_TRUNCATION", "0")
+    paths = artifacts.create_run()
+
+    calls = {"n": 0}
+
+    async def fake_acompletion(**kw):
+        calls["n"] += 1
+        return _stub_resp("partial body", "length")
+
+    monkeypatch.setattr(litellm, "acompletion", fake_acompletion)
+    monkeypatch.setattr(litellm, "completion_cost", lambda **_: 0.01)
+
+    entry = await _call_one(ModelSpec(model="claude-haiku"), "haiku-0", "prompt", paths)
+    assert calls["n"] == 1
+    assert entry.status is Status.TRUNCATED
+
+
+@pytest.mark.asyncio
+async def test_call_one_continuation_failure_keeps_truncated_body(tmp_path, monkeypatch):
+    """A dead continuation call must not downgrade a partial answer to
+    nothing: the truncated body survives, with a note."""
+    import litellm
+
+    from consult.runner import _call_one
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    paths = artifacts.create_run()
+
+    calls = {"n": 0}
+
+    async def fake_acompletion(**kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _stub_resp("partial body", "length")
+        raise RuntimeError("provider fell over")
+
+    monkeypatch.setattr(litellm, "acompletion", fake_acompletion)
+    monkeypatch.setattr(litellm, "completion_cost", lambda **_: 0.01)
+
+    entry = await _call_one(ModelSpec(model="claude-haiku"), "haiku-0", "prompt", paths)
+    assert entry.status is Status.TRUNCATED
+    assert paths.response_text("haiku-0").read_text() == "partial body"
+    assert entry.note is not None and "continuation failed" in entry.note
+    assert entry.cost_known is False  # the failed attempt may have billed
+
+
+@pytest.mark.asyncio
+async def test_call_one_max_output_tokens_raises_grant(tmp_path, monkeypatch):
+    """The caller override lifts the output grant above both the kind cap
+    and the model default; the granted value reaches the provider call."""
+    import litellm
+
+    from consult.runner import _call_one
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    paths = artifacts.create_run()
+
+    captured = {}
+
+    async def fake_acompletion(**kw):
+        captured.update(kw)
+        return _stub_resp("fine\n\nCONFIDENCE: 0.7\nKEY_REASON: x", "stop")
+
+    monkeypatch.setattr(litellm, "acompletion", fake_acompletion)
+    monkeypatch.setattr(litellm, "completion_cost", lambda **_: 0.01)
+
+    await _call_one(
+        ModelSpec(model="claude-haiku"),
+        "haiku-0",
+        "prompt",
+        paths,
+        max_output_tokens=32000,
+    )
+    assert captured["max_completion_tokens"] == 32000
+
+
+def test_output_budget_derivation():
+    """max(kind cap, model default, caller override) — one shared derivation
+    for the grant and the cost estimate."""
+    from consult.runner.specs import output_budget
+
+    entry = {"default_budget_tokens": 8000}
+    assert output_budget(entry, "decision") == 8000  # model default wins
+    assert output_budget({}, "review") == 16000  # kind cap wins
+    assert output_budget(entry, "decision", 32000) == 32000  # override wins
+    assert output_budget(entry, "decision", 100) == 8000  # override is a floor, not a cut
+
+
+def test_estimate_cost_prices_max_output_tokens_override():
+    """The cap gate must price the same ceiling the calls will be granted —
+    a raised grant with an unraised estimate would wave through over-cap runs."""
+    base, base_known = estimate_cost([ModelSpec(model="claude-haiku")], "hello")
+    raised, raised_known = estimate_cost([ModelSpec(model="claude-haiku")], "hello", max_output_tokens=64000)
+    if base_known and raised_known:
+        assert raised > base
+
+
+@pytest.mark.asyncio
+async def test_fanout_slow_tail_dropout_spares_active_stragglers(tmp_path, monkeypatch):
+    """Progress-aware dropout: a straggler that keeps signalling activity
+    (stream chunks, a retry or continuation call starting) survives past the
+    grace and completes; a silent straggler is still cancelled. Task start
+    itself never counts as activity, so panels without signals keep the
+    original fixed-grace behaviour.
+    """
+    import asyncio as _asyncio
+
+    from consult import runner
+    from consult.runner import fanout
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    monkeypatch.setattr(runner, "estimate_cost", lambda *a, **kw: (0.0, True))
+    monkeypatch.setenv("CONSULT_TAIL_DROPOUT_S", "0.05")
+    monkeypatch.setenv("CONSULT_TAIL_K_FRAC", "0.4")  # k=2 for n=5 -> trigger=3
+    monkeypatch.setenv("CONSULT_TAIL_ACTIVITY_WINDOW_S", "0.3")
+
+    async def fake_call(spec, slug, per_prompt, paths, provider_sems=None, on_activity=None, **_):
+        if "active" in slug:
+            for _i in range(12):  # ~0.6s of work, far past the 0.05s grace
+                await _asyncio.sleep(0.05)
+                if on_activity is not None:
+                    on_activity()
+        elif "silent" in slug:
+            await _asyncio.sleep(5.0)
+        paths.response_text(slug).write_text("ok")
+        return ManifestEntry(
+            slug=slug,
+            model_id="x/y",
+            persona=None,
+            status=Status.OK,
+            finish_reason="stop",
+            resource_uri=paths.resource_uri(slug),
+            body_path=str(paths.response_text(slug)),
+            latency_ms=1,
+            cost_usd=0.0,
+            cost_known=True,
+        )
+
+    monkeypatch.setattr(runner, "_call_one", fake_call)
+
+    specs = [
+        ModelSpec(model="claude-haiku", slug="fast-0"),
+        ModelSpec(model="claude-haiku", slug="fast-1"),
+        ModelSpec(model="claude-haiku", slug="fast-2"),
+        ModelSpec(model="claude-haiku", slug="active-3"),
+        ModelSpec(model="claude-haiku", slug="silent-4"),
+    ]
+    handle = await fanout("anything", specs)
+    by_slug = {m.slug: m for m in handle.manifest}
+    assert by_slug["active-3"].status is Status.OK
+    assert by_slug["silent-4"].status is Status.TIMEOUT
+    assert "slow-tail dropout" in (by_slug["silent-4"].error or "")
+    assert [m.status for m in handle.manifest].count(Status.OK) == 4

@@ -48,6 +48,8 @@ class ModelEntry(TypedDict, total=False):
     mode: str
     reasoning_effort: str
     max_input_tokens: int
+    pricing: dict[str, float]
+    supports_web: bool
 
 
 def _deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
@@ -148,6 +150,20 @@ def resolve_tier(tier: str) -> list[str]:
     return list(tiers[tier])
 
 
+def web_capable_models() -> list[str]:
+    """Aliases whose entry declares provider-native web search
+    (`supports_web: true` in models.json or a user overlay).
+
+    The flag is consult's own source of truth rather than LiteLLM's
+    supports_web_search table, because registry entries newer than the
+    shipped tables (the gap-fill case) would otherwise all read as
+    non-web. The transport turns the capability on per call; this helper
+    is how the evidence pass (issue #92) selects its workers.
+    """
+    models = models_config().get("models", {})
+    return sorted(a for a, e in models.items() if isinstance(e, dict) and e.get("supports_web") is True)
+
+
 def resolve_stance(key_or_prompt: str | None) -> str:
     """Return the stance prompt text. If `key_or_prompt` matches a registered
     key, return that. Otherwise treat it as a literal prompt (custom stance).
@@ -162,6 +178,25 @@ def resolve_stance(key_or_prompt: str | None) -> str:
 
 def default_synthesiser() -> str:
     return models_config().get("defaults", {}).get("synthesiser", "gemini-pro")
+
+
+def synthesiser_fallbacks() -> list[str]:
+    """Aliases tried, in order, when a judge-role call (synthesiser or
+    refine arbiter — the roles share `defaults.synthesiser`) fails or
+    returns nothing usable.
+
+    Sourced from `models.json:defaults.synthesiser_fallbacks`. The
+    packaged default is a single cross-provider fallback so a provider
+    outage (e.g. the 2026-07-13 Gemini 503s that killed a run's synthesis
+    and aborted a refine loop) degrades to a different vendor instead of
+    failing the run's final step. Non-string entries are dropped rather
+    than raising — a malformed config shouldn't take the fallback path
+    down with it.
+    """
+    raw = models_config().get("defaults", {}).get("synthesiser_fallbacks", ["claude-sonnet"])
+    if not isinstance(raw, list):
+        return []
+    return [alias for alias in raw if isinstance(alias, str) and alias]
 
 
 def default_capsule_extractor() -> str:

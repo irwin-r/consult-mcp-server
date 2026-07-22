@@ -10,15 +10,16 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from typing import Any
 
 import litellm
 
 from consult import runner as _facade
 
-from .. import registry
-from ..capsule import MAX_TOKENS_BY_KIND
+from .. import pricing, registry
 from ..redact import redact_exc
 from ..types import ModelSpec
+from .specs import output_budget
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +29,7 @@ async def aestimate_cost(
     prompt: str,
     *,
     capsule_kind: str = "decision",
+    max_output_tokens: int | None = None,
 ) -> tuple[float, bool]:
     """Async wrapper around `estimate_cost`.
 
@@ -36,9 +38,16 @@ async def aestimate_cost(
     heartbeat ticks for noticeable real-time. Offloading to a thread keeps
     the event loop responsive. Test monkeypatches still bind to the sync
     `estimate_cost` symbol — this wrapper picks up whatever's currently
-    bound there, so test setup is unchanged.
+    bound there, so test setup is unchanged. `max_output_tokens` is
+    forwarded only when set, so patched lambdas without the kwarg survive.
     """
-    return await asyncio.to_thread(_facade.estimate_cost, specs, prompt, capsule_kind=capsule_kind)
+    # `Any` values, not `object`: the splat feeds typed keyword parameters
+    # (`capsule_kind: str`, `max_output_tokens: int | None`) and pyright
+    # rejects `object` against them.
+    kwargs: dict[str, Any] = {"capsule_kind": capsule_kind}
+    if max_output_tokens is not None:
+        kwargs["max_output_tokens"] = max_output_tokens
+    return await asyncio.to_thread(lambda: _facade.estimate_cost(specs, prompt, **kwargs))
 
 
 def estimate_cost(
@@ -46,6 +55,7 @@ def estimate_cost(
     prompt: str,
     *,
     capsule_kind: str = "decision",
+    max_output_tokens: int | None = None,
 ) -> tuple[float, bool]:
     """Returns (total_estimate, all_known).
 
@@ -62,6 +72,7 @@ def estimate_cost(
     async fan-out paths call `aestimate_cost()` to keep the event loop
     free during the blocking `token_counter` lookup.
     """
+    pricing.ensure_registered()
     total = 0.0
     all_known = True
     for spec in specs:
@@ -76,14 +87,10 @@ def estimate_cost(
             continue
         try:
             tin = litellm.token_counter(model=litellm_id, text=prompt)
-            # Match _call_one: the granted budget is max(kind cap, the
-            # model's default_budget_tokens), so the estimate prices that
-            # same ceiling. Conservative by design — the gate must hold
-            # even if the model fills its whole budget.
-            tout = max(
-                MAX_TOKENS_BY_KIND.get(capsule_kind, MAX_TOKENS_BY_KIND["decision"]),
-                entry.get("default_budget_tokens", 0),
-            )
+            # Match _call_one: the estimate prices the same `output_budget`
+            # ceiling the call will actually grant. Conservative by design —
+            # the gate must hold even if the model fills its whole budget.
+            tout = output_budget(entry, capsule_kind, max_output_tokens)
             # cost_per_token returns the TOTAL prompt/completion cost for
             # the given token counts, not per-token rates.
             prompt_cost, completion_cost = litellm.cost_per_token(
@@ -105,6 +112,7 @@ def estimate_drivers(
     prompt: str,
     *,
     capsule_kind: str = "decision",
+    max_output_tokens: int | None = None,
     top_n: int = 3,
 ) -> list[tuple[str, float]]:
     """Per-spec cost estimates, highest first, for the over-cap message.
@@ -118,6 +126,7 @@ def estimate_drivers(
     estimate the gate sees). Best-effort: any per-spec failure just omits
     that spec.
     """
+    pricing.ensure_registered()
     per_spec: list[tuple[str, float]] = []
     for spec in specs:
         try:
@@ -126,10 +135,7 @@ def estimate_drivers(
             if not litellm_id:
                 continue
             tin = litellm.token_counter(model=litellm_id, text=prompt)
-            tout = max(
-                MAX_TOKENS_BY_KIND.get(capsule_kind, MAX_TOKENS_BY_KIND["decision"]),
-                entry.get("default_budget_tokens", 0),
-            )
+            tout = output_budget(entry, capsule_kind, max_output_tokens)
             prompt_cost, completion_cost = litellm.cost_per_token(
                 model=litellm_id, prompt_tokens=tin, completion_tokens=tout
             )

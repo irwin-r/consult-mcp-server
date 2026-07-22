@@ -126,10 +126,17 @@ async def test_handle_list_tools_advertises_default_surface():
     by_name = {t.name: t for t in tools}
     assert set(by_name) == {"panel", "synthesise", "consult", "refine"}
     assert "prompt" in by_name["panel"].inputSchema["required"]
-    assert "models" in by_name["panel"].inputSchema["required"]
     assert "prompt" in by_name["consult"].inputSchema["required"]
     assert "prompt" in by_name["refine"].inputSchema["required"]
     assert "run_id" in by_name["synthesise"].inputSchema["required"]
+    # `models` moved out of `required` when `tier` became an accepted
+    # alternative; the anyOf keeps one-of-them mandatory at the SDK's
+    # schema-validation layer.
+    for tool_name in ("panel", "refine"):
+        schema = by_name[tool_name].inputSchema
+        assert "models" not in schema["required"]
+        assert {"required": ["models"]} in schema["anyOf"]
+        assert {"required": ["tier"]} in schema["anyOf"]
 
 
 @pytest.mark.asyncio
@@ -539,3 +546,16 @@ def test_schemas_declare_wire_level_bounds():
     assert schemas.consult_schema()["properties"]["attachments"]["maxItems"] == 32
     per_step = schemas.SEQUENCE_SCHEMA["properties"]["prompts"]["items"]["anyOf"][1]
     assert per_step["properties"]["attachments"]["maxItems"] == 32
+
+
+@pytest.mark.asyncio
+async def test_all_panel_tools_advertise_max_output_tokens():
+    """Long-form prompts truncated 4 of 9 panellists on 2026-07-13 with no
+    knob to raise the grant. Every panel-shaped tool must advertise
+    `max_output_tokens`."""
+    from consult.mcp import server as server_mod
+
+    tools = await server_mod.handle_list_tools()
+    by_name = {t.name: t for t in tools}
+    for tool_name in ("panel", "refine", "consult"):
+        assert "max_output_tokens" in by_name[tool_name].inputSchema["properties"], tool_name

@@ -333,10 +333,8 @@ async def _ask_arbiter(
     prior_manifest: list[ManifestEntry] | None = None,
 ) -> ArbiterVerdict:
     entry = registry.resolve_model(arbiter_alias)
-    litellm_id = entry.get("litellm_id")
-    if not litellm_id:
+    if not entry.get("litellm_id"):
         raise ValueError(f"arbiter {arbiter_alias!r} must be an API model, not a CLI panellist")
-    timeout = entry.get("default_timeout_s", 180)
 
     usable_count = sum(1 for m in manifest if m.status in (Status.OK, Status.TRUNCATED))
     counts: dict[str, int] = {}
@@ -354,18 +352,15 @@ async def _ask_arbiter(
         health_breakdown=health_breakdown,
     )
 
-    # Output budget gets the same per-model floor as panellist calls
-    # (issue #55): the default arbiter is a thinking model whose reasoning
-    # burn inside a flat 2000-token cap can cut the verdict JSON
-    # mid-stream — the likely mechanism behind 043229's json_parse_failed.
-    budget = max(2000, entry.get("default_budget_tokens", 0))
-
-    # Cost accrues across BOTH attempts when the parse-failure retry fires;
-    # the provider bills the first call whether or not we could parse it.
+    # Cost accrues across EVERY attempt (parse-failure retries and arbiter
+    # fallbacks alike); the provider bills each call whether or not we
+    # could parse it.
     cost: float | None = None
     cost_known = True
 
-    async def _attempt(attempt_prompt: str) -> tuple[dict[str, Any] | None, str | None]:
+    async def _attempt(
+        attempt_prompt: str, *, litellm_id: str, budget: int, timeout: float
+    ) -> tuple[dict[str, Any] | None, str | None]:
         """One arbiter call. Returns (parsed_json, error_label).
 
         (None, label) covers both a failed call and unparseable text;
@@ -437,38 +432,71 @@ async def _ask_arbiter(
         except (TypeError, ValueError):
             return False
 
-    # 1) First attempt, then one retry on any parse failure (issue #53).
-    # A call exception on the first attempt is terminal as before — that's
-    # a transport problem, not a formatting one, and the runner-level
-    # retry semantics don't belong here.
-    data, err = await _attempt(prompt)
-    if err is not None and err != "json_parse_failed":
-        return ArbiterVerdict(
-            round=round_num,
-            score=0.0,
-            gaps=[],
-            reasoning="arbiter call failed; refine must abort or retry",
-            cost_usd=cost,
-            cost_known=cost_known,
-            parsed_ok=False,
-            error=err,
-        )
-    if data is None or not _scoreable(data):
-        retry_data, _retry_err = await _attempt(prompt + _ARBITER_RETRY_NUDGE)
-        if retry_data is not None and _scoreable(retry_data):
-            data = retry_data
-        elif data is None:
-            data = retry_data  # an unscoreable parse still beats nothing
+    # 1) Per alias: first attempt, then one retry on a parse failure
+    # (issue #53). 2) Across aliases: when one arbiter fails outright — a
+    # transport error, or two unparseable responses — fall through to the
+    # configured fallback aliases before giving up. A dead arbiter used to
+    # abort the whole refine loop at round 1 (run 20260713-050837: the
+    # default Gemini arbiter returned non-JSON twice under provider load,
+    # scored the round 0, and the loop never iterated); a second vendor's
+    # verdict is strictly better than no verdict.
+    candidates = [arbiter_alias]
+    for fallback_alias in registry.synthesiser_fallbacks():
+        if fallback_alias not in candidates:
+            candidates.append(fallback_alias)
+
+    data: dict[str, Any] | None = None
+    last_err: str | None = None
+    for candidate_idx, candidate in enumerate(candidates):
+        try:
+            cand_entry = registry.resolve_model(candidate)
+        except KeyError:
+            if candidate_idx == 0:
+                raise
+            logger.warning("arbiter fallback alias %r not in registry; skipping", candidate)
+            continue
+        cand_id = cand_entry.get("litellm_id")
+        if not cand_id:
+            continue  # CLI panellists can't arbitrate; only reachable via fallback config
+        # Output budget gets the same per-model floor as panellist calls
+        # (issue #55): the default arbiter is a thinking model whose
+        # reasoning burn inside a flat 2000-token cap can cut the verdict
+        # JSON mid-stream — the likely mechanism behind 043229's
+        # json_parse_failed.
+        call_params: dict[str, Any] = {
+            "litellm_id": cand_id,
+            "budget": max(2000, cand_entry.get("default_budget_tokens", 0)),
+            "timeout": cand_entry.get("default_timeout_s", 180),
+        }
+        if candidate_idx > 0:
+            logger.warning("arbiter falling back to %s after: %s", cand_id, last_err)
+        data, err = await _attempt(prompt, **call_params)
+        if err is not None and err != "json_parse_failed":
+            last_err = err
+            data = None
+            continue
+        if data is None or not _scoreable(data):
+            retry_data, _retry_err = await _attempt(prompt + _ARBITER_RETRY_NUDGE, **call_params)
+            if retry_data is not None and _scoreable(retry_data):
+                data = retry_data
+            elif data is None:
+                data = retry_data  # an unscoreable parse still beats nothing
+        if data is not None:
+            break
+        last_err = "json_parse_failed"
     if data is None:
         return ArbiterVerdict(
             round=round_num,
             score=0.0,
             gaps=[],
-            reasoning="arbiter returned non-JSON output (retried once)",
+            reasoning=(
+                f"arbiter failed across {len(candidates)} model(s) "
+                f"(parse retry included); last error: {last_err}"
+            ),
             cost_usd=cost,
             cost_known=cost_known,
             parsed_ok=False,
-            error="json_parse_failed",
+            error=last_err or "json_parse_failed",
         )
 
     # 4) Score derivation. v2 prompt: arbiter emits per-dimension 1-5
@@ -670,6 +698,7 @@ async def _round_cost_gate(
     arbiter_spec: ModelSpec,
     spent_usd: float,
     cap: float,
+    max_output_tokens: int | None = None,
 ) -> str | None:
     """Estimate the next refine round's cost (fanout + arbiter) and decide
     whether to proceed. Returns a `partial_reason` when the round should be
@@ -689,8 +718,13 @@ async def _round_cost_gate(
     """
     fanout_est = 0.0
     fanout_known = True
+    # Conditional kwarg keeps test monkeypatches of `aestimate_cost`
+    # (lambdas without the new parameter) working when no override is set.
+    est_kwargs: dict[str, Any] = {"capsule_kind": resolved_kind}
+    if max_output_tokens is not None:
+        est_kwargs["max_output_tokens"] = max_output_tokens
     for spec, cost_input in round_inputs:
-        est, known = await runner.aestimate_cost([spec], cost_input, capsule_kind=resolved_kind)
+        est, known = await runner.aestimate_cost([spec], cost_input, **est_kwargs)
         fanout_est += est
         if not known:
             fanout_known = False
@@ -735,6 +769,7 @@ async def refine(
     rubric: str | None = None,
     capsule_kind: str | None = None,
     strategy: str = "default",
+    max_output_tokens: int | None = None,
     on_progress: runner.ProgressCallback | None = None,
 ) -> RefineResult:
     if max_rounds < 1 or max_rounds > 5:
@@ -798,7 +833,10 @@ async def refine(
     # anyway — exactly the "extra fields silently dropped" trap this repo has
     # hit before (FRICTION 2026-06-14). Mirrors the panel/consult dry_run path.
     if dry_run:
-        panel_est, panel_known = await runner.aestimate_cost(specs, prompt, capsule_kind=resolved_kind)
+        dry_est_kwargs: dict[str, Any] = {"capsule_kind": resolved_kind}
+        if max_output_tokens is not None:
+            dry_est_kwargs["max_output_tokens"] = max_output_tokens
+        panel_est, panel_known = await runner.aestimate_cost(specs, prompt, **dry_est_kwargs)
         arb_est, arb_known = await runner.aestimate_cost(
             [ModelSpec(model=arbiter_alias)], prompt, capsule_kind=resolved_kind
         )
@@ -931,6 +969,7 @@ async def refine(
             arbiter_spec=arbiter_spec,
             spent_usd=meter.total,
             cap=cap,
+            max_output_tokens=max_output_tokens,
         )
         if gate_reason is not None:
             partial_reason = gate_reason
@@ -974,6 +1013,7 @@ async def refine(
             # with an empty body). `_should_run_round` already prices the
             # kind cap, so the grant must match the estimate.
             capsule_kind=resolved_kind,
+            max_output_tokens=max_output_tokens,
             on_progress=progress_mod.make_phase_cb(
                 emit if on_progress else None,
                 round_base,

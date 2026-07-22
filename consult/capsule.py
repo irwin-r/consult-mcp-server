@@ -201,6 +201,122 @@ def _body_has_findings(body: str) -> bool:
     return any(m in low for m in ("severity", "finding", "fix:", "issue", "\n- ", "\n1.", "\n* ", "\n#"))
 
 
+_ENVELOPE_KEYS = ("parameter", "parameters", "input", "arguments", "capsule", "response", "properties")
+
+# Extractor models drift off the Literal enums under pressure ("architecture",
+# "compliance", "critical"...). Coerce the common aliases; anything still
+# invalid is dropped PER FINDING rather than discarding the whole capsule —
+# observed live 2026-07-13 run 20260713-095511-17732: ONE
+# `category: "architecture"` finding nuked a 6-finding gemini capsule to
+# empty via the all-or-nothing Pydantic build.
+_SEVERITY_ALIASES = {
+    "critical": "blocker",
+    "high": "major",
+    "medium": "minor",
+    "moderate": "minor",
+    "low": "nit",
+    "info": "nit",
+    "suggestion": "nit",
+    "positive": "praise",
+}
+_CATEGORY_ALIASES = {
+    "architecture": "maintainability",
+    "design": "maintainability",
+    "infrastructure": "maintainability",
+    "config": "maintainability",
+    "configuration": "maintainability",
+    "deployment": "maintainability",
+    "compliance": "correctness",
+    "legal": "correctness",
+    "bug": "correctness",
+    "reliability": "correctness",
+    "data-loss": "correctness",
+    "testing": "tests",
+    "test": "tests",
+    "documentation": "docs",
+    "perf": "performance",
+}
+_LINE_RANGE_RE = re.compile(r"^\s*(\d+)\s*(?:[-–:]\s*(\d+))?\s*$")
+
+
+def _salvage_review_findings(data: dict[str, Any], capsule_cls: type) -> dict[str, Any]:
+    """Per-finding validation for review capsules: coerce, keep valid, drop bad.
+
+    Also normalises `overall_verdict` case/hyphens. Non-review kinds pass
+    through untouched.
+    """
+    if capsule_cls is not ReviewCapsule:
+        return data
+    from .types import Finding
+
+    out = dict(data)
+    verdict = out.get("overall_verdict")
+    if isinstance(verdict, str):
+        out["overall_verdict"] = verdict.strip().lower().replace("-", "_").replace(" ", "_")
+
+    raw = out.get("findings")
+    if not isinstance(raw, list):
+        return out
+    kept: list[dict[str, Any]] = []
+    dropped = 0
+    for item in raw:
+        if not isinstance(item, dict):
+            dropped += 1
+            continue
+        candidate = dict(item)
+        sev = str(candidate.get("severity", "")).strip().lower()
+        candidate["severity"] = _SEVERITY_ALIASES.get(sev, sev)
+        cat = str(candidate.get("category", "")).strip().lower()
+        candidate["category"] = _CATEGORY_ALIASES.get(cat, cat)
+        lr = candidate.get("line_range")
+        if isinstance(lr, str):
+            m = _LINE_RANGE_RE.match(lr)
+            candidate["line_range"] = (int(m.group(1)), int(m.group(2) or m.group(1))) if m else None
+        candidate = {k: v for k, v in candidate.items() if k in Finding.model_fields}
+        try:
+            kept.append(Finding(**candidate).model_dump())
+        except Exception:
+            dropped += 1
+    if dropped:
+        logger.warning("capsule salvage dropped %d invalid finding(s), kept %d", dropped, len(kept))
+    out["findings"] = kept
+    return out
+
+
+def _unwrap_capsule_data(data: Any, capsule_cls: type) -> dict[str, Any]:
+    """Undo tool-call envelope nesting around extracted capsule JSON.
+
+    LiteLLM's `response_format` emulation on some providers wraps the payload
+    in an envelope key — observed live 2026-07-13: claude-haiku via Anthropic
+    tool-use returned `{"parameter": {"kind": "review", "findings": [...]}}`.
+    The known-fields filter below then dropped the single unknown key and
+    built a perfectly VALID empty capsule: five panellists' findings vanished
+    with no log line anywhere, and the round-1 arbiter blamed the panellists
+    ("failed to extract parseable findings").
+
+    Descend (bounded) while the dict carries none of the capsule's fields and
+    either a known envelope key or exactly one dict value points deeper.
+    """
+    fields = set(capsule_cls.model_fields)
+    for _ in range(3):
+        if not isinstance(data, dict) or (fields & data.keys()):
+            break
+        nxt = None
+        for key in _ENVELOPE_KEYS:
+            candidate = data.get(key)
+            if isinstance(candidate, dict):
+                nxt = candidate
+                break
+        if nxt is None and len(data) == 1:
+            (only,) = data.values()
+            if isinstance(only, dict):
+                nxt = only
+        if nxt is None:
+            break
+        data = nxt
+    return data if isinstance(data, dict) else {}
+
+
 def _capsule_lacks_content(capsule: AnyCapsule, kind: str) -> bool:
     """True when the capsule carries nothing a synthesiser could use.
 
@@ -288,7 +404,9 @@ async def _extract_one(
     # 2) Capsule build — failures here are JSON shape or Pydantic validation
     try:
         text = resp.choices[0].message.content or ""
-        data = extract_json(text) or {}
+        data = _salvage_review_findings(
+            _unwrap_capsule_data(extract_json(text) or {}, capsule_cls), capsule_cls
+        )
         # Trust the body fallback over an absent/null confidence in JSON.
         if data.get("confidence") in (None, "null"):
             body_conf = _body_confidence(body)
@@ -343,7 +461,13 @@ async def _extract_one(
                 Any, await asyncio.wait_for(litellm.acompletion(**retry_kwargs), timeout=timeout)
             )
             billed_responses.append(retry_resp)
-            retry_data = extract_json(retry_resp.choices[0].message.content or "") or {}
+            retry_data = _salvage_review_findings(
+                _unwrap_capsule_data(
+                    extract_json(retry_resp.choices[0].message.content or "") or {},
+                    capsule_cls,
+                ),
+                capsule_cls,
+            )
             if retry_data.get("confidence") in (None, "null"):
                 bc = _body_confidence(body)
                 if bc is not None:

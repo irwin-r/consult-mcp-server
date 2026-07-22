@@ -48,8 +48,11 @@ Changelog = "https://github.com/irwin-r/consult-mcp-server/blob/main/CHANGELOG.m
 # Pinned to a tight minor range: the MCP SDK is on a fast release cadence
 # and the Tool/ToolAnnotations/CreateTaskResult surfaces have moved between
 # minor versions. We track upstream releases manually rather than floating.
+# Floor raised to 1.28.1: CVE-2026-52869/52870 (session and task scoping,
+# fixed 1.27.2) and CVE-2026-59950 (WebSocket Host/Origin, fixed 1.28.1).
+# The task-scoping one covers the experimental task surface server.py uses.
 mcp = [
-    "mcp>=1.2.0,<2",
+    "mcp>=1.28.1,<2",
 ]
 # OpenTelemetry tracing — emits gen_ai.* semantic-conventions spans per
 # panellist call when OTEL_EXPORTER_OTLP_ENDPOINT is set. Without this
@@ -60,7 +63,7 @@ otel = [
     "opentelemetry-exporter-otlp>=1.20,<2",
 ]
 dev = [
-    "mcp>=1.2.0,<2",
+    "mcp>=1.28.1,<2",
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     "pytest-cov>=5.0",

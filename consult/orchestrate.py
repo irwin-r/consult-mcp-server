@@ -17,7 +17,7 @@ from collections.abc import Awaitable, Callable
 
 import litellm
 
-from . import artifacts, capsule, registry, runner, synth, voting
+from . import artifacts, capsule, pricing, registry, runner, synth, voting
 from . import attachments as attachments_mod
 from . import calibration as calibration_mod
 from .cost import CostMeter
@@ -103,6 +103,7 @@ def _estimate_synth_cost(synth_alias: str, manifest: list[ManifestEntry]) -> tup
     caller then mirrors fanout's warn-don't-block posture.
     """
     try:
+        pricing.ensure_registered()
         entry = registry.resolve_model(synth_alias)
         litellm_id = entry.get("litellm_id")
         if not litellm_id:
@@ -132,6 +133,7 @@ async def consult(
     rubric: str | None = None,
     attachments: list | None = None,
     dry_run: bool = False,
+    max_output_tokens: int | None = None,
     on_progress: ProgressCallback | None = None,
     gate_synth_at_agreement: float | None = None,
     diverse_stances: bool = True,
@@ -217,6 +219,7 @@ async def consult(
         max_run_usd=max_run_usd,
         on_progress=shift_bucket(on_progress, fanout_offset, overall_total),
         capsule_kind=capsule_kind,
+        max_output_tokens=max_output_tokens,
     )
     if handle.partial or not handle.manifest:
         # Return a real `RunResult` so the partial response has the same shape

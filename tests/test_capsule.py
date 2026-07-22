@@ -588,3 +588,125 @@ async def test_capsule_trim_preserves_sources_footer(monkeypatch):
     await capsule_mod._extract_one(body, "anthropic/claude-haiku-4-5", 30, kind="research")
     assert "TRIMMED" in seen["prompt"], "prose over budget should have been trimmed"
     assert "[1] Tail Source - https://tail.example/source" in seen["prompt"]
+
+
+def test_unwrap_capsule_data_handles_tool_call_envelopes():
+    """LiteLLM's response_format emulation sometimes nests the payload under
+    a wrapper key (`{"parameter": {...}}` observed live from claude-haiku on
+    2026-07-13, review run 20260713-091722-76480). The known-fields filter
+    then silently produced an empty-but-valid capsule. `_unwrap_capsule_data`
+    must descend into known envelope keys, single-key dict wrappers, and
+    nested combinations, but never touch an already-flat payload.
+    """
+    from consult.capsule import _unwrap_capsule_data
+    from consult.types import ReviewCapsule
+
+    finding = {
+        "severity": "blocker",
+        "file": "a.ts",
+        "line_range": [1, 2],
+        "category": "correctness",
+        "summary": "s",
+        "suggestion": "",
+    }
+    flat = {"kind": "review", "findings": [finding], "overall_verdict": "ship"}
+
+    # The exact live shape.
+    assert _unwrap_capsule_data({"parameter": flat}, ReviewCapsule) == flat
+    # Generic single-key wrapper with an unknown name.
+    assert _unwrap_capsule_data({"weird_wrapper": flat}, ReviewCapsule) == flat
+    # Two levels of nesting.
+    assert _unwrap_capsule_data({"parameters": {"input": flat}}, ReviewCapsule) == flat
+    # Flat payloads pass through untouched.
+    assert _unwrap_capsule_data(flat, ReviewCapsule) == flat
+    # Non-dicts and dead ends degrade to {} / stop descending.
+    assert _unwrap_capsule_data(["not", "a", "dict"], ReviewCapsule) == {}
+    assert _unwrap_capsule_data({"parameter": "not a dict"}, ReviewCapsule) == {"parameter": "not a dict"}
+
+
+@pytest.mark.asyncio
+async def test_capsule_extraction_recovers_envelope_wrapped_findings(monkeypatch):
+    """End-to-end through `_extract_one`: an envelope-wrapped extractor reply
+    must still yield the findings (pre-fix this returned an empty capsule and
+    burned the empty-extraction retry on the same wrapped shape).
+    """
+    import json
+
+    import litellm
+
+    from consult import capsule as capsule_mod
+
+    wrapped = {
+        "parameter": {
+            "kind": "review",
+            "findings": [
+                {
+                    "severity": "blocker",
+                    "file": "route.ts",
+                    "line_range": [32, 40],
+                    "category": "correctness",
+                    "summary": "Dedupe before emit strands settled payments.",
+                    "suggestion": "Emit first, record last.",
+                }
+            ],
+            "overall_verdict": "changes_requested",
+            "confidence": 0.8,
+        }
+    }
+
+    async def fake_acompletion(**kwargs):
+        class Resp:
+            class _Choice:
+                class _Msg:
+                    content = json.dumps(wrapped)
+
+                message = _Msg()
+                finish_reason = "stop"
+
+            choices = [_Choice()]
+            usage = None
+
+        return Resp()
+
+    monkeypatch.setattr(litellm, "acompletion", fake_acompletion)
+    monkeypatch.setattr(litellm, "completion_cost", lambda **kwargs: 0.0)
+
+    cap, _cost, _known = await capsule_mod._extract_one(
+        "## CRITICAL\n\n### C1. Dedupe-before-emit\nFix: emit first.\n\nCONFIDENCE: 0.8",
+        extractor_id="anthropic/claude-haiku-test",
+        timeout=30,
+        kind="review",
+    )
+    assert len(cap.findings) == 1
+    assert cap.findings[0].severity == "blocker"
+    assert cap.overall_verdict == "changes_requested"
+
+
+def test_salvage_review_findings_coerces_and_drops_per_finding():
+    """One off-enum finding must not empty the whole capsule (2026-07-13 run
+    20260713-095511-17732: a single `category: "architecture"` finding nuked a
+    six-finding gemini capsule via the all-or-nothing Pydantic build). Common
+    severity/category aliases coerce, string line ranges parse, hopeless
+    entries drop individually, and the verdict normalises.
+    """
+    from consult.capsule import _salvage_review_findings
+    from consult.types import ReviewCapsule
+
+    data = {
+        "kind": "review",
+        "overall_verdict": "CHANGES-REQUESTED",
+        "findings": [
+            {"severity": "critical", "category": "architecture", "summary": "a", "line_range": "80-92"},
+            {"severity": "blocker", "category": "compliance", "summary": "b"},
+            {"severity": "not-a-severity", "category": "correctness", "summary": "c"},
+            "not even a dict",
+        ],
+    }
+    out = _salvage_review_findings(data, ReviewCapsule)
+    cap = ReviewCapsule(**{k: v for k, v in out.items() if k in ReviewCapsule.model_fields})
+    assert cap.overall_verdict == "changes_requested"
+    assert len(cap.findings) == 2
+    assert cap.findings[0].severity == "blocker"
+    assert cap.findings[0].category == "maintainability"
+    assert cap.findings[0].line_range == (80, 92)
+    assert cap.findings[1].category == "correctness"

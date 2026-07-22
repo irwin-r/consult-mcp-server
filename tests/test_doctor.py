@@ -135,3 +135,37 @@ def test_check_pricing_all_priced_passes(monkeypatch):
     lines, fails = doctor._check_pricing()
     assert fails == 0
     assert any("priced: 1/1" in line for line in lines)
+
+
+async def test_ping_output_limit_error_counts_as_success(isolated_env, monkeypatch):
+    """A reasoning model can burn the 1-token grant thinking and return an
+    output-limit error. The provider authenticated and routed, which is all
+    the ping asks — this must not read as a failed key.
+    """
+    import litellm
+
+    monkeypatch.setenv("OPENAI_API_KEY", "k")
+
+    async def boom(**kwargs):
+        raise Exception(
+            "BadRequestError: Could not finish the message because max_tokens "
+            "or model output limit was reached."
+        )
+
+    monkeypatch.setattr(litellm, "acompletion", boom)
+    ok, msg = await doctor._ping_provider("OPENAI_API_KEY", "gpt-nano")
+    assert ok
+    assert "output-capped" in msg
+
+
+async def test_ping_auth_error_still_fails(isolated_env, monkeypatch):
+    import litellm
+
+    monkeypatch.setenv("OPENAI_API_KEY", "k")
+
+    async def boom(**kwargs):
+        raise Exception("AuthenticationError: invalid api key")
+
+    monkeypatch.setattr(litellm, "acompletion", boom)
+    ok, msg = await doctor._ping_provider("OPENAI_API_KEY", "gpt-nano")
+    assert not ok

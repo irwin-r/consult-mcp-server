@@ -23,13 +23,16 @@ from . import registry
 
 # Built-in deny list. Substrings, case-insensitive, matched against the
 # resolved LiteLLM ID. `gemini` covers `gemini/gemini-...` and
-# `openrouter/google/gemini-...`. `claude-opus-4-7` covers the specific
-# Anthropic model that started rejecting temperature; `claude-opus-5`
-# is included pre-emptively for the next bump.
+# `openrouter/google/gemini-...`. Anthropic removed sampling params from
+# Opus 4.7 onward; Sonnet 5 and Fable 5 reject non-default values too.
+# Sonnet 4.6 and earlier still accept temperature, so those patterns
+# must stay version-specific.
 _DEFAULT_NO_TEMPERATURE = (
     "gemini",
     "claude-opus-4-7",
-    "claude-opus-5",
+    "claude-opus-4-8",
+    "claude-sonnet-5",
+    "claude-fable",
     # GPT-5 reasoning models reject temperature when reasoning_effort is set
     "gpt-5",
 )

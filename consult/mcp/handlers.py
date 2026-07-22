@@ -15,14 +15,17 @@ without going through this adapter.
 from __future__ import annotations
 
 import asyncio
+import difflib
 import logging
 from collections.abc import Awaitable, Callable
 from typing import Any
 
 from .. import (
+    artifacts,
     attachments,
     capsule,
     orchestrate,
+    registry,
     runner,
     synth,
 )
@@ -30,8 +33,12 @@ from .. import (
     refine as refine_mod,
 )
 from .. import (
+    research as research_mod,
+)
+from .. import (
     sequence as sequence_mod,
 )
+from ..exceptions import UnknownModelError
 from ..progress import ProgressEvent
 from ..types import ModelSpec
 
@@ -42,6 +49,61 @@ ProgressCallback = Callable[[ProgressEvent], Awaitable[None]]
 
 def _specs_from_args(models_arg: list[dict[str, Any]]) -> list[ModelSpec]:
     return [ModelSpec(**m) for m in models_arg]
+
+
+def _validate_specs(specs: list[ModelSpec]) -> None:
+    """Fail the request BEFORE any provider call when a panellist alias
+    resolves nowhere.
+
+    Without this, an unknown alias only surfaces when its own panellist
+    task runs — the rest of the panel still fans out, so a typo'd model
+    burns a full run's latency and spend to report one bad string
+    (FRICTION 2026-07-13: `opus-4.7` alongside two raw-ID near-misses
+    produced a three-minute zero-usable-panellist round). Raw LiteLLM IDs
+    still pass through: `resolve_model` accepts them by design.
+    """
+    unknown: list[str] = []
+    for spec in specs:
+        try:
+            registry.resolve_model(spec.model)
+        except KeyError:
+            unknown.append(spec.model)
+    if not unknown:
+        return
+    cfg = registry.models_config()
+    aliases = sorted(cfg.get("models", {}))
+    tiers = sorted(cfg.get("tiers", {}))
+    described: list[str] = []
+    for name in unknown:
+        hints = difflib.get_close_matches(name, aliases, n=3, cutoff=0.5)
+        suffix = f" (closest: {', '.join(hints)})" if hints else ""
+        described.append(f"{name!r}{suffix}")
+    raise UnknownModelError(
+        f"unknown model alias(es): {'; '.join(described)}. "
+        f"Registry aliases: {', '.join(aliases)}. "
+        f"Tiers (pass as `tier` instead of `models`): {', '.join(tiers)}. "
+        "Raw LiteLLM IDs with a provider prefix (e.g. 'openrouter/x-ai/grok-4.3') "
+        "are also accepted."
+    )
+
+
+def _panel_specs(args: dict[str, Any]) -> list[ModelSpec]:
+    """Resolve the panel from `models` (explicit list) or `tier` (registry
+    tier name), validating every alias up front.
+
+    `models` wins when both are present — an explicit list is more specific
+    than a tier name, and silently unioning them would make panel size
+    surprising. Neither present is a caller error.
+    """
+    models_arg = args.get("models")
+    if models_arg:
+        specs = _specs_from_args(models_arg)
+    elif args.get("tier"):
+        specs = [ModelSpec(model=alias) for alias in registry.resolve_tier(args["tier"])]
+    else:
+        raise ValueError("provide `models` (explicit panellist list) or `tier` (registry tier name)")
+    _validate_specs(specs)
+    return specs
 
 
 # Statuses that mean the panellist produced a usable body even if the capsule
@@ -144,6 +206,17 @@ def _summarise_manifest(manifest: list[dict[str, Any]], *, cost_usd: float | Non
     }
     if cost_usd is not None:
         summary["cost_per_usable_capsule"] = round(cost_usd / usable, 4) if usable > 0 else None
+    # Truncation is actionable, not just reportable: when any panellist hit
+    # the output cap, tell the agent reading this result which knob fixes it
+    # (2026-07-13: a long-form prompt truncated 4 of 9 panellists and the
+    # only clue was per-entry finish_reasons).
+    truncated_n = status_counts.get("TRUNCATED", 0)
+    if truncated_n:
+        summary["truncation_advice"] = (
+            f"{truncated_n} panellist(s) hit their output-token cap; responses "
+            "were auto-continued where possible. For long-form deliverables, "
+            "pass max_output_tokens to grant more room up front."
+        )
     return summary
 
 
@@ -193,7 +266,7 @@ async def _augment_result(result: dict[str, Any]) -> dict[str, Any]:
 
 async def panel(args: dict[str, Any], *, on_progress: ProgressCallback | None = None) -> dict[str, Any]:
     prompt = attachments.inline_attachments(args["prompt"], args.get("attachments"))
-    specs = _specs_from_args(args["models"])
+    specs = _panel_specs(args)
     kind = args.get("capsule_kind", "decision")
     handle = await runner.fanout(
         prompt,
@@ -203,6 +276,7 @@ async def panel(args: dict[str, Any], *, on_progress: ProgressCallback | None = 
         max_run_usd=args.get("max_run_usd"),
         on_progress=on_progress,
         capsule_kind=kind,
+        max_output_tokens=args.get("max_output_tokens"),
     )
     if args.get("extract_capsules", True) and not handle.partial and handle.manifest:
         handle = await capsule.annotate(handle, on_progress=on_progress, kind=kind)
@@ -306,6 +380,7 @@ async def consult(args: dict[str, Any], *, on_progress: ProgressCallback | None 
         rubric=args.get("rubric"),
         attachments=args.get("attachments"),
         dry_run=args.get("dry_run", False),
+        max_output_tokens=args.get("max_output_tokens"),
         gate_synth_at_agreement=args.get("gate_synth_at_agreement"),
         diverse_stances=args.get("diverse_stances", True),
         on_progress=on_progress,
@@ -331,6 +406,7 @@ async def sequence(args: dict[str, Any], *, on_progress: ProgressCallback | None
             effective_atts = step_atts if step_atts is not None else default_attachments
             prompts.append(attachments.inline_attachments(item["prompt"], effective_atts))
     specs = _specs_from_args(args["models"])
+    _validate_specs(specs)
     result = await sequence_mod.sequence(
         prompts,
         specs,
@@ -340,6 +416,7 @@ async def sequence(args: dict[str, Any], *, on_progress: ProgressCallback | None
         dry_run=args.get("dry_run", False),
         capsule_kind=args.get("capsule_kind", "decision"),
         rubric=args.get("rubric"),
+        max_output_tokens=args.get("max_output_tokens"),
         on_progress=on_progress,
     )
     payload = result.model_dump()
@@ -347,9 +424,69 @@ async def sequence(args: dict[str, Any], *, on_progress: ProgressCallback | None
     return payload if args.get("dry_run", False) else await _augment_result(payload)
 
 
+def _research_summary(result: Any) -> str:
+    """Deterministic executive summary for the inline payload — no extra
+    model call. The full dossier stays behind `dossier_uri` so a long run
+    doesn't bloat the calling agent's context (the product's whole point).
+    """
+    lines = [
+        f"Research stopped: {result.stop_reason or 'unknown'} after "
+        f"{result.rounds_completed} round(s); converged={result.converged}."
+    ]
+    if result.brief is not None:
+        if result.brief.assumptions:
+            lines.append("Assumptions: " + "; ".join(result.brief.assumptions))
+        last = result.verdicts[-1] if result.verdicts else None
+        for section in result.brief.sections:
+            status = (last.section_status.get(section.id) if last else None) or "missing"
+            lines.append(f"- {section.title} [{section.id}]: {status}")
+    if result.open_gaps:
+        lines.append("Open gaps: " + "; ".join(f"[{g.id}] {g.text}" for g in result.open_gaps))
+    prefix = "" if result.cost_known else "≥"
+    lines.append(f"Cost: {prefix}${result.cost_usd:.2f}. Full dossier: read the dossier_uri resource.")
+    return "\n".join(lines)
+
+
+async def research(args: dict[str, Any], *, on_progress: ProgressCallback | None = None) -> dict[str, Any]:
+    prompt = attachments.inline_attachments(args["prompt"], args.get("attachments"))
+    # Presence-sensitive cap: an ABSENT max_run_usd takes the engine default;
+    # an explicit JSON null arrives as None and means uncapped. `args.get`
+    # with a default would collapse the two.
+    cap_kwargs: dict[str, Any] = {}
+    if "max_run_usd" in args:
+        cap_kwargs["max_run_usd"] = args["max_run_usd"]
+    result = await research_mod.research(
+        prompt,
+        tier=args.get("tier", "standard"),
+        director=args.get("director"),
+        max_rounds=args.get("max_rounds", 6),
+        max_output_tokens=args.get("max_output_tokens"),
+        on_progress=on_progress,
+        **cap_kwargs,
+    )
+    # The dossier is the one deliberately-large field; it ships as a
+    # resource, not inline. Everything else in the result is capsule-sized.
+    payload = result.model_dump(exclude={"dossier"})
+    payload["dossier_uri"] = f"consult://runs/{result.run_id}/dossier/dossier.md"
+    payload["dossier_chars"] = len(result.dossier)
+    payload["summary"] = _research_summary(result)
+    # Best-effort observability pointers (parity with _augment_result; the
+    # panel-manifest summary and viewer render don't apply to a research
+    # run until the viewer learns the shape in issue #92 PR 6).
+    try:
+        root = artifacts.load_run(result.run_id).root
+        for filename, key in (("_progress.log", "progress_log"), ("journal.jsonl", "journal_path")):
+            path = root / filename
+            if path.exists():
+                payload[key] = str(path)
+    except Exception as e:  # noqa: BLE001 — pointers must never sink the result
+        logger.warning("research observability pointers failed for %s: %s", result.run_id, e)
+    return payload
+
+
 async def refine(args: dict[str, Any], *, on_progress: ProgressCallback | None = None) -> dict[str, Any]:
     prompt = attachments.inline_attachments(args["prompt"], args.get("attachments"))
-    specs = _specs_from_args(args["models"])
+    specs = _panel_specs(args)
     result = await refine_mod.refine(
         prompt,
         specs,
@@ -367,6 +504,7 @@ async def refine(args: dict[str, Any], *, on_progress: ProgressCallback | None =
         # silently defaulting back to "decision".
         capsule_kind=args.get("capsule_kind"),
         strategy=args.get("strategy", "default"),
+        max_output_tokens=args.get("max_output_tokens"),
         on_progress=on_progress,
     )
     payload = result.model_dump()

@@ -25,9 +25,8 @@ import litellm
 
 from consult import runner as _facade
 
-from .. import artifacts, citations, context, registry, telemetry
+from .. import artifacts, citations, context, pricing, registry, telemetry
 from .. import attachments as attachments_mod
-from ..capsule import MAX_TOKENS_BY_KIND
 from ..envutil import env_float
 from ..progress import (
     Heartbeat,
@@ -43,18 +42,37 @@ from ..redact import redact_exc, redact_traceback, scrub_exception_attrs
 from ..status import classify
 from ..types import ManifestEntry, ModelSpec, RunHandle, Status
 from .fit import _fit_prompt_to_context, concat_turn_text
-from .specs import _build_per_slug_prompt, _make_slugs, expand_specs
+from .specs import _build_per_slug_prompt, _make_slugs, expand_specs, output_budget
 from .transport import (
     _acompletion_with_retry,
     _aresponses_as_completion,
     _format_error_message,
     _get_provider_sems,
     _stream_acompletion,
+    apply_web_search,
     build_messages,
     configure_litellm,
 )
 
 logger = logging.getLogger(__name__)
+
+
+# Sent as the follow-up user turn when a panellist's response was cut by the
+# output cap. The model sees its own partial answer as the preceding
+# assistant turn, so "continue from where it stopped" is well-defined.
+_CONTINUATION_NUDGE = (
+    "Your previous message was cut off by an output-length limit. Continue "
+    "it from EXACTLY where it stopped — do not repeat anything you already "
+    "wrote, do not add a preamble or an apology, resume mid-sentence if "
+    "necessary. If the instructions asked for a CONFIDENCE/KEY_REASON "
+    "footer, make sure your continuation ends with it."
+)
+
+
+def _join_notes(*notes: str | None) -> str | None:
+    """Merge optional manifest-note fragments, dropping Nones."""
+    joined = "; ".join(n for n in notes if n)
+    return joined or None
 
 
 async def _write_text_async(path: Path, content: str) -> None:
@@ -76,8 +94,11 @@ async def _call_one(
     *,
     stream: bool = False,
     on_partial: Callable[[int, int], Awaitable[None]] | None = None,
+    on_activity: Callable[[], None] | None = None,
     prior_turns: list[dict[str, Any]] | None = None,
     capsule_kind: str = "decision",
+    max_output_tokens: int | None = None,
+    web_search: bool = False,
 ) -> ManifestEntry:
     # An unknown alias must fail this single panellist, not the whole panel.
     # `asyncio.gather` without return_exceptions=True would otherwise cancel
@@ -111,20 +132,13 @@ async def _call_one(
     # Use `litellm_id` when present, otherwise fall back to the spec's
     # alias for logging/diagnostics so error messages stay attributable.
     litellm_id = entry.get("litellm_id") or spec.model
-    # Output budget: the larger of the per-kind cap (what the TASK needs —
-    # a review must fit ~20-30 findings whether haiku or opus writes it)
-    # and the model's own default_budget_tokens (what the MODEL needs —
-    # reasoning models burn thousands of completion tokens before any text
-    # lands, and verbose flagships stop naturally past the decision cap).
-    # Issue #55: the kind cap alone bound below reasoning burn, so e.g.
-    # gpt-pro spent its whole 2000/4000-token budget thinking and returned
-    # zero text. Same max(model, floor) idiom as the synthesiser
-    # (synth.py / orchestrate.py); estimate_cost mirrors it so the
-    # max_run_usd gate prices the same ceiling actually granted here.
-    budget = max(
-        MAX_TOKENS_BY_KIND.get(capsule_kind, MAX_TOKENS_BY_KIND["decision"]),
-        entry.get("default_budget_tokens", 0),
-    )
+    # Output budget: kind cap vs model default vs caller override — see
+    # `output_budget` for the reasoning behind each dimension. Issue #55:
+    # the kind cap alone bound below reasoning burn, so e.g. gpt-pro spent
+    # its whole 2000/4000-token budget thinking and returned zero text.
+    # estimate_cost shares the derivation so the max_run_usd gate prices
+    # the same ceiling actually granted here.
+    budget = output_budget(entry, capsule_kind, max_output_tokens)
     timeout = entry.get("default_timeout_s", 180)
     provider = entry.get("provider", "")
     # mode=responses models (e.g. gpt-pro, gpt-codex) use the OpenAI Responses
@@ -134,6 +148,14 @@ async def _call_one(
     extra: dict[str, Any] = {}
     if "reasoning_effort" in entry:
         extra["reasoning_effort"] = entry["reasoning_effort"]
+    # Provider-native web search, requested per call and honoured only for
+    # `supports_web` entries. Silent no-op (debug log) otherwise, so a
+    # mixed panel with one web-capable model doesn't fail the rest.
+    if web_search:
+        if entry.get("supports_web"):
+            apply_web_search(extra, entry)
+        else:
+            logger.debug("web_search requested but %s lacks supports_web; ignoring", litellm_id)
 
     await _write_text_async(paths.prompt_for(slug), per_slug_prompt)
     start = time.time()
@@ -215,47 +237,194 @@ async def _call_one(
         "app.consult.slug": slug,
         "app.consult.run_id": paths.run_id,
     }
+
+    def _accrue_usage_and_cost(resp: Any) -> None:
+        """Fold one response's tokens + spend into the entry's running
+        totals. Every billable call on this panellist (empty-truncation
+        retry, truncation continuation) is a real provider charge; the
+        manifest reports the sum, not the last attempt.
+        """
+        nonlocal tokens_in, tokens_out, cost, cost_known
+        usage = getattr(resp, "usage", None)
+        attempt_in = getattr(usage, "prompt_tokens", None) if usage else None
+        attempt_out = getattr(usage, "completion_tokens", None) if usage else None
+        if attempt_in is not None:
+            tokens_in = (tokens_in or 0) + attempt_in
+        if attempt_out is not None:
+            tokens_out = (tokens_out or 0) + attempt_out
+        if is_responses:
+            # The Responses adapter returns a synthetic chat-shaped object
+            # that `completion_cost` can't price; compute from token counts.
+            try:
+                pc, cc = litellm.cost_per_token(
+                    model=litellm_id,
+                    prompt_tokens=attempt_in or 0,
+                    completion_tokens=attempt_out or 0,
+                )
+                cost = (cost or 0.0) + float(pc or 0.0) + float(cc or 0.0)
+            except Exception as ce:  # noqa: BLE001
+                logger.warning("responses cost lookup failed for %s: %s", litellm_id, redact_exc(ce))
+                cost_known = False
+        else:
+            try:
+                attempt_cost = litellm.completion_cost(completion_response=resp)
+                if attempt_cost is None:
+                    cost_known = False
+                else:
+                    cost = (cost or 0.0) + float(attempt_cost)
+            except Exception as ce:  # noqa: BLE001
+                logger.warning("cost lookup failed for %s: %s", litellm_id, redact_exc(ce))
+                cost_known = False
+
+    retry_note: str | None = None
     with telemetry.span(otel_span_name, attributes=otel_attrs) as tspan:
         try:
-            async with sem if sem is not None else nullcontext():
-                messages = build_messages(per_slug_prompt, provider, prior_turns)
-                if is_responses:
-                    # Responses-API models 404 on chat completions; route them
-                    # through the adapter. No streaming on this path.
-                    resp = await _aresponses_as_completion(
-                        timeout=timeout,
-                        model=litellm_id,
-                        messages=messages,
-                        max_completion_tokens=budget,
-                        **extra,
-                    )
-                elif stream:
-                    resp = await _stream_acompletion(
-                        timeout=timeout,
-                        on_partial=on_partial,
-                        start=start,
-                        model=litellm_id,
-                        messages=messages,
-                        max_completion_tokens=budget,
-                        **extra,
-                    )
-                else:
-                    resp = await _acompletion_with_retry(
-                        timeout=timeout,
-                        model=litellm_id,
-                        messages=messages,
-                        max_completion_tokens=budget,
-                        **extra,
-                    )
-            # Persist raw response — use model_dump for Pydantic, fall
-            # back to dict
-            try:
-                raw = resp.model_dump()  # type: ignore[attr-defined]
-            except AttributeError:
-                raw = dict(resp) if hasattr(resp, "__iter__") else {"_repr": repr(resp)}
-            await _write_text_async(paths.response_raw(slug), json.dumps(raw, indent=2, default=str))
+            # Empty-truncation retry (FRICTION 2026-07-13): a reasoning model
+            # can burn the entire output grant thinking and come back
+            # finish_reason=length with a zero-byte body — billed, counted as
+            # a panellist, zero value (run 20260713-050837: gpt spent 12k
+            # output tokens for an empty response). One retry with a doubled
+            # budget converts most of those into usable answers; both
+            # attempts' spend is accumulated.
+            for attempt in (1, 2):
+                async with sem if sem is not None else nullcontext():
+                    messages = build_messages(per_slug_prompt, provider, prior_turns)
+                    if is_responses:
+                        # Responses-API models 404 on chat completions; route them
+                        # through the adapter. No streaming on this path.
+                        resp = await _aresponses_as_completion(
+                            timeout=timeout,
+                            model=litellm_id,
+                            messages=messages,
+                            max_completion_tokens=budget,
+                            **extra,
+                        )
+                    elif stream:
+                        resp = await _stream_acompletion(
+                            timeout=timeout,
+                            on_partial=on_partial,
+                            start=start,
+                            model=litellm_id,
+                            messages=messages,
+                            max_completion_tokens=budget,
+                            **extra,
+                        )
+                    else:
+                        resp = await _acompletion_with_retry(
+                            timeout=timeout,
+                            model=litellm_id,
+                            messages=messages,
+                            max_completion_tokens=budget,
+                            **extra,
+                        )
+                # Persist raw response — use model_dump for Pydantic, fall
+                # back to dict
+                try:
+                    raw = resp.model_dump()  # type: ignore[attr-defined]
+                except AttributeError:
+                    raw = dict(resp) if hasattr(resp, "__iter__") else {"_repr": repr(resp)}
+                await _write_text_async(paths.response_raw(slug), json.dumps(raw, indent=2, default=str))
 
-            status, finish, body = classify(resp)
+                status, finish, body = classify(resp)
+                # Tokens and cost accumulate PER ATTEMPT: the empty first
+                # attempt is billed just like the retry that replaces it.
+                _accrue_usage_and_cost(resp)
+
+                if attempt == 1 and status is Status.TRUNCATED and not body.strip():
+                    budget *= 2
+                    retry_note = (
+                        f"empty body at finish_reason={finish} with a "
+                        f"{budget // 2}-token grant (reasoning burn); "
+                        f"retried once at {budget}"
+                    )
+                    logger.warning("panellist %s: %s", slug, retry_note)
+                    if on_activity is not None:
+                        # The retry is a fresh provider call; tell the
+                        # slow-tail dropout this panellist is working, not hung.
+                        on_activity()
+                    continue
+                break
+
+            # Truncation continuation (FRICTION 2026-07-13): a panellist that
+            # hit finish_reason=length mid-document used to lose its tail —
+            # 4 of 9 panellists truncated writing a build spec, and the
+            # capsule extractor had to mine incomplete bodies. One follow-up
+            # call hands the model its own partial output as an assistant
+            # turn and asks it to carry on from the cut; the stitched body
+            # is what downstream consumers see. Bounded to a single
+            # continuation; disable with CONSULT_CONTINUE_ON_TRUNCATION=0.
+            if (
+                status is Status.TRUNCATED
+                and body.strip()
+                and os.environ.get("CONSULT_CONTINUE_ON_TRUNCATION", "1") == "1"
+            ):
+                if on_activity is not None:
+                    # Closes the FRICTION gap where a panellist mid-continuation
+                    # could still be dropped by the slow-tail policy.
+                    on_activity()
+                cont_messages = [
+                    *messages,
+                    {"role": "assistant", "content": body},
+                    {"role": "user", "content": _CONTINUATION_NUDGE},
+                ]
+                cont = None
+                try:
+                    async with sem if sem is not None else nullcontext():
+                        if is_responses:
+                            cont = await _aresponses_as_completion(
+                                timeout=timeout,
+                                model=litellm_id,
+                                messages=cont_messages,
+                                max_completion_tokens=budget,
+                                **extra,
+                            )
+                        else:
+                            # Non-streamed even when the first call streamed:
+                            # the partial-progress callback already saw the
+                            # first body, and a second stream adds machinery
+                            # for no user-visible gain.
+                            cont = await _acompletion_with_retry(
+                                timeout=timeout,
+                                model=litellm_id,
+                                messages=cont_messages,
+                                max_completion_tokens=budget,
+                                **extra,
+                            )
+                except Exception as ce:  # noqa: BLE001
+                    # Keep the truncated body — a failed continuation must not
+                    # downgrade a partial answer to nothing. The provider may
+                    # have billed the attempt.
+                    logger.warning("continuation failed for %s: %s", slug, redact_exc(ce))
+                    cost_known = False
+                    retry_note = _join_notes(retry_note, "truncation continuation failed; body kept as-is")
+                if cont is not None:
+                    _accrue_usage_and_cost(cont)
+                    try:
+                        cont_raw = cont.model_dump()  # type: ignore[attr-defined]
+                    except AttributeError:
+                        cont_raw = {"_repr": repr(cont)}
+                    await _write_text_async(
+                        paths.responses / f"{slug}.continuation.json",
+                        json.dumps(cont_raw, indent=2, default=str),
+                    )
+                    cont_status, cont_finish, cont_body = classify(cont)
+                    if cont_body.strip():
+                        body = body + cont_body
+                        finish = cont_finish
+                        if cont_status is Status.OK:
+                            status = Status.OK
+                            retry_note = _join_notes(retry_note, "continued once after output-cap truncation")
+                        else:
+                            retry_note = _join_notes(
+                                retry_note,
+                                "continued once after output-cap truncation; "
+                                "continuation itself also truncated",
+                            )
+                    else:
+                        retry_note = _join_notes(
+                            retry_note, "truncation continuation returned no content; body kept as-is"
+                        )
+
             # Web-grounded panellists (sonar) cite sources as [n] markers
             # whose URL list lives in response metadata, not the content.
             # Fold it into the body here — the one choke point every
@@ -264,33 +433,6 @@ async def _call_one(
             # models can't strip the provider-extra fields.
             if body:
                 body = citations.append_sources_footer(body, citations.harvest(raw))
-            usage = getattr(resp, "usage", None)
-            if usage:
-                tokens_in = getattr(usage, "prompt_tokens", None)
-                tokens_out = getattr(usage, "completion_tokens", None)
-            if is_responses:
-                # The Responses adapter returns a synthetic chat-shaped object
-                # that `completion_cost` can't price; compute from token counts.
-                try:
-                    pc, cc = litellm.cost_per_token(
-                        model=litellm_id,
-                        prompt_tokens=tokens_in or 0,
-                        completion_tokens=tokens_out or 0,
-                    )
-                    cost = float(pc or 0.0) + float(cc or 0.0)
-                    cost_known = True
-                except Exception as ce:  # noqa: BLE001
-                    logger.warning("responses cost lookup failed for %s: %s", litellm_id, redact_exc(ce))
-                    cost = None
-                    cost_known = False
-            else:
-                try:
-                    cost = litellm.completion_cost(completion_response=resp)
-                    cost_known = cost is not None
-                except Exception as ce:  # noqa: BLE001
-                    logger.warning("cost lookup failed for %s: %s", litellm_id, redact_exc(ce))
-                    cost = None
-                    cost_known = False
             # Populate the OTel span with per-call telemetry (tokens /
             # cost / finish_reason). No-op when the span is None.
             if tokens_in is not None:
@@ -367,10 +509,11 @@ async def _call_one(
     if status in (Status.ERROR, Status.TIMEOUT) and not error:
         error = f"{status.value}: no provider exception captured"
 
-    # Trim note goes to `note` (info annotation on a successful call),
+    # Trim/retry notes go to `note` (info annotation on a successful call),
     # NOT `error` (failure reason). Conflating them made the viewer render
     # the trim message in red error styling on a green-OK card, which read
     # like a contradiction.
+    note = _join_notes(trim_note, retry_note)
     return ManifestEntry(
         slug=slug,
         model_id=litellm_id,
@@ -385,7 +528,7 @@ async def _call_one(
         cost_usd=cost,
         cost_known=cost_known,
         error=error,
-        note=trim_note,
+        note=note,
         confidence=None,  # populated by capsule extractor
         capsule=None,
     )
@@ -447,6 +590,8 @@ async def _gather_with_tail_dropout(
     paths: artifacts.RunPaths,
     start: float,
     safe_notify: Callable[[ProgressEvent], Awaitable[None]],
+    task_activity: dict[str, float] | None = None,
+    activity_window_s: float = 0.0,
     tail_dropout_s: float,
     tail_k_frac: float,
 ) -> list[ManifestEntry]:
@@ -498,6 +643,29 @@ async def _gather_with_tail_dropout(
                 len(pending),
             )
             done_set, pending = await asyncio.wait(pending, timeout=tail_dropout_s)
+            completed_tasks.update(done_set)
+
+        # Progress-aware extension: while any straggler shows a REAL sign of
+        # life within the window (stream chunk, retry/continuation call
+        # starting — task start never counts), keep waiting in short slices
+        # instead of cancelling a working panellist. Stragglers with no
+        # signals fall straight through, so non-streaming panels behave
+        # exactly as before. Per-spec timeouts bound every task, so this
+        # loop always terminates.
+        while pending and activity_window_s > 0 and task_activity is not None:
+            now = time.monotonic()
+            fresh = [
+                t
+                for t in pending
+                if now - task_activity.get(task_meta[t][0], float("-inf")) < activity_window_s
+            ]
+            if not fresh:
+                break
+            logger.info(
+                "slow-tail dropout: extending for %d active straggler(s)",
+                len(fresh),
+            )
+            done_set, pending = await asyncio.wait(pending, timeout=min(activity_window_s, 15.0))
             completed_tasks.update(done_set)
 
         drop_entries: dict[asyncio.Task[ManifestEntry], ManifestEntry] = {}
@@ -606,10 +774,16 @@ async def fanout(
     prior_turns: list[dict[str, Any]] | None = None,
     prior_turns_by_slug: dict[str, list[dict[str, Any]]] | None = None,
     max_concurrency: int | None = None,
+    max_output_tokens: int | None = None,
+    web_search: bool = False,
 ) -> RunHandle:
     """Parallel fan-out. Creates a fresh run by default. Pass `existing_paths`
     to write into an existing run dir (used by `refine` to keep all rounds
     under one run_id with round-suffixed slugs).
+
+    Registers any models.json `pricing` blocks with LiteLLM up front so
+    per-panellist cost accounting (`completion_cost` / `cost_per_token`
+    below) can price models newer than the shipped tables.
 
     `prior_turns`, when set, is a sequence of `{role, content}` dicts
     prepended to the messages array for every panellist call. Used by
@@ -625,6 +799,11 @@ async def fanout(
     Anthropic's prompt cache can reuse across rounds, instead of the
     monolithic refinement prompt that changes every round.
 
+    `web_search=True` requests provider-native web search for every
+    panellist whose registry entry carries `supports_web`; other
+    panellists run unchanged. Search fees are provider-billed on top of
+    tokens and are not part of `estimate_cost` (estimates stay floors).
+
     `max_concurrency` (or `CONSULT_MAX_CONCURRENCY` env var) caps the
     *total* number of panellists in flight at once. The existing
     per-provider semaphores in `_get_provider_sems()` cap concurrency
@@ -638,6 +817,7 @@ async def fanout(
     with `(done, total, message)`. Failures inside the callback are logged
     and swallowed — progress is best-effort, not load-bearing.
     """
+    pricing.ensure_registered()
     # Resolve `model:N` sugar BEFORE estimate_cost so the cap reflects the
     # real panel size, not the pre-expansion request count.
     specs = expand_specs(specs)
@@ -698,7 +878,13 @@ async def fanout(
     cost_input = prompt
     if prior_turns:
         cost_input = concat_turn_text(prior_turns) + "\n" + prompt
-    estimate, all_known = await _facade.aestimate_cost(specs, cost_input, capsule_kind=capsule_kind)
+    # `max_output_tokens` is forwarded conditionally so existing test
+    # monkeypatches of `estimate_cost` (plain lambdas without the kwarg)
+    # keep working when the override isn't in play.
+    est_kwargs: dict[str, Any] = {"capsule_kind": capsule_kind}
+    if max_output_tokens is not None:
+        est_kwargs["max_output_tokens"] = max_output_tokens
+    estimate, all_known = await _facade.aestimate_cost(specs, cost_input, **est_kwargs)
     cap = max_run_usd if max_run_usd is not None else registry.default_max_run_usd()
 
     # Don't clobber an existing manifest with the empty-manifest early-return
@@ -748,7 +934,7 @@ async def fanout(
         drivers_note = ""
         try:
             drivers = await asyncio.to_thread(
-                _facade.estimate_drivers, specs, cost_input, capsule_kind=capsule_kind
+                lambda: _facade.estimate_drivers(specs, cost_input, **est_kwargs)
             )
             if drivers:
                 named = ", ".join(f"{m} ~${c:.2f}" for m, c in drivers)
@@ -875,6 +1061,11 @@ async def fanout(
 
         heartbeat_task = asyncio.create_task(_heartbeat_loop())
 
+    # slug → monotonic timestamp of the last REAL sign of life (stream chunk,
+    # retry or continuation call starting). Read by the slow-tail dropout to
+    # tell working stragglers from hung ones.
+    task_activity: dict[str, float] = {}
+
     async def _run_one(spec: ModelSpec, slug: str, per_prompt: str) -> ManifestEntry:
         # Acquire the global fanout slot BEFORE emitting PanellistStarted so
         # the started_count reflects "doing real work", not "queued". The
@@ -897,11 +1088,17 @@ async def fanout(
             # When streaming is enabled, wire each panellist's mid-stream chunk
             # callback to emit `PanellistPartial` events. Throttled to
             # ~1 chunk/sec by `_STREAM_PARTIAL_INTERVAL_S` so the progress
-            # channel doesn't drown in micro-updates.
+            # channel doesn't drown in micro-updates. The callback ALWAYS
+            # records slow-tail activity (task_activity feeds the
+            # progress-aware dropout); the progress event is emitted only
+            # when a listener is attached.
             on_partial: Callable[[int, int], Awaitable[None]] | None = None
-            if stream and on_progress is not None:
+            if stream:
 
                 async def _emit_partial(chars: int, elapsed_ms: int) -> None:
+                    task_activity[slug] = time.monotonic()
+                    if on_progress is None:
+                        return
                     await _safe_notify(
                         PanellistPartial(
                             done=state.done,
@@ -913,6 +1110,13 @@ async def fanout(
                     )
 
                 on_partial = _emit_partial
+
+            def _record_activity() -> None:
+                # Real signs of life only (stream chunks, retry/continuation
+                # calls starting) — never task start, or every straggler
+                # would earn a free extension window.
+                task_activity[slug] = time.monotonic()
+
             # Per-slug history takes precedence when set (refine round-2+
             # passes each panellist its own conversation). Falls back to
             # the global `prior_turns` (set by `_apply_continuation` for
@@ -930,8 +1134,11 @@ async def fanout(
                 provider_sems,
                 stream=stream,
                 on_partial=on_partial,
+                on_activity=_record_activity,
                 prior_turns=pt,
                 capsule_kind=capsule_kind,
+                max_output_tokens=max_output_tokens,
+                web_search=web_search,
             )
             state.record_completed(entry)
             await _safe_notify(
@@ -945,12 +1152,22 @@ async def fanout(
             )
             return entry
 
-    # Slow-tail dropout knobs (see `_gather_with_tail_dropout`). Default 180s:
+    # Slow-tail dropout knobs (see `_gather_with_tail_dropout`). Default 300s:
     # long-context reviews produce useful capsules from slower models (kimi,
     # qwen, deepseek often take 60-180s on ~200K input), so the prior 30s was
-    # dropping real signal on wide panels.
-    tail_dropout_s = env_float("CONSULT_TAIL_DROPOUT_S", 180.0)
+    # dropping real signal on wide panels. 180s still cancelled kimi at 292s
+    # on the 2026-07-13 review run while it was inside its own 360s per-spec
+    # budget and likely a minute from done; 300s of grace keeps the dropout
+    # as a hang guard rather than a working-straggler killer (per-spec
+    # timeouts still bound the true worst case).
+    tail_dropout_s = env_float("CONSULT_TAIL_DROPOUT_S", 300.0)
     tail_k_frac = env_float("CONSULT_TAIL_K_FRAC", 0.2)
+    # Progress-aware extension: a straggler whose stream produced chunks (or
+    # whose truncation continuation started) within this window is WORKING,
+    # not hung, and survives past the grace; per-spec timeouts still bound
+    # everything. 0 disables. Only real signals count, so non-streaming runs
+    # without continuations behave exactly as before.
+    tail_activity_window_s = env_float("CONSULT_TAIL_ACTIVITY_WINDOW_S", 120.0)
 
     try:
         manifest = await _gather_with_tail_dropout(
@@ -962,6 +1179,8 @@ async def fanout(
             paths=paths,
             start=start,
             safe_notify=_safe_notify,
+            task_activity=task_activity,
+            activity_window_s=tail_activity_window_s,
             tail_dropout_s=tail_dropout_s,
             tail_k_frac=tail_k_frac,
         )

@@ -629,3 +629,78 @@ async def test_call_sequence_dry_run_succeeds_without_spending(mcp_session_facto
     assert result.structuredContent is not None
     assert result.structuredContent.get("partial") is True
     assert "dry_run" in (result.structuredContent.get("partial_reason") or "")
+
+
+@pytest.mark.asyncio
+async def test_call_panel_unknown_alias_fails_fast_with_unknown_model_envelope(mcp_session_factory):
+    """A typo'd alias must fail the request BEFORE any fanout with the
+    unknown_model envelope and the registry's valid choices, instead of
+    burning a run to surface one per-panellist error (FRICTION 2026-07-13:
+    `opus-4.7` produced a three-minute zero-usable-panellist round).
+    """
+    async with mcp_session_factory() as client:
+        result = await client.call_tool(
+            "panel",
+            {"prompt": "any", "models": [{"model": "opus-4.7"}], "dry_run": True},
+        )
+    assert result.structuredContent is not None
+    assert result.structuredContent.get("ok") is False
+    assert result.structuredContent["error"]["code"] == "unknown_model"
+    message = result.structuredContent["error"]["message"]
+    assert "opus-4.7" in message
+    assert "Registry aliases" in message
+    assert "tier" in message
+
+
+@pytest.mark.asyncio
+async def test_call_panel_with_tier_expands_registry_tier(mcp_session_factory):
+    """`tier` must be accepted in place of `models` (the skill docs always
+    claimed it was; the schema/handler never implemented it)."""
+    async with mcp_session_factory() as client:
+        result = await client.call_tool(
+            "panel",
+            {"prompt": "any", "tier": "quick", "dry_run": True},
+        )
+    assert result.structuredContent is not None
+    assert result.structuredContent.get("ok") is not False
+    assert result.structuredContent.get("partial") is True  # dry_run envelope
+
+
+@pytest.mark.asyncio
+async def test_call_refine_with_tier_expands_registry_tier(mcp_session_factory):
+    """Same contract as panel: refine accepts `tier` in place of `models`."""
+    async with mcp_session_factory() as client:
+        result = await client.call_tool(
+            "refine",
+            {"prompt": "any", "tier": "quick", "dry_run": True},
+        )
+    assert result.structuredContent is not None
+    assert result.structuredContent.get("ok") is not False
+    assert result.structuredContent.get("partial") is True
+
+
+@pytest.mark.asyncio
+async def test_call_panel_without_models_or_tier_is_rejected(mcp_session_factory):
+    """Neither `models` nor `tier` is a caller error. The SDK enforces the
+    schema's anyOf before the handler runs, so this surfaces as an input
+    validation error (isError=True), not a default panel. The handler keeps
+    its own ValueError guard for library callers that bypass the schema."""
+    async with mcp_session_factory() as client:
+        result = await client.call_tool("panel", {"prompt": "any", "dry_run": True})
+    assert result.isError is True
+    assert "validation" in result.content[0].text.lower()
+
+
+@pytest.mark.asyncio
+async def test_call_panel_unknown_tier_returns_unknown_model_envelope(mcp_session_factory):
+    """An unknown tier name lists the available tiers via the same
+    unknown_model envelope as a bad alias."""
+    async with mcp_session_factory() as client:
+        result = await client.call_tool(
+            "panel",
+            {"prompt": "any", "tier": "platinum", "dry_run": True},
+        )
+    assert result.structuredContent is not None
+    assert result.structuredContent.get("ok") is False
+    assert result.structuredContent["error"]["code"] == "unknown_model"
+    assert "platinum" in result.structuredContent["error"]["message"]

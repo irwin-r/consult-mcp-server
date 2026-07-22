@@ -87,12 +87,29 @@ _DRY_RUN_FIELD = {
     ),
 }
 
+_MAX_OUTPUT_TOKENS_FIELD = {
+    "type": "integer",
+    "minimum": 1000,
+    "maximum": 100000,
+    "description": (
+        "Raise every panellist's output-token grant to at least this many "
+        "tokens. Set it when the prompt asks for a long deliverable (a plan, "
+        "a spec, a full document) — the default grants are sized for "
+        "position-and-reasoning answers and long-form output hits "
+        "finish_reason=length. Raises cost estimates proportionally; the "
+        "max_run_usd cap still applies. On truncation the server also "
+        "auto-continues a cut-off response once, but a right-sized grant "
+        "beats a stitched continuation."
+    ),
+}
+
 
 # --- Tool schemas -------------------------------------------------------------
 
 PANEL_SCHEMA = {
     "type": "object",
-    "required": ["prompt", "models"],
+    "required": ["prompt"],
+    "anyOf": [{"required": ["models"]}, {"required": ["tier"]}],
     "properties": {
         "prompt": {"type": "string", "description": "The question / task for the panel."},
         "models": {
@@ -100,7 +117,18 @@ PANEL_SCHEMA = {
             "minItems": 1,
             "maxItems": _MAX_MODELS_ITEMS,
             "items": _MODEL_SPEC_ITEM,
-            "description": "Panellists. Each entry: {model, stance?, slug?}.",
+            "description": (
+                "Panellists. Each entry: {model, stance?, slug?}. "
+                "Optional when `tier` is given; wins when both are set."
+            ),
+        },
+        "tier": {
+            "type": "string",
+            "description": (
+                "Registry tier name (e.g. quick, standard, deep, code, review) — "
+                "expands to that tier's full model list as the panel. "
+                "Alternative to `models`."
+            ),
         },
         "blinded": {
             "type": "boolean",
@@ -127,6 +155,7 @@ PANEL_SCHEMA = {
             "type": "number",
             "description": "Per-run cost cap. Defaults to CONSULT_MAX_RUN_USD.",
         },
+        "max_output_tokens": _MAX_OUTPUT_TOKENS_FIELD,
         "extract_capsules": {
             "type": "boolean",
             "default": True,
@@ -193,7 +222,8 @@ SYNTH_SCHEMA = {
 
 REFINE_SCHEMA = {
     "type": "object",
-    "required": ["prompt", "models"],
+    "required": ["prompt"],
+    "anyOf": [{"required": ["models"]}, {"required": ["tier"]}],
     "properties": {
         "prompt": {"type": "string"},
         "models": {
@@ -201,6 +231,15 @@ REFINE_SCHEMA = {
             "minItems": 1,
             "maxItems": _MAX_MODELS_ITEMS,
             "items": _MODEL_SPEC_ITEM,
+            "description": ("Panellists. Optional when `tier` is given; wins when both are set."),
+        },
+        "tier": {
+            "type": "string",
+            "description": (
+                "Registry tier name (e.g. quick, standard, deep, code, review) — "
+                "expands to that tier's full model list as the panel. "
+                "Alternative to `models`."
+            ),
         },
         "arbiter": {
             "type": "string",
@@ -228,6 +267,7 @@ REFINE_SCHEMA = {
             "description": _ATTACHMENTS_FIELD_DESC,
         },
         "max_run_usd": {"type": "number"},
+        "max_output_tokens": _MAX_OUTPUT_TOKENS_FIELD,
         "dry_run": _DRY_RUN_FIELD,
         "synthesiser": {
             "type": "string",
@@ -315,6 +355,7 @@ SEQUENCE_SCHEMA = {
             "type": "number",
             "description": "Cap across the whole sequence (cumulative, not per-step).",
         },
+        "max_output_tokens": _MAX_OUTPUT_TOKENS_FIELD,
         "dry_run": _DRY_RUN_FIELD,
         "rubric": {
             **_RUBRIC_FIELD,
@@ -328,6 +369,59 @@ SEQUENCE_SCHEMA = {
             **_CAPSULE_KIND_FIELD,
             "description": ("Capsule shape for every step. 'decision' (default), 'review', or 'research'."),
         },
+    },
+}
+
+
+RESEARCH_SCHEMA = {
+    "type": "object",
+    "required": ["prompt"],
+    "properties": {
+        "prompt": {
+            "type": "string",
+            "description": (
+                "The research goal. Put every constraint you already know "
+                "(region, budget, audience, scope) here — the director must "
+                "otherwise state an assumption in your place."
+            ),
+        },
+        "tier": {
+            "type": "string",
+            "description": (
+                "Default worker tier for sub-runs (e.g. quick, standard, deep). "
+                "Defaults to standard. The director may not override it per "
+                "work item in v1."
+            ),
+        },
+        "director": {
+            "type": "string",
+            "description": (
+                "Model alias for the brief/plan/judge calls. Defaults to the configured default synthesiser."
+            ),
+        },
+        "max_rounds": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 12,
+            "default": 6,
+            "description": "Round ceiling. Stall detection usually stops the loop first.",
+        },
+        "max_run_usd": {
+            "type": ["number", "null"],
+            "description": (
+                "Cumulative cap, enforced per round BEFORE spending (accrued "
+                "cost plus the planned round's projection). Omit for the $25 "
+                "default; explicit null runs UNCAPPED — stall detection stays "
+                "on either way."
+            ),
+        },
+        "attachments": {
+            "type": "array",
+            "maxItems": _MAX_ATTACHMENT_ITEMS,
+            "items": ATTACHMENT_SCHEMA_ITEMS,
+            "description": _ATTACHMENTS_FIELD_DESC,
+        },
+        "max_output_tokens": _MAX_OUTPUT_TOKENS_FIELD,
     },
 }
 
@@ -399,6 +493,7 @@ def consult_schema() -> dict[str, Any]:
             },
             "blinded": {"type": "boolean", "default": False},
             "max_run_usd": {"type": "number"},
+            "max_output_tokens": _MAX_OUTPUT_TOKENS_FIELD,
             "dry_run": {
                 "type": "boolean",
                 "default": False,

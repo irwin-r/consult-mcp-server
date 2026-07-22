@@ -559,18 +559,19 @@ async def test_consult_auto_assigns_diverse_stances_and_carries_calibration(tmp_
     captured = _stance_capturing_setup(monkeypatch, tmp_path)
     result = await orchestrate.consult("p", tier="quick")
 
-    # quick tier is [claude-haiku, gemini-pro, grok, qwen-max, kimi]; the
-    # default synthesiser (gemini-pro) is excluded from the panel.
+    # quick tier is [claude-haiku, gemini-pro, grok, qwen-max, kimi,
+    # deepseek-flash]; the default synthesiser (gemini-pro) is excluded
+    # from the panel.
     specs = captured[0]
     stances = [s.stance for s in specs]
-    assert stances == ["staff_engineer", "contrarian", "security", "product"]
+    assert stances == ["staff_engineer", "contrarian", "security", "product", "future_self"]
 
     cal = result.calibration
     assert cal is not None
     assert cal.disagreement == 0.6
-    assert cal.panellists == 4
-    assert cal.usable == 4
-    assert set(cal.stance_coverage) == {"staff_engineer", "contrarian", "security", "product"}
+    assert cal.panellists == 5
+    assert cal.usable == 5
+    assert set(cal.stance_coverage) == {"staff_engineer", "contrarian", "security", "product", "future_self"}
     assert cal.family_diversity >= 1
 
 
