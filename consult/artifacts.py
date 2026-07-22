@@ -359,15 +359,19 @@ async def aaugment_manifest(paths: RunPaths, **fields: object) -> None:
     await asyncio.to_thread(augment_manifest, paths, **fields)
 
 
-_RESOURCE_KINDS: tuple[str, ...] = ("responses", "attachments")
+_RESOURCE_KINDS: tuple[str, ...] = ("responses", "attachments", "dossier")
+
+# Human label for the <name> segment per kind — appears in validation errors.
+_RESOURCE_NAME_LABELS = {"responses": "slug", "attachments": "attachment", "dossier": "dossier file"}
 
 
 def parse_resource_uri(uri: str) -> tuple[str, str, str]:
     """Parse `consult://runs/<id>/<kind>/<name>` → (run_id, kind, name).
 
-    `kind` is one of `responses` (panellist body) or `attachments`
-    (original inlined attachment source). The kind makes the read path
-    explicit at parse time so the MCP resource handler dispatches without
+    `kind` is one of `responses` (panellist body), `attachments`
+    (original inlined attachment source), or `dossier` (a research run's
+    assembled document, issue #92). The kind makes the read path explicit
+    at parse time so the MCP resource handler dispatches without
     re-validating.
     """
     if not uri.startswith("consult://runs/"):
@@ -379,5 +383,5 @@ def parse_resource_uri(uri: str) -> tuple[str, str, str]:
     # Validate before returning so a malicious URI can't reach disk via
     # downstream callers that forget to call `_validate_id` themselves.
     _validate_id(parts[0], "run_id")
-    _validate_id(parts[2], parts[1].rstrip("s"))  # "slug" or "attachment"
+    _validate_id(parts[2], _RESOURCE_NAME_LABELS[parts[1]])
     return parts[0], parts[1], parts[2]

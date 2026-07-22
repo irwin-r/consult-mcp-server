@@ -373,6 +373,59 @@ SEQUENCE_SCHEMA = {
 }
 
 
+RESEARCH_SCHEMA = {
+    "type": "object",
+    "required": ["prompt"],
+    "properties": {
+        "prompt": {
+            "type": "string",
+            "description": (
+                "The research goal. Put every constraint you already know "
+                "(region, budget, audience, scope) here — the director must "
+                "otherwise state an assumption in your place."
+            ),
+        },
+        "tier": {
+            "type": "string",
+            "description": (
+                "Default worker tier for sub-runs (e.g. quick, standard, deep). "
+                "Defaults to standard. The director may not override it per "
+                "work item in v1."
+            ),
+        },
+        "director": {
+            "type": "string",
+            "description": (
+                "Model alias for the brief/plan/judge calls. Defaults to the configured default synthesiser."
+            ),
+        },
+        "max_rounds": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 12,
+            "default": 6,
+            "description": "Round ceiling. Stall detection usually stops the loop first.",
+        },
+        "max_run_usd": {
+            "type": ["number", "null"],
+            "description": (
+                "Cumulative cap, enforced per round BEFORE spending (accrued "
+                "cost plus the planned round's projection). Omit for the $25 "
+                "default; explicit null runs UNCAPPED — stall detection stays "
+                "on either way."
+            ),
+        },
+        "attachments": {
+            "type": "array",
+            "maxItems": _MAX_ATTACHMENT_ITEMS,
+            "items": ATTACHMENT_SCHEMA_ITEMS,
+            "description": _ATTACHMENTS_FIELD_DESC,
+        },
+        "max_output_tokens": _MAX_OUTPUT_TOKENS_FIELD,
+    },
+}
+
+
 def _tier_names() -> list[str]:
     """Read tier names at call time so test monkeypatching of the registry
     config (and any future live-reload of models.json) is honoured. The
