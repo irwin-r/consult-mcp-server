@@ -48,6 +48,7 @@ class ModelEntry(TypedDict, total=False):
     mode: str
     reasoning_effort: str
     max_input_tokens: int
+    pricing: dict[str, float]
 
 
 def _deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:

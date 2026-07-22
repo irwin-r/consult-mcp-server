@@ -17,7 +17,7 @@ from collections.abc import Awaitable, Callable
 
 import litellm
 
-from . import artifacts, capsule, registry, runner, synth, voting
+from . import artifacts, capsule, pricing, registry, runner, synth, voting
 from . import attachments as attachments_mod
 from . import calibration as calibration_mod
 from .cost import CostMeter
@@ -103,6 +103,7 @@ def _estimate_synth_cost(synth_alias: str, manifest: list[ManifestEntry]) -> tup
     caller then mirrors fanout's warn-don't-block posture.
     """
     try:
+        pricing.ensure_registered()
         entry = registry.resolve_model(synth_alias)
         litellm_id = entry.get("litellm_id")
         if not litellm_id:

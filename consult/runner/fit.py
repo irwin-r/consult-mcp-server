@@ -9,7 +9,7 @@ from typing import Any
 
 import litellm
 
-from .. import artifacts, context
+from .. import artifacts, context, pricing
 from .. import attachments as attachments_mod
 
 logger = logging.getLogger(__name__)
@@ -50,6 +50,7 @@ def _max_input_tokens(litellm_id: str, entry: Mapping[str, Any]) -> int | None:
     Status.ERROR rather than as a raw provider BadRequestError that the
     user has to decode.
     """
+    pricing.ensure_registered()
     override = entry.get("max_input_tokens")
     if override is not None:
         try:

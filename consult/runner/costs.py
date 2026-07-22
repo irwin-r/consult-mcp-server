@@ -15,7 +15,7 @@ import litellm
 
 from consult import runner as _facade
 
-from .. import registry
+from .. import pricing, registry
 from ..redact import redact_exc
 from ..types import ModelSpec
 from .specs import output_budget
@@ -68,6 +68,7 @@ def estimate_cost(
     async fan-out paths call `aestimate_cost()` to keep the event loop
     free during the blocking `token_counter` lookup.
     """
+    pricing.ensure_registered()
     total = 0.0
     all_known = True
     for spec in specs:
@@ -121,6 +122,7 @@ def estimate_drivers(
     estimate the gate sees). Best-effort: any per-spec failure just omits
     that spec.
     """
+    pricing.ensure_registered()
     per_spec: list[tuple[str, float]] = []
     for spec in specs:
         try:

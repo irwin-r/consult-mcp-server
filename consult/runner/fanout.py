@@ -25,7 +25,7 @@ import litellm
 
 from consult import runner as _facade
 
-from .. import artifacts, citations, context, registry, telemetry
+from .. import artifacts, citations, context, pricing, registry, telemetry
 from .. import attachments as attachments_mod
 from ..envutil import env_float
 from ..progress import (
@@ -770,6 +770,10 @@ async def fanout(
     to write into an existing run dir (used by `refine` to keep all rounds
     under one run_id with round-suffixed slugs).
 
+    Registers any models.json `pricing` blocks with LiteLLM up front so
+    per-panellist cost accounting (`completion_cost` / `cost_per_token`
+    below) can price models newer than the shipped tables.
+
     `prior_turns`, when set, is a sequence of `{role, content}` dicts
     prepended to the messages array for every panellist call. Used by
     `refine` with a `continuation_id` to expose the prior consultation as
@@ -797,6 +801,7 @@ async def fanout(
     with `(done, total, message)`. Failures inside the callback are logged
     and swallowed — progress is best-effort, not load-bearing.
     """
+    pricing.ensure_registered()
     # Resolve `model:N` sugar BEFORE estimate_cost so the cap reflects the
     # real panel size, not the pre-expansion request count.
     specs = expand_specs(specs)

@@ -39,7 +39,7 @@ from typing import Any, cast
 
 import litellm
 
-from . import artifacts, context, registry
+from . import artifacts, context, pricing, registry
 from .redact import redact_exc
 from .runner import build_messages
 from .types import Status
@@ -226,6 +226,7 @@ async def synthesise(
     anonymised: bool = False,
     directive: str | None = None,
 ) -> SynthResult:
+    pricing.ensure_registered()
     paths = artifacts.load_run(run_id)
     manifest_payload = json.loads(await asyncio.to_thread(paths.manifest_json.read_text))
     manifest = manifest_payload["manifest"]
