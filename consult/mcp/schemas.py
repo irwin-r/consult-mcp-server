@@ -422,6 +422,17 @@ RESEARCH_SCHEMA = {
             "description": _ATTACHMENTS_FIELD_DESC,
         },
         "max_output_tokens": _MAX_OUTPUT_TOKENS_FIELD,
+        "continuation_id": {
+            "type": "string",
+            "description": (
+                "run_id of a CRASHED research run to resume from its journal. "
+                "Committed rounds replay (spend and state restored); the "
+                "in-flight round restarts fresh. Completed runs refuse to "
+                "resume, and `prompt` must restate the original goal. This is "
+                "the recovery path after a server restart, when tasks/get no "
+                "longer knows the task."
+            ),
+        },
     },
 }
 

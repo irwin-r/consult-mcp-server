@@ -187,3 +187,29 @@ async def test_summary_walks_back_past_parse_failed_verdict(monkeypatch, tmp_pat
 
     # The parse-failed final verdict must not erase the accepted status.
     assert "Niche [niche]: accepted" in payload["summary"]
+
+
+@pytest.mark.asyncio
+async def test_handler_forwards_continuation_id(monkeypatch, tmp_path):
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    captured: dict = {}
+
+    async def fake_research(prompt, **kwargs):
+        captured.update(kwargs)
+        return _fake_result()
+
+    monkeypatch.setattr(research_mod, "research", fake_research)
+
+    await handlers.research({"prompt": "goal", "continuation_id": "20260722-000000-44444"})
+
+    assert captured["continuation_id"] == "20260722-000000-44444"
+
+
+@pytest.mark.asyncio
+async def test_research_schema_advertises_continuation_id(monkeypatch):
+    from consult.mcp import server as server_mod
+
+    monkeypatch.setenv("CONSULT_ENABLE_RESEARCH", "1")
+    tools = await server_mod.handle_list_tools()
+    schema = next(t for t in tools if t.name == "research").inputSchema
+    assert "continuation_id" in schema["properties"]
