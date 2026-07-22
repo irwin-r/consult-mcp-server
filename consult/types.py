@@ -532,7 +532,7 @@ class RefineResult(StrictModel):
 _SECTION_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 
 _SECTION_STATUSES = ("missing", "draft", "accepted")
-_WORK_ITEM_KINDS = ("panel", "consult")
+_WORK_ITEM_KINDS = ("panel", "consult", "evidence")
 
 
 class BriefSection(StrictModel):
