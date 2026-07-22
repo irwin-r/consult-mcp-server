@@ -417,3 +417,60 @@ def test_reopen_guard_unit():
     )
     assert [g.id for g in verdict.blocking_gaps] == ["fresh-1"]
     assert isinstance(verdict.blocking_gaps[0], ResearchGap)
+
+
+@pytest.mark.asyncio
+async def test_evidence_item_feeds_later_rounds_not_sections(rig):
+    from consult import evidence as evidence_mod
+
+    pack = evidence_mod.EvidencePack(
+        run_id="ev-run-1",
+        records=[
+            evidence_mod.EvidenceRecord(
+                url="https://ex.example/prices",
+                title="Price survey",
+                claims=["rivals charge nine dollars flat"],
+                model_id="fake/sonar-pro",
+                slug="sonar-pro-1",
+            )
+        ],
+        cost_usd=0.05,
+    )
+
+    async def fake_gather(question, **kw):
+        return pack
+
+    rig.monkeypatch.setattr(evidence_mod, "gather_evidence", fake_gather)
+    plan_r1 = {
+        "items": [{"id": "r1-ev", "kind": "evidence", "question": "find prices", "section_ids": ["niche"]}]
+    }
+    judge_r1 = {
+        "section_status": {"niche": "draft", "brand": "draft"},
+        "blocking_gaps": [{"id": "g1", "text": "sections need content", "section_id": "niche"}],
+    }
+    plan_r2 = {
+        "items": [
+            {
+                "id": "r2-1",
+                "kind": "consult",
+                "question": "write both sections",
+                "section_ids": ["niche", "brand"],
+            }
+        ]
+    }
+    director = ScriptedDirector(brief=BRIEF_DATA, plans=[plan_r1, plan_r2], judges=[judge_r1, JUDGE_ACCEPT])
+    rig.monkeypatch.setattr(research, "_director_json", director)
+
+    result = await research.research("goal", max_rounds=4)
+
+    assert result.converged is True
+    # The evidence item recorded its pass run but wrote no section body.
+    assert result.rounds[0].results[0].run_id == "ev-run-1"
+    # Round 2's consult question carries the framed evidence pack.
+    assert len(rig.consult_calls) == 1
+    question = rig.consult_calls[0]["question"]
+    assert question.startswith("write both sections")
+    assert "BEGIN UNTRUSTED WEB EVIDENCE" in question
+    assert "https://ex.example/prices" in question
+    # The dossier body is the consult answer, not an empty evidence body.
+    assert "ANSWER to: write both sections" in result.dossier

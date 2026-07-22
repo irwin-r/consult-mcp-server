@@ -50,7 +50,7 @@ from typing import Any, cast
 
 import litellm
 
-from . import artifacts, orchestrate, pricing, provider_caps, registry, runner
+from . import artifacts, evidence, orchestrate, pricing, provider_caps, registry, runner
 from .cost import CostMeter
 from .jsonparse import extract_json
 from .progress import ProgressCallback, ProgressEvent, ResearchPhase, append_progress_log
@@ -125,6 +125,11 @@ Rules:
 re-do an accepted section without a gap that demands it.
 - `kind` is "panel" for contested questions that benefit from diverse \
 opinions, "consult" for questions needing one consolidated answer.
+- `kind` "evidence" gathers live web facts with citations. An evidence \
+item does NOT write its sections; its findings attach automatically to \
+every work item in LATER rounds. Plan evidence early (usually round 1) \
+when sections need current facts, prices, or competitor specifics; its \
+`section_ids` name the sections the facts will support.
 - Every `section_ids` entry must be an id from the brief. Give each item a \
 short stable `id` like "r{round_num}-1".
 - Write each `question` to be fully self-contained: the panel answering it \
@@ -467,14 +472,68 @@ async def _execute_item(
     max_run_usd: float | None,
     max_output_tokens: int | None,
     sem: asyncio.Semaphore,
-) -> tuple[WorkItemResult, str]:
-    """Run one work item as an `orchestrate.consult` sub-run. Returns the
-    result record plus the synthesis body ("" on failure). Never raises —
-    a failed item is journal data the judge re-plans around."""
+    evidence_context: str = "",
+) -> tuple[WorkItemResult, str, evidence.EvidencePack | None]:
+    """Run one work item. Returns (result record, section body, evidence
+    pack). Panel/consult items produce a body and no pack; evidence items
+    produce a pack and no body. Never raises — a failed item is journal
+    data the judge re-plans around.
+
+    `evidence_context`, when non-empty, is the rendered pack from PRIOR
+    rounds' evidence items; it rides along with every panel/consult
+    question so grounded facts reach the deliberating panels."""
+    if item.kind == "evidence":
+        try:
+            async with sem:
+                pack = await evidence.gather_evidence(
+                    item.question,
+                    max_run_usd=max_run_usd,
+                    max_output_tokens=max_output_tokens,
+                )
+        except Exception as e:  # noqa: BLE001 — sub-run failure must not crash the round
+            scrub_exception_attrs(e)
+            logger.warning("evidence item %s failed: %s", item.id, redact_exc(e))
+            return (
+                WorkItemResult(
+                    item_id=item.id,
+                    status="error",
+                    cost_usd=None,
+                    cost_known=False,
+                    error=redact_exc(e, limit=200),
+                ),
+                "",
+                None,
+            )
+        if pack.partial or not pack.records:
+            return (
+                WorkItemResult(
+                    item_id=item.id,
+                    run_id=pack.run_id,
+                    status="error",
+                    cost_usd=pack.cost_usd,
+                    cost_known=pack.cost_known,
+                    error=pack.partial_reason or "evidence pass harvested zero sources",
+                ),
+                "",
+                None,
+            )
+        return (
+            WorkItemResult(
+                item_id=item.id,
+                run_id=pack.run_id,
+                status="ok",
+                cost_usd=pack.cost_usd,
+                cost_known=pack.cost_known,
+            ),
+            "",
+            pack,
+        )
+
+    question = item.question if not evidence_context else f"{item.question}\n\n{evidence_context}"
     try:
         async with sem:
             res = await orchestrate.consult(
-                item.question,
+                question,
                 tier=item.tier or tier,
                 capsule_kind="decision",
                 max_run_usd=max_run_usd,
@@ -492,6 +551,7 @@ async def _execute_item(
                 error=redact_exc(e, limit=200),
             ),
             "",
+            None,
         )
     if res.partial or not (res.synthesis or "").strip():
         return (
@@ -504,6 +564,7 @@ async def _execute_item(
                 error=res.partial_reason or "sub-run returned no synthesis",
             ),
             "",
+            None,
         )
     return (
         WorkItemResult(
@@ -514,17 +575,22 @@ async def _execute_item(
             cost_known=res.cost_known,
         ),
         res.synthesis,
+        None,
     )
 
 
 async def _project_round_cost(items: list[WorkItem], tier: str) -> tuple[float, bool]:
     """Floor estimate for a planned round: per-item panel cost at the item's
-    tier. Excludes per-item synthesis and director calls, so it is a floor —
+    tier (evidence items price their web workers instead). Excludes per-item
+    synthesis, director calls, and provider search fees, so it is a floor —
     the same contract as every other estimate in the engine."""
     total = 0.0
     all_known = True
     for item in items:
-        aliases = registry.resolve_tier(item.tier or tier)
+        if item.kind == "evidence":
+            aliases = list(evidence.DEFAULT_MODELS)
+        else:
+            aliases = registry.resolve_tier(item.tier or tier)
         specs = [ModelSpec(model=a) for a in aliases]
         est, known = await runner.aestimate_cost(specs, item.question)
         total += est
@@ -618,6 +684,7 @@ async def research(
     open_gaps: list[ResearchGap] = []
     verdicts: list[ResearchVerdict] = []
     rounds: list[ResearchRound] = []
+    packs: list[evidence.EvidencePack] = []
     stall = 0
     judge_failures = 0
     progress_prev: tuple[int, int] | None = None
@@ -626,13 +693,18 @@ async def research(
     item_sem = asyncio.Semaphore(max(1, max_parallel_items))
 
     for round_num in range(1, max_rounds + 1):
-        # Plan — fail-closed.
+        # Plan — fail-closed. The dossier state carries an evidence tally so
+        # the director knows whether grounding already happened.
         await _emit(ResearchPhase(done=round_num - 1, total=max_rounds, phase="plan", round=round_num))
+        dossier_state = _render_dossier_state(brief, sections, statuses)
+        gathered = evidence.merged_records(packs)
+        if gathered:
+            dossier_state += f"\nEvidence gathered: {len(gathered)} web source(s) from {len(packs)} pass(es)"
         plan_prompt = _PLAN_PROMPT.format(
             round_num=round_num,
             max_rounds=max_rounds,
             brief=_render_brief(brief),
-            dossier_state=_render_dossier_state(brief, sections, statuses),
+            dossier_state=dossier_state,
             gaps=_render_gaps(open_gaps),
         )
         data, cost, cost_known, err = await _director_json(plan_prompt, director_alias, label="plan")
@@ -666,9 +738,11 @@ async def research(
                 await _journal(paths, phase="budget_refused", round=round_num, reason=partial_reason)
                 break
 
-        # Execute — child cap slices; failures trapped per item.
+        # Execute — child cap slices; failures trapped per item. Prior
+        # rounds' evidence rides along with every panel/consult question.
         await _emit(ResearchPhase(done=round_num - 1, total=max_rounds, phase="execute", round=round_num))
         per_item_cap = None if max_run_usd is None else max(0.0, max_run_usd - meter.total) / len(items)
+        evidence_context = evidence.render_evidence_pack(gathered) if gathered else ""
         outcomes = await asyncio.gather(
             *(
                 _execute_item(
@@ -677,18 +751,28 @@ async def research(
                     max_run_usd=per_item_cap,
                     max_output_tokens=max_output_tokens,
                     sem=item_sem,
+                    evidence_context=evidence_context,
                 )
                 for item in items
             )
         )
         results: list[WorkItemResult] = []
-        for item, (res, body) in zip(items, outcomes, strict=True):
+        for item, (res, body, pack) in zip(items, outcomes, strict=True):
             results.append(res)
             meter.add(res.cost_usd or 0.0, res.cost_known)
             await _journal(paths, phase="item_result", round=round_num, result=res.model_dump())
-            if res.status == "ok":
-                for sid in item.section_ids:
-                    sections[sid] = {"body": body, "run_id": res.run_id, "round": round_num}
+            if res.status != "ok":
+                continue
+            if pack is not None:
+                # Evidence items feed later rounds, never the dossier —
+                # writing their empty body would clobber a real section.
+                packs.append(pack)
+                await _journal(
+                    paths, phase="evidence", round=round_num, item_id=item.id, sources=len(pack.records)
+                )
+                continue
+            for sid in item.section_ids:
+                sections[sid] = {"body": body, "run_id": res.run_id, "round": round_num}
         await asyncio.to_thread(
             (paths.root / "dossier.md").write_text,
             _render_dossier(brief, sections, provenance=True, clip=False),
