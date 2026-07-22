@@ -188,3 +188,45 @@ async def test_fanout_web_search_skips_non_web_models(tmp_path, monkeypatch):
     assert handle.manifest[0].status is Status.OK
     assert "web_search_options" not in captured
     assert "tools" not in captured
+
+
+@pytest.mark.asyncio
+async def test_timeout_floor_raises_per_spec_timeouts(tmp_path, monkeypatch):
+    """Patience plumbing: the floor must reach the transport call so a deep
+    model can run for hours instead of its interactive registry default."""
+    import importlib
+
+    from consult import runner
+    from consult.runner.fanout import fanout
+
+    # The facade rebinds the name `fanout` to the function, shadowing the
+    # submodule as a package attribute — importlib reaches the module itself.
+    fanout_mod = importlib.import_module("consult.runner.fanout")
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    monkeypatch.setattr(runner, "estimate_cost", lambda *a, **kw: (0.0, True))
+    monkeypatch.setenv("CONSULT_HEARTBEAT_INTERVAL_S", "0")
+
+    captured: dict = {}
+
+    async def fake_retry(*, timeout, **kwargs):
+        captured["timeout"] = timeout
+        return SimpleNamespace(
+            model=kwargs["model"],
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content="answer", tool_calls=None),
+                    finish_reason="stop",
+                )
+            ],
+            usage=SimpleNamespace(prompt_tokens=5, completion_tokens=3),
+        )
+
+    monkeypatch.setattr(fanout_mod, "_acompletion_with_retry", fake_retry)
+    monkeypatch.setattr(runner.litellm, "completion_cost", lambda completion_response: 0.001)
+
+    # claude-haiku's registry timeout is 120s; the floor must win.
+    handle = await fanout("q", [ModelSpec(model="claude-haiku")], timeout_floor_s=7200.0)
+
+    assert handle.manifest[0].status is Status.OK
+    assert captured["timeout"] == 7200.0

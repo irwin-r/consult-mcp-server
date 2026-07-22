@@ -99,6 +99,7 @@ async def _call_one(
     capsule_kind: str = "decision",
     max_output_tokens: int | None = None,
     web_search: bool = False,
+    timeout_floor_s: float | None = None,
 ) -> ManifestEntry:
     # An unknown alias must fail this single panellist, not the whole panel.
     # `asyncio.gather` without return_exceptions=True would otherwise cancel
@@ -140,6 +141,12 @@ async def _call_one(
     # the same ceiling actually granted here.
     budget = output_budget(entry, capsule_kind, max_output_tokens)
     timeout = entry.get("default_timeout_s", 180)
+    # Patience floor (issue #92 hardening): a caller that would rather wait
+    # hours than lose a deep model raises every per-spec timeout to at
+    # least this. The registry defaults are sized for interactive panels;
+    # research sub-runs pass a floor instead of editing the registry.
+    if timeout_floor_s is not None:
+        timeout = max(timeout, timeout_floor_s)
     provider = entry.get("provider", "")
     # mode=responses models (e.g. gpt-pro, gpt-codex) use the OpenAI Responses
     # API, not chat completions — routed via `_aresponses_as_completion`.
@@ -776,6 +783,8 @@ async def fanout(
     max_concurrency: int | None = None,
     max_output_tokens: int | None = None,
     web_search: bool = False,
+    timeout_floor_s: float | None = None,
+    tail_dropout_s: float | None = None,
 ) -> RunHandle:
     """Parallel fan-out. Creates a fresh run by default. Pass `existing_paths`
     to write into an existing run dir (used by `refine` to keep all rounds
@@ -803,6 +812,14 @@ async def fanout(
     panellist whose registry entry carries `supports_web`; other
     panellists run unchanged. Search fees are provider-billed on top of
     tokens and are not part of `estimate_cost` (estimates stay floors).
+
+    Patience knobs (issue #92 hardening): `timeout_floor_s` raises every
+    panellist's per-spec timeout to at least the floor, and
+    `tail_dropout_s` overrides the CONSULT_TAIL_DROPOUT_S env default —
+    `0` disables slow-tail dropout entirely, so no straggler is ever
+    cancelled and the (floored) per-spec timeouts are the only bound.
+    Research sub-runs use both so a deep model can take hours without
+    being dropped.
 
     `max_concurrency` (or `CONSULT_MAX_CONCURRENCY` env var) caps the
     *total* number of panellists in flight at once. The existing
@@ -1139,6 +1156,7 @@ async def fanout(
                 capsule_kind=capsule_kind,
                 max_output_tokens=max_output_tokens,
                 web_search=web_search,
+                timeout_floor_s=timeout_floor_s,
             )
             state.record_completed(entry)
             await _safe_notify(
@@ -1160,7 +1178,10 @@ async def fanout(
     # budget and likely a minute from done; 300s of grace keeps the dropout
     # as a hang guard rather than a working-straggler killer (per-spec
     # timeouts still bound the true worst case).
-    tail_dropout_s = env_float("CONSULT_TAIL_DROPOUT_S", 300.0)
+    # Caller override wins over the env default; 0 disables the dropout
+    # (`_gather_with_tail_dropout` treats non-positive grace as plain gather).
+    if tail_dropout_s is None:
+        tail_dropout_s = env_float("CONSULT_TAIL_DROPOUT_S", 300.0)
     tail_k_frac = env_float("CONSULT_TAIL_K_FRAC", 0.2)
     # Progress-aware extension: a straggler whose stream produced chunks (or
     # whose truncation continuation started) within this window is WORKING,

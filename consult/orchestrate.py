@@ -137,6 +137,8 @@ async def consult(
     on_progress: ProgressCallback | None = None,
     gate_synth_at_agreement: float | None = None,
     diverse_stances: bool = True,
+    timeout_floor_s: float | None = None,
+    tail_dropout_s: float | None = None,
 ) -> RunResult:
     """Run the 3-phase hero: fanout → capsule extract → synth.
 
@@ -220,6 +222,10 @@ async def consult(
         on_progress=shift_bucket(on_progress, fanout_offset, overall_total),
         capsule_kind=capsule_kind,
         max_output_tokens=max_output_tokens,
+        # Patience passthrough (issue #92): research sub-runs float per-spec
+        # timeouts and disable slow-tail dropout so deep models can run long.
+        timeout_floor_s=timeout_floor_s,
+        tail_dropout_s=tail_dropout_s,
     )
     if handle.partial or not handle.manifest:
         # Return a real `RunResult` so the partial response has the same shape

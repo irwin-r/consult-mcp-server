@@ -436,7 +436,10 @@ def _research_summary(result: Any) -> str:
     if result.brief is not None:
         if result.brief.assumptions:
             lines.append("Assumptions: " + "; ".join(result.brief.assumptions))
-        last = result.verdicts[-1] if result.verdicts else None
+        # The LAST verdict can be a parse failure with an empty status map,
+        # which read as every section "missing" even after acceptances
+        # (review finding, #92) — walk back to the last parsed verdict.
+        last = next((v for v in reversed(result.verdicts) if v.parsed_ok), None)
         for section in result.brief.sections:
             status = (last.section_status.get(section.id) if last else None) or "missing"
             lines.append(f"- {section.title} [{section.id}]: {status}")
@@ -467,8 +470,11 @@ async def research(args: dict[str, Any], *, on_progress: ProgressCallback | None
     # The dossier is the one deliberately-large field; it ships as a
     # resource, not inline. Everything else in the result is capsule-sized.
     payload = result.model_dump(exclude={"dossier"})
-    payload["dossier_uri"] = f"consult://runs/{result.run_id}/dossier/dossier.md"
-    payload["dossier_chars"] = len(result.dossier)
+    # A brief failure aborts before dossier.md exists — advertising the URI
+    # then would hand the client a dead resource (review finding, #92).
+    if result.brief is not None:
+        payload["dossier_uri"] = f"consult://runs/{result.run_id}/dossier/dossier.md"
+        payload["dossier_chars"] = len(result.dossier)
     payload["summary"] = _research_summary(result)
     # Best-effort observability pointers (parity with _augment_result; the
     # panel-manifest summary and viewer render don't apply to a research
