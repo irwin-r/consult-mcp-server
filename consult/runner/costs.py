@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from typing import Any
 
 import litellm
 
@@ -40,7 +41,10 @@ async def aestimate_cost(
     bound there, so test setup is unchanged. `max_output_tokens` is
     forwarded only when set, so patched lambdas without the kwarg survive.
     """
-    kwargs: dict[str, object] = {"capsule_kind": capsule_kind}
+    # `Any` values, not `object`: the splat feeds typed keyword parameters
+    # (`capsule_kind: str`, `max_output_tokens: int | None`) and pyright
+    # rejects `object` against them.
+    kwargs: dict[str, Any] = {"capsule_kind": capsule_kind}
     if max_output_tokens is not None:
         kwargs["max_output_tokens"] = max_output_tokens
     return await asyncio.to_thread(lambda: _facade.estimate_cost(specs, prompt, **kwargs))

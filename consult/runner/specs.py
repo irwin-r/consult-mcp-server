@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+from collections.abc import Mapping
 from typing import Any
 
 from .. import slugs
@@ -14,7 +15,10 @@ from ..types import ModelSpec
 logger = logging.getLogger(__name__)
 
 
-def output_budget(entry: dict[str, Any], capsule_kind: str, max_output_tokens: int | None = None) -> int:
+# `Mapping` rather than `dict`: callers hand this a `registry.ModelEntry`
+# (a TypedDict), which pyright refuses to assign to `dict[str, Any]` but
+# accepts as a read-only Mapping. The function only reads.
+def output_budget(entry: Mapping[str, Any], capsule_kind: str, max_output_tokens: int | None = None) -> int:
     """The output-token grant for one panellist call.
 
     max(kind cap, model default, caller override) — the kind cap is what
