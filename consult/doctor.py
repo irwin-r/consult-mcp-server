@@ -233,6 +233,14 @@ async def _ping_provider(env_var: str, alias: str) -> tuple[bool, str]:
         )
         return True, "ok"
     except Exception as e:  # noqa: BLE001
+        # A reasoning model can spend the single granted token thinking and
+        # come back with an output-limit error. That response still proves
+        # the key authenticated and the model routed — which is all the ping
+        # asks — so count it as success rather than raising the grant (and
+        # the ping cost) for every provider.
+        msg = str(e).lower()
+        if "max_tokens" in msg or "output limit" in msg:
+            return True, "ok (output-capped reasoning reply)"
         # Redact secrets before surfacing — same risk as the runner paths.
         from .redact import redact_exc
 
