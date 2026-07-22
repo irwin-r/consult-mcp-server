@@ -519,3 +519,200 @@ class RefineResult(StrictModel):
             if any(not v.cost_known for v in self.verdicts):
                 raise ValueError("RefineResult.cost_known=True but an arbiter verdict has cost_known=False")
         return self
+
+
+# ---- Research (director-loop) types -----------------------------------------
+#
+# Wire and journal shapes for `consult.research`. The brief is frozen in
+# round 0 and is the contract that makes "the judge is satisfied" decidable:
+# section ids are stable for the life of the run, work items own the sections
+# they feed, and dossier assembly is deterministic replacement by section id
+# (no LLM integrator — the panel review of issue #92 killed that design).
+
+_SECTION_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
+
+_SECTION_STATUSES = ("missing", "draft", "accepted")
+_WORK_ITEM_KINDS = ("panel", "consult")
+
+
+class BriefSection(StrictModel):
+    """One deliverable in the frozen brief. `acceptance` is the bar the judge
+    holds this section to — written by the director in round 0 and never
+    edited afterwards, so acceptance can't drift with the judge's mood."""
+
+    id: str
+    title: str
+    goal: str
+    acceptance: str
+
+    @field_validator("id")
+    @classmethod
+    def _validate_id(cls, v: str) -> str:
+        if not _SECTION_ID_RE.fullmatch(v):
+            raise ValueError(f"section id {v!r} must match {_SECTION_ID_RE.pattern}")
+        return v
+
+
+class Brief(StrictModel):
+    """The round-0 contract: explicit assumptions plus the deliverable
+    skeleton. Frozen for the life of the run — the judge may want more, but
+    wants that aren't in the brief cannot block acceptance."""
+
+    assumptions: list[str] = Field(default_factory=list)
+    sections: list[BriefSection]
+
+    @model_validator(mode="after")
+    def _validate_sections(self) -> Brief:
+        if not self.sections:
+            raise ValueError("Brief requires at least one section")
+        ids = [s.id for s in self.sections]
+        if len(set(ids)) != len(ids):
+            raise ValueError(f"Brief section ids must be unique; got {ids}")
+        return self
+
+    def section_ids(self) -> set[str]:
+        return {s.id for s in self.sections}
+
+
+class WorkItem(StrictModel):
+    """One planned unit of round work. `kind` selects the execution
+    primitive; `section_ids` are the brief sections this item's synthesis
+    will replace. The plan parser is fail-closed: an item that doesn't
+    validate rejects the whole plan rather than executing a salvaged one."""
+
+    id: str
+    kind: str
+    question: str
+    section_ids: list[str]
+    tier: str | None = None
+    rationale: str = ""
+
+    @field_validator("kind")
+    @classmethod
+    def _validate_kind(cls, v: str) -> str:
+        if v not in _WORK_ITEM_KINDS:
+            raise ValueError(f"work item kind {v!r} not in {_WORK_ITEM_KINDS}")
+        return v
+
+    @model_validator(mode="after")
+    def _validate_targets(self) -> WorkItem:
+        if not self.question.strip():
+            raise ValueError("work item question must be non-empty")
+        if not self.section_ids:
+            raise ValueError("work item must target at least one section")
+        return self
+
+
+class ResearchGap(StrictModel):
+    """A blocking gap the judge raised. Ids are judge-assigned and stable:
+    the judge is instructed to carry unresolved ids forward verbatim, and
+    the engine drops any gap whose id was previously resolved (the reopen
+    guard that stops verdict flip-flop)."""
+
+    id: str
+    text: str
+    section_id: str | None = None
+
+
+class ResearchVerdict(StrictModel):
+    """The judge's per-round assessment of the dossier against the brief.
+
+    Acceptance = every section `accepted` and zero blocking gaps.
+    `parsed_ok=False` means the judge call or parse failed; the engine
+    treats it as a round without progress signal, never as a zero score.
+    """
+
+    round: int
+    section_status: dict[str, str] = Field(default_factory=dict)
+    blocking_gaps: list[ResearchGap] = Field(default_factory=list)
+    next_focus: str = ""
+    reasoning: str = ""
+    cost_usd: float | None = 0.0
+    cost_known: bool = True
+    parsed_ok: bool = True
+    error: str | None = None
+
+    @model_validator(mode="after")
+    def _validate_invariants(self) -> ResearchVerdict:
+        if self.cost_usd is None and self.cost_known:
+            raise ValueError("ResearchVerdict with cost_usd=None must have cost_known=False")
+        if not self.parsed_ok and not self.error:
+            raise ValueError("ResearchVerdict.parsed_ok=False requires an error message")
+        for sid, status in self.section_status.items():
+            if status not in _SECTION_STATUSES:
+                raise ValueError(f"section_status[{sid!r}]={status!r} not in {_SECTION_STATUSES}")
+        return self
+
+    def accepted(self, brief: Brief) -> bool:
+        """True when every brief section is accepted and nothing blocks."""
+        if self.blocking_gaps or not self.parsed_ok:
+            return False
+        return all(self.section_status.get(s.id) == "accepted" for s in brief.sections)
+
+
+class WorkItemResult(StrictModel):
+    """Execution outcome for one work item. `status="error"` entries stay in
+    the round record (and the journal) so the judge re-plans around the
+    failure instead of the round crashing."""
+
+    item_id: str
+    run_id: str | None = None
+    status: str = "ok"
+    cost_usd: float | None = 0.0
+    cost_known: bool = True
+    error: str | None = None
+
+    @model_validator(mode="after")
+    def _validate_invariants(self) -> WorkItemResult:
+        if self.status not in ("ok", "error"):
+            raise ValueError(f"WorkItemResult.status must be 'ok' or 'error'; got {self.status!r}")
+        if self.cost_usd is None and self.cost_known:
+            raise ValueError("WorkItemResult with cost_usd=None must have cost_known=False")
+        if self.status == "error" and not self.error:
+            raise ValueError("WorkItemResult.status='error' requires an error message")
+        return self
+
+
+class ResearchRound(StrictModel):
+    """One completed round: what was planned, what happened, what the judge
+    said. The journal mirrors this record at each phase boundary."""
+
+    round: int
+    work_items: list[WorkItem]
+    results: list[WorkItemResult] = Field(default_factory=list)
+    verdict: ResearchVerdict | None = None
+
+
+class ResearchResult(StrictModel):
+    """Returned by `research()`. The dossier is the full assembled markdown;
+    the MCP layer (issue #92, PR 4) will trim it to a resource URI plus an
+    executive summary rather than inlining it into the parent context."""
+
+    schema_version: int = Field(_MANIFEST_SCHEMA_VERSION, ge=1)
+    run_id: str
+    brief: Brief | None = None
+    rounds_completed: int = Field(..., ge=0)
+    rounds: list[ResearchRound] = Field(default_factory=list)
+    verdicts: list[ResearchVerdict] = Field(default_factory=list)
+    dossier: str = ""
+    converged: bool = False
+    stop_reason: str = ""
+    open_gaps: list[ResearchGap] = Field(default_factory=list)
+    cost_usd: float = Field(..., ge=0.0)
+    cost_known: bool = True
+    wall_ms: int = Field(..., ge=0)
+    partial: bool = False
+    partial_reason: str | None = None
+
+    @model_validator(mode="after")
+    def _validate_partial(self) -> ResearchResult:
+        if self.partial and not self.partial_reason:
+            raise ValueError("ResearchResult.partial=True requires partial_reason")
+        if not self.partial and self.partial_reason:
+            raise ValueError("ResearchResult.partial=False must not carry a partial_reason")
+        known_reasons = ("accepted", "stalled", "max_rounds", "budget", "director_error", "")
+        if self.stop_reason not in known_reasons:
+            raise ValueError(f"ResearchResult.stop_reason {self.stop_reason!r} not in {known_reasons}")
+        if self.converged and self.stop_reason != "accepted":
+            raise ValueError("ResearchResult.converged=True requires stop_reason='accepted'")
+        return self
