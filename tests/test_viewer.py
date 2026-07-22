@@ -5,6 +5,7 @@ Split out of the old 7,400-line test_smoke.py; bodies are unchanged.
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -463,3 +464,125 @@ def test_attachment_git_diff_under_cap_renders_normally(monkeypatch):
     out = attachments.render_attachment({"source": "git_diff", "base": "main", "head": "HEAD"})
     assert "[ERROR" not in out
     assert "hello" in out
+
+
+# ---- Research runs (issue #92) ----------------------------------------------
+
+
+def _research_run(tmp_path, monkeypatch, manifest_extra=None, with_inline_state=True):
+    from consult import artifacts
+
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    run_dir = tmp_path / "20260722-101010-77777"
+    run_dir.mkdir()
+    brief = {
+        "assumptions": ["AU market"],
+        "sections": [
+            {"id": "niche", "title": "Niche", "goal": "g", "acceptance": "three niches"},
+            {"id": "brand", "title": "Brand", "goal": "g", "acceptance": "name plus voice"},
+        ],
+    }
+    verdict = {
+        "round": 1,
+        "section_status": {"niche": "accepted", "brand": "draft"},
+        "blocking_gaps": [{"id": "g1-1", "text": "voice missing", "section_id": "brand"}],
+        "next_focus": "",
+        "reasoning": "niche is done",
+        "cost_usd": 0.01,
+        "cost_known": True,
+        "parsed_ok": True,
+        "error": None,
+    }
+    rounds = [
+        {
+            "round": 1,
+            "work_items": [
+                {
+                    "id": "r1-1",
+                    "kind": "consult",
+                    "question": "Pick the niche.",
+                    "section_ids": ["niche"],
+                    "tier": None,
+                    "rationale": "",
+                }
+            ],
+            "results": [
+                {
+                    "item_id": "r1-1",
+                    "run_id": "20260722-101011-88888",
+                    "status": "ok",
+                    "cost_usd": 0.1,
+                    "cost_known": True,
+                    "error": None,
+                }
+            ],
+            "verdict": verdict,
+        }
+    ]
+    manifest = {
+        "kind": "research",
+        "run_id": run_dir.name,
+        "rounds_completed": 1,
+        "converged": False,
+        "stop_reason": "max_rounds",
+        "partial": False,
+        "partial_reason": None,
+        "cost_usd": 0.02,
+        "cost_known": True,
+        "total_cost_usd": 0.12,
+        "total_cost_known": True,
+        "wall_ms": 61000,
+    }
+    if with_inline_state:
+        manifest.update({"brief": brief, "verdicts": [verdict], "rounds": rounds})
+    else:
+        (run_dir / "brief.json").write_text(json.dumps(brief))
+        (run_dir / "verdicts.json").write_text(json.dumps([verdict]))
+        journal_lines = [
+            {"phase": "brief", "brief": brief},
+            {"phase": "plan", "round": 1, "items": rounds[0]["work_items"]},
+            {"phase": "item_result", "round": 1, "result": rounds[0]["results"][0]},
+            {"phase": "verdict", "round": 1, "verdict": verdict},
+        ]
+        (run_dir / "journal.jsonl").write_text("\n".join(json.dumps(r) for r in journal_lines))
+    if manifest_extra:
+        manifest.update(manifest_extra)
+    (run_dir / "manifest.json").write_text(json.dumps(manifest))
+    (run_dir / "prompt.txt").write_text("build a brand")
+    (run_dir / "dossier.md").write_text("## Niche\n\nespresso subscriptions win\n")
+    return run_dir.name
+
+
+def test_research_run_renders_dedicated_page(tmp_path, monkeypatch):
+    from consult import viewer
+
+    run_id = _research_run(tmp_path, monkeypatch)
+    out = viewer.render_run(run_id)
+    html_text = out.read_text()
+
+    assert "research run" in html_text
+    assert "director cost" in html_text and "total cost" in html_text
+    assert "three niches" in html_text  # acceptance bar in the brief table
+    assert "espresso subscriptions win" in html_text  # dossier body
+    assert "Round 1" in html_text
+    assert "20260722-101011-88888/feed.html" in html_text  # sub-run link
+    assert "voice missing" in html_text  # blocking gap
+    assert "panellists" not in html_text  # not the panel layout
+
+
+def test_crash_path_research_manifest_renders_from_files(tmp_path, monkeypatch):
+    """A crash-path manifest is minimal; brief/verdicts/rounds come from
+    their own artifacts and the journal."""
+    from consult import viewer
+
+    run_id = _research_run(
+        tmp_path,
+        monkeypatch,
+        manifest_extra={"partial": True, "partial_reason": "run aborted before finalise"},
+        with_inline_state=False,
+    )
+    html_text = viewer.render_run(run_id).read_text()
+
+    assert "aborted before finalise" in html_text
+    assert "three niches" in html_text  # brief recovered from brief.json
+    assert "Round 1" in html_text  # rounds recovered from the journal
