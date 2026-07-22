@@ -478,3 +478,29 @@ revisions are folded into the plan issue. Run 20260722-003510-38368.
   probes one model per provider, so a retired ID's first detector today is
   a paid panellist. The zero-token existence probe proposed in #91 would
   cover it locally.
+
+## 2026-07-22 — research crash-resume dogfood (kill -9, then recover)
+
+Final validation for the #92 build-out: `probe_92_resume.py start` ran an
+evidence-demanding research goal on the quick tier, the harness SIGKILLed
+the process seconds after the round-1 verdict hit the journal, and
+`probe_92_resume.py resume <run_id>` recovered it. Run 20260722-052734-19649,
+$1.27 total across both halves, all pricing known.
+
+- [meta] **First live execution of the evidence path passed.** The director
+  planned an evidence item unprompted, sonar-pro harvested 2 cited web
+  sources, and the framed pack rode into rounds 2-3 questions. Until this
+  run the whole web-search pipeline had only offline coverage.
+- [meta] **Resume survived the hardest crash shape.** kill dash nine means
+  no finally block, so no manifest existed at all; replay worked from
+  journal plus artifacts alone. The resumed process started directly at
+  round 2 with the accepted section, four open gaps, the evidence pack,
+  and both meters restored — no re-brief, no re-executed items, and the
+  cumulative cost stayed fully known.
+- [ux] **max_rounds exit left one section in draft** (competitor-analysis;
+  the judge kept holding it to its citation bar). Working as designed, but
+  the natural next move — "resume with two more rounds" — is refused
+  because completed runs only reopen via the deferred v2 steering feature.
+  First real argument for building it.
+- [meta] `consult-view` rendered the whole run first try, crash-era round
+  included (76KB page: brief table, dossier, three round cards, timeline).
