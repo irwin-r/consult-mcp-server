@@ -455,3 +455,26 @@ bumping gemini-flash to 3.6. Five of six new IDs worked first try; total spend
 - [ux] **kimi-k3 is the slow panellist of the new set** (24s for a one-line
   answer vs 4-7s for the rest; registry timeout stays 600s like the other
   moonshot entries). Not actionable yet, just expect it to pace wide panels.
+
+## 2026-07-22 — refine dogfood on the deep-research plan (stale registry)
+
+Ran `refine` (review tier, blinded, critique rubric, cap $10, ~$1.02 known
+spend) to pressure-test the implementation plan for the proposed `research`
+tool. Converged in one round at 0.95 with 6/7 panellists usable; the panel's
+revisions are folded into the plan issue. Run 20260722-003510-38368.
+
+- [ux] **A long-lived server served a dead model ID to a paid run.** The
+  running process resolved `gpt-pro` to `openai/gpt-5.6-sol-pro`, the exact
+  ID the same-day refresh smoke (entry above) had already rejected; the
+  panellist burned its slot on `model_not_found`. models.json on disk was
+  correct (`openai/gpt-5.5-pro`, confirmed 200 via the models endpoint),
+  but the registry is cached for the process lifetime, so the
+  editable-install server kept serving a mid-refresh tree state from
+  memory. Restarting the server is the documented fix; the sharp edge is
+  that nothing warns when the on-disk config has drifted from the loaded
+  one. Filed as issue #91 (drift warning + key-gated existence probe).
+- [meta] **Detection gap between refreshes**: the weekly canary skips its
+  provider ping in CI (no repository keys) and `consult-doctor --ping`
+  probes one model per provider, so a retired ID's first detector today is
+  a paid panellist. The zero-token existence probe proposed in #91 would
+  cover it locally.
