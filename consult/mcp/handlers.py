@@ -21,6 +21,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from .. import (
+    artifacts,
     attachments,
     capsule,
     orchestrate,
@@ -30,6 +31,9 @@ from .. import (
 )
 from .. import (
     refine as refine_mod,
+)
+from .. import (
+    research as research_mod,
 )
 from .. import (
     sequence as sequence_mod,
@@ -418,6 +422,66 @@ async def sequence(args: dict[str, Any], *, on_progress: ProgressCallback | None
     payload = result.model_dump()
     # Dry runs have no artifacts to render or summarise (parity with panel/consult).
     return payload if args.get("dry_run", False) else await _augment_result(payload)
+
+
+def _research_summary(result: Any) -> str:
+    """Deterministic executive summary for the inline payload — no extra
+    model call. The full dossier stays behind `dossier_uri` so a long run
+    doesn't bloat the calling agent's context (the product's whole point).
+    """
+    lines = [
+        f"Research stopped: {result.stop_reason or 'unknown'} after "
+        f"{result.rounds_completed} round(s); converged={result.converged}."
+    ]
+    if result.brief is not None:
+        if result.brief.assumptions:
+            lines.append("Assumptions: " + "; ".join(result.brief.assumptions))
+        last = result.verdicts[-1] if result.verdicts else None
+        for section in result.brief.sections:
+            status = (last.section_status.get(section.id) if last else None) or "missing"
+            lines.append(f"- {section.title} [{section.id}]: {status}")
+    if result.open_gaps:
+        lines.append("Open gaps: " + "; ".join(f"[{g.id}] {g.text}" for g in result.open_gaps))
+    prefix = "" if result.cost_known else "≥"
+    lines.append(f"Cost: {prefix}${result.cost_usd:.2f}. Full dossier: read the dossier_uri resource.")
+    return "\n".join(lines)
+
+
+async def research(args: dict[str, Any], *, on_progress: ProgressCallback | None = None) -> dict[str, Any]:
+    prompt = attachments.inline_attachments(args["prompt"], args.get("attachments"))
+    # Presence-sensitive cap: an ABSENT max_run_usd takes the engine default;
+    # an explicit JSON null arrives as None and means uncapped. `args.get`
+    # with a default would collapse the two.
+    cap_kwargs: dict[str, Any] = {}
+    if "max_run_usd" in args:
+        cap_kwargs["max_run_usd"] = args["max_run_usd"]
+    result = await research_mod.research(
+        prompt,
+        tier=args.get("tier", "standard"),
+        director=args.get("director"),
+        max_rounds=args.get("max_rounds", 6),
+        max_output_tokens=args.get("max_output_tokens"),
+        on_progress=on_progress,
+        **cap_kwargs,
+    )
+    # The dossier is the one deliberately-large field; it ships as a
+    # resource, not inline. Everything else in the result is capsule-sized.
+    payload = result.model_dump(exclude={"dossier"})
+    payload["dossier_uri"] = f"consult://runs/{result.run_id}/dossier/dossier.md"
+    payload["dossier_chars"] = len(result.dossier)
+    payload["summary"] = _research_summary(result)
+    # Best-effort observability pointers (parity with _augment_result; the
+    # panel-manifest summary and viewer render don't apply to a research
+    # run until the viewer learns the shape in issue #92 PR 6).
+    try:
+        root = artifacts.load_run(result.run_id).root
+        for filename, key in (("_progress.log", "progress_log"), ("journal.jsonl", "journal_path")):
+            path = root / filename
+            if path.exists():
+                payload[key] = str(path)
+    except Exception as e:  # noqa: BLE001 — pointers must never sink the result
+        logger.warning("research observability pointers failed for %s: %s", result.run_id, e)
+    return payload
 
 
 async def refine(args: dict[str, Any], *, on_progress: ProgressCallback | None = None) -> dict[str, Any]:

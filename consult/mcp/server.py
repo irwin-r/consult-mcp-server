@@ -121,6 +121,13 @@ _SEQUENCE_ANN = ToolAnnotations(
     idempotentHint=False,
     openWorldHint=True,
 )
+_RESEARCH_ANN = ToolAnnotations(
+    title="Director-driven research loop",
+    readOnlyHint=False,
+    destructiveHint=False,
+    idempotentHint=False,
+    openWorldHint=True,
+)
 
 
 @server.list_tools()
@@ -199,6 +206,35 @@ async def handle_list_tools() -> list[Tool]:
     # registered (so an explicit call still works); it just isn't advertised
     # unless CONSULT_ENABLE_SEQUENCE is set, so it can be revisited with usage
     # data without re-implementing anything.
+    # `research` ships env-gated (issue #92, same rollout as sequence):
+    # dogfood it behind CONSULT_ENABLE_RESEARCH, promote with usage data.
+    if env_bool("CONSULT_ENABLE_RESEARCH"):
+        tools.append(
+            Tool(
+                name="research",
+                description=(
+                    "Run a director-driven research loop on an open-ended goal: a "
+                    "director model freezes a brief (explicit assumptions, deliverable "
+                    "sections, per-section acceptance bars), then repeatedly plans work "
+                    "items, executes each as a panel/consult sub-run, assembles a "
+                    "dossier, and judges it against the brief until accepted, stalled, "
+                    "over budget, or out of rounds. "
+                    "Use when: the goal is too big for one panel — strategy dossiers, "
+                    "multi-part research deliverables ('plan an e-commerce brand'). "
+                    "Don't use for: a single question (use `consult`), iterating on one "
+                    "contested question (use `refine`), or live web facts — workers are "
+                    "one-shot LLM calls without browsing. "
+                    "Long-running (minutes, not seconds): prefer task mode "
+                    "(`params.task`) and poll tasks/get. Costs real money per round; "
+                    "`max_run_usd` defaults to $25 and explicit null opts into UNCAPPED "
+                    "spend (stall detection stays on either way). "
+                    "Returns: {run_id, summary, brief, verdicts, open_gaps, stop_reason, "
+                    "converged, cost_usd, dossier_uri (full dossier as an MCP resource)}."
+                ),
+                inputSchema=schemas.RESEARCH_SCHEMA,
+                annotations=_RESEARCH_ANN,
+            )
+        )
     if env_bool("CONSULT_ENABLE_SEQUENCE"):
         tools.append(
             Tool(
@@ -229,6 +265,9 @@ _HANDLERS = {
     "consult": handlers.consult,
     "refine": handlers.refine,
     "sequence": handlers.sequence,
+    # Dispatch-map entry is all research needs for SEP-1686 task mode —
+    # the background-task plumbing in handle_call_tool is tool-agnostic.
+    "research": handlers.research,
 }
 
 # Tools whose result is a markdown blob rather than a structured dict. The
@@ -561,6 +600,13 @@ async def handle_read_resource(uri: AnyUrl) -> str:
         f = paths.attachment_path(name)
         if not f.exists():
             raise FileNotFoundError(f"Attachment not found: {uri}")
+        return f.read_text()
+    if kind == "dossier":
+        # A research run's assembled document. Exactly one file per run,
+        # so the name segment is fixed rather than caller-chosen.
+        f = paths.root / "dossier.md"
+        if name != "dossier.md" or not f.exists():
+            raise FileNotFoundError(f"Dossier not found: {uri}")
         return f.read_text()
     raise ValueError(f"Unsupported resource kind: {kind}")
 
