@@ -25,6 +25,14 @@
       "family": "claude",
       "privacy_tier": "first_party"
     },
+    "claude-fable": {
+      "litellm_id": "anthropic/claude-fable-5",
+      "default_budget_tokens": 8000,
+      "default_timeout_s": 360,
+      "provider": "anthropic",
+      "family": "claude",
+      "privacy_tier": "first_party"
+    },
     "gpt-pro": {
       "litellm_id": "openai/gpt-5.5-pro",
       "mode": "responses",
@@ -33,7 +41,12 @@
       "provider": "openai",
       "family": "gpt",
       "reasoning_effort": "medium",
-      "privacy_tier": "first_party"
+      "privacy_tier": "first_party",
+      "max_input_tokens": 1050000,
+      "pricing": {
+        "input_usd_per_mtok": 30.0,
+        "output_usd_per_mtok": 180.0
+      }
     },
     "gpt": {
       "litellm_id": "openai/gpt-5.6-sol",
@@ -47,6 +60,14 @@
       "litellm_id": "openai/gpt-5.6-luna",
       "default_budget_tokens": 8000,
       "default_timeout_s": 180,
+      "provider": "openai",
+      "family": "gpt",
+      "privacy_tier": "first_party"
+    },
+    "gpt-terra": {
+      "litellm_id": "openai/gpt-5.6-terra",
+      "default_budget_tokens": 12000,
+      "default_timeout_s": 300,
       "provider": "openai",
       "family": "gpt",
       "privacy_tier": "first_party"
@@ -77,12 +98,17 @@
       "privacy_tier": "first_party"
     },
     "gemini-flash": {
-      "litellm_id": "gemini/gemini-3.5-flash",
+      "litellm_id": "gemini/gemini-3.6-flash",
       "default_budget_tokens": 8000,
       "default_timeout_s": 120,
       "provider": "google",
       "family": "gemini",
-      "privacy_tier": "first_party"
+      "privacy_tier": "first_party",
+      "max_input_tokens": 1048576,
+      "pricing": {
+        "input_usd_per_mtok": 1.5,
+        "output_usd_per_mtok": 7.5
+      }
     },
     "grok": {
       "litellm_id": "openrouter/x-ai/grok-4.5",
@@ -90,7 +116,12 @@
       "default_timeout_s": 240,
       "provider": "openrouter",
       "family": "grok",
-      "privacy_tier": "aggregator"
+      "privacy_tier": "aggregator",
+      "max_input_tokens": 500000,
+      "pricing": {
+        "input_usd_per_mtok": 2.0,
+        "output_usd_per_mtok": 6.0
+      }
     },
     "llama": {
       "litellm_id": "openrouter/meta-llama/llama-4-maverick",
@@ -98,7 +129,12 @@
       "default_timeout_s": 240,
       "provider": "openrouter",
       "family": "llama",
-      "privacy_tier": "aggregator"
+      "privacy_tier": "aggregator",
+      "max_input_tokens": 1048576,
+      "pricing": {
+        "input_usd_per_mtok": 0.2,
+        "output_usd_per_mtok": 0.8
+      }
     },
     "sonar-pro": {
       "litellm_id": "openrouter/perplexity/sonar-pro",
@@ -106,7 +142,12 @@
       "default_timeout_s": 240,
       "provider": "openrouter",
       "family": "perplexity",
-      "privacy_tier": "aggregator"
+      "privacy_tier": "aggregator",
+      "max_input_tokens": 200000,
+      "pricing": {
+        "input_usd_per_mtok": 3.0,
+        "output_usd_per_mtok": 15.0
+      }
     },
     "qwen-max": {
       "litellm_id": "openrouter/qwen/qwen3.7-max",
@@ -114,7 +155,12 @@
       "default_timeout_s": 240,
       "provider": "openrouter",
       "family": "qwen",
-      "privacy_tier": "aggregator"
+      "privacy_tier": "aggregator",
+      "max_input_tokens": 1000000,
+      "pricing": {
+        "input_usd_per_mtok": 1.48,
+        "output_usd_per_mtok": 4.42
+      }
     },
     "deepseek": {
       "litellm_id": "openrouter/deepseek/deepseek-v4-pro",
@@ -122,7 +168,25 @@
       "default_timeout_s": 360,
       "provider": "openrouter",
       "family": "deepseek",
-      "privacy_tier": "aggregator"
+      "privacy_tier": "aggregator",
+      "max_input_tokens": 1048576,
+      "pricing": {
+        "input_usd_per_mtok": 0.43,
+        "output_usd_per_mtok": 0.87
+      }
+    },
+    "deepseek-flash": {
+      "litellm_id": "openrouter/deepseek/deepseek-v4-flash",
+      "default_budget_tokens": 6000,
+      "default_timeout_s": 180,
+      "provider": "openrouter",
+      "family": "deepseek",
+      "privacy_tier": "aggregator",
+      "max_input_tokens": 1048576,
+      "pricing": {
+        "input_usd_per_mtok": 0.09,
+        "output_usd_per_mtok": 0.19
+      }
     },
     "kimi": {
       "litellm_id": "openrouter/moonshotai/kimi-k2.6",
@@ -130,7 +194,25 @@
       "default_timeout_s": 600,
       "provider": "openrouter",
       "family": "moonshot",
-      "privacy_tier": "aggregator"
+      "privacy_tier": "aggregator",
+      "max_input_tokens": 262144,
+      "pricing": {
+        "input_usd_per_mtok": 0.68,
+        "output_usd_per_mtok": 3.42
+      }
+    },
+    "kimi-k3": {
+      "litellm_id": "openrouter/moonshotai/kimi-k3",
+      "default_budget_tokens": 12000,
+      "default_timeout_s": 600,
+      "provider": "openrouter",
+      "family": "moonshot",
+      "privacy_tier": "aggregator",
+      "max_input_tokens": 1048576,
+      "pricing": {
+        "input_usd_per_mtok": 3.0,
+        "output_usd_per_mtok": 15.0
+      }
     },
     "kimi-code": {
       "litellm_id": "openrouter/moonshotai/kimi-k2.7-code",
@@ -138,7 +220,12 @@
       "default_timeout_s": 600,
       "provider": "openrouter",
       "family": "moonshot",
-      "privacy_tier": "aggregator"
+      "privacy_tier": "aggregator",
+      "max_input_tokens": 262144,
+      "pricing": {
+        "input_usd_per_mtok": 0.82,
+        "output_usd_per_mtok": 3.75
+      }
     },
     "glm": {
       "litellm_id": "openrouter/z-ai/glm-5.2",
@@ -146,7 +233,12 @@
       "default_timeout_s": 360,
       "provider": "openrouter",
       "family": "zhipu",
-      "privacy_tier": "aggregator"
+      "privacy_tier": "aggregator",
+      "max_input_tokens": 1048576,
+      "pricing": {
+        "input_usd_per_mtok": 0.82,
+        "output_usd_per_mtok": 2.59
+      }
     },
     "mistral": {
       "litellm_id": "openrouter/mistralai/mistral-medium-3-5",
@@ -154,7 +246,12 @@
       "default_timeout_s": 180,
       "provider": "openrouter",
       "family": "mistral",
-      "privacy_tier": "aggregator"
+      "privacy_tier": "aggregator",
+      "max_input_tokens": 262144,
+      "pricing": {
+        "input_usd_per_mtok": 1.5,
+        "output_usd_per_mtok": 7.5
+      }
     },
     "mimo": {
       "litellm_id": "openrouter/xiaomi/mimo-v2.5-pro",
@@ -169,35 +266,40 @@
     "nano": [
       "claude-haiku",
       "gemini-flash",
-      "gpt-nano"
+      "gpt-nano",
+      "deepseek-flash"
     ],
     "quick": [
       "claude-haiku",
       "gemini-pro",
       "grok",
       "qwen-max",
-      "kimi"
+      "kimi",
+      "deepseek-flash"
     ],
     "standard": [
       "claude-opus",
       "claude-sonnet",
       "gpt",
+      "gpt-terra",
       "gemini-pro",
       "grok",
       "qwen-max",
-      "kimi",
+      "kimi-k3",
       "glm",
       "llama"
     ],
     "deep": [
+      "claude-fable",
       "claude-opus",
       "claude-sonnet",
       "gpt-pro",
       "gpt",
+      "gpt-terra",
       "gemini-pro",
       "grok",
       "qwen-max",
-      "kimi",
+      "kimi-k3",
       "glm",
       "llama",
       "mistral",
@@ -214,6 +316,7 @@
       "kimi-code"
     ],
     "review": [
+      "claude-fable",
       "claude-opus",
       "gpt-codex",
       "gpt-pro",
