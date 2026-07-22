@@ -162,10 +162,43 @@ consult-doctor --config # print copy-paste-ready MCP client JSON
 | **`refine`** | Iterative consortium with arbiter scoring (≤3 rounds). | High-stakes; disagreement-heavy. |
 | **`synthesise`** | Re-collapse an existing run via a flagship model. | Different rubric/synthesiser on a prior `run_id`. |
 | **`sequence`** | Chained multi-step where step N depends on N-1. | Decompose-then-answer; plan-then-execute. Opt-in: set `CONSULT_ENABLE_SEQUENCE=1`. |
+| **`research`** | Director loop: frozen brief → rounds of plan/execute/judge until accepted. | Open-ended goals needing a multi-part dossier. Opt-in: set `CONSULT_ENABLE_RESEARCH=1`. |
 
 Tool descriptions are intentionally written as **prompts for the calling
 agent** (verb-first, explicit "use when…/don't use for…") so the agent
 reliably picks the right one without you having to spell it out.
+
+### Deep research (env-gated)
+
+`research` takes an open-ended goal ("plan an e-commerce brand for espresso
+subscriptions") and runs a director loop until the work passes its own
+acceptance bars. Round 0 freezes a *brief*: the director's explicit
+assumptions plus deliverable sections, each with a concrete acceptance
+test. Every later round plans 1-4 work items, executes each as an ordinary
+panel/consult sub-run, assembles the answers into a dossier by section id,
+and judges the dossier against the frozen brief. `evidence` work items
+gather cited live web facts via provider-native search and ride along with
+later rounds' questions.
+
+Things worth knowing before running one:
+
+- **It is slow on purpose.** Sub-runs are patient: slow-tail dropout is off
+  and per-model timeouts are floored at two hours, so a deep model is never
+  cancelled for being slow. Use MCP task mode and poll; progress is also
+  tailable at `~/.consult/runs/<id>/_progress.log`.
+- **Cost**: default cap `$25`, enforced per round *before* spending, with a
+  strict-cap refusal whenever accrued pricing goes unknown. An explicit
+  `max_run_usd: null` opts into uncapped — stall detection (two rounds
+  without progress) stays on either way. Expect roughly $1-4 per round.
+- **The dossier ships as a resource** (`consult://runs/<id>/dossier/dossier.md`),
+  not inline — the result carries a deterministic summary, section statuses,
+  and open gaps. `consult-view <run_id>` renders the whole run as HTML.
+- **Crash recovery**: every phase boundary lands in `journal.jsonl`. If the
+  server restarts mid-run, re-invoke with `continuation_id: "<run_id>"` —
+  committed rounds replay (state and spend restored) and at most one
+  round of work is lost.
+- **Ledger honesty**: the parent run's manifest carries director-side spend
+  only; each sub-run reports its own, so `consult-ledger` totals stay true.
 
 ---
 
@@ -389,6 +422,12 @@ verdict = await refine(
     [ModelSpec(model="claude-opus"), ModelSpec(model="deepseek")],
     threshold=0.85,
 )
+
+# Deep research (director loop; no env gate needed at the library level)
+from consult.research import research
+
+dossier = await research("plan an espresso-bean subscription brand", tier="quick", max_run_usd=5.0)
+print(dossier.stop_reason, dossier.converged, len(dossier.dossier))
 ```
 
 Swap the URI scheme for a non-MCP transport:

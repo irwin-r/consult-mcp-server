@@ -1676,8 +1676,10 @@ def _section_timeline(events: list[dict[str, Any]]) -> str:
             detail_bits.append(_pill(str(status), _status_tone(str(status))))
         if score is not None:
             detail_bits.append(_pill(f"score {float(score):.2f}", "muted"))
-        if round_num is not None and "round" in kind:
+        if round_num is not None and ("round" in kind or kind == "research_phase"):
             detail_bits.append(_pill(f"r{round_num}", "muted"))
+        if e.get("phase"):
+            detail_bits.append(_pill(str(e["phase"]), "muted"))
         if step is not None:
             detail_bits.append(_pill(f"step {step}", "muted"))
         lat_disp = _fmt_ms(latency_ms) if isinstance(latency_ms, int) else ""
@@ -1711,8 +1713,249 @@ def _section_footer(paths: artifacts.RunPaths) -> str:
     """
 
 
+# ---- Research runs (issue #92) ----------------------------------------------
+
+_RESEARCH_CSS = """
+  .brief-table { width: 100%; border-collapse: collapse; margin-top: .5rem; }
+  .brief-table th, .brief-table td {
+    text-align: left; padding: .4rem .6rem; border-bottom: 1px solid var(--border);
+    vertical-align: top; font-size: .9rem;
+  }
+  .round-card {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 8px; padding: .8rem 1rem; margin: .8rem 0;
+  }
+  .round-card h3 { margin: 0 0 .5rem; font-size: 1rem; }
+  .work-item { margin: .5rem 0; padding-left: .6rem; border-left: 3px solid var(--border); }
+  .work-item .q { color: var(--muted-text); font-size: .88rem; margin-top: .2rem; }
+  .gap-list li { margin: .25rem 0; }
+"""
+
+_SECTION_STATUS_TONE = {"accepted": "ok", "draft": "warn", "missing": "err"}
+
+
+def _load_research_data(paths: artifacts.RunPaths, manifest: dict[str, Any]) -> dict[str, Any]:
+    """Research-specific artifacts, tolerant of the crash-path manifest.
+
+    A normally-finalised manifest carries brief/rounds/verdicts inline; a
+    crash-path manifest is minimal, so each piece falls back to its own
+    file (`brief.json`, `verdicts.json`) or to the journal for round
+    structure. Missing pieces render as absent rather than failing.
+    """
+
+    def _load_json_file(path: Path) -> Any:
+        # Best-effort: a malformed artifact degrades the page, never kills
+        # the render.
+        if not path.exists():
+            return None
+        try:
+            return json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError) as e:
+            logger.warning("viewer: skipping malformed research artifact %s: %s", path.name, e)
+            return None
+
+    brief = manifest.get("brief") or _load_json_file(paths.root / "brief.json")
+    verdicts = manifest.get("verdicts") or _load_json_file(paths.root / "verdicts.json") or []
+    rounds = manifest.get("rounds") or _rounds_from_journal(paths)
+    dossier_path = paths.root / "dossier.md"
+    dossier = dossier_path.read_text() if dossier_path.exists() else ""
+    return {"brief": brief, "verdicts": verdicts, "rounds": rounds, "dossier": dossier}
+
+
+def _rounds_from_journal(paths: artifacts.RunPaths) -> list[dict[str, Any]]:
+    """Coarse round reconstruction for crash-path manifests: group journal
+    plan/item_result/verdict records by round."""
+    journal_path = paths.root / "journal.jsonl"
+    if not journal_path.exists():
+        return []
+    by_round: dict[int, dict[str, Any]] = {}
+    for line in journal_path.read_text().splitlines():
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        round_num = rec.get("round")
+        if not isinstance(round_num, int) or round_num < 1:
+            continue
+        bucket = by_round.setdefault(
+            round_num, {"round": round_num, "work_items": [], "results": [], "verdict": None}
+        )
+        if rec.get("phase") == "plan":
+            bucket["work_items"] = rec.get("items") or []
+        elif rec.get("phase") == "item_result":
+            bucket["results"].append(rec.get("result") or {})
+        elif rec.get("phase") == "verdict":
+            bucket["verdict"] = rec.get("verdict")
+    return [by_round[n] for n in sorted(by_round)]
+
+
+def _research_header(run_id: str, manifest: dict[str, Any]) -> str:
+    stop_reason = manifest.get("stop_reason") or "unknown"
+    converged = bool(manifest.get("converged"))
+    rounds_completed = manifest.get("rounds_completed", 0)
+    stats_pieces = [
+        f'<span class="stat-chip"><b>{rounds_completed}</b> rounds</span>',
+        f'<span class="stat-chip">director cost <b>{html.escape(_fmt_cost(manifest.get("cost_usd"), manifest.get("cost_known", True)))}</b></span>',
+        f'<span class="stat-chip">total cost <b>{html.escape(_fmt_cost(manifest.get("total_cost_usd"), manifest.get("total_cost_known", True)))}</b></span>',
+        f'<span class="stat-chip">wall <b>{html.escape(_fmt_ms(manifest.get("wall_ms", 0)))}</b></span>',
+    ]
+    outcome = _pill("converged", "ok") if converged else _pill(stop_reason, "warn")
+    banner = ""
+    if manifest.get("partial") and manifest.get("partial_reason"):
+        banner = (
+            f'<div class="partial-banner">Partial run: {html.escape(str(manifest["partial_reason"]))}</div>'
+        )
+    return f"""
+    <header>
+      <div class="kind">research run</div>
+      <h1>{html.escape(run_id)}</h1>
+      <div class="header-stats">{"".join(stats_pieces)}</div>
+      <div class="status-counts">{outcome}</div>
+      {banner}
+    </header>
+    """
+
+
+def _section_brief(brief: dict[str, Any] | None, verdicts: list[dict[str, Any]]) -> str:
+    if not brief:
+        return ""
+    last_parsed = next(
+        (v for v in reversed(verdicts) if v.get("parsed_ok", True) and v.get("section_status")), None
+    )
+    statuses = (last_parsed or {}).get("section_status", {})
+    assumptions = "".join(f"<li>{html.escape(str(a))}</li>" for a in brief.get("assumptions") or [])
+    rows = []
+    for s in brief.get("sections") or []:
+        sid = str(s.get("id", ""))
+        status = str(statuses.get(sid, "missing"))
+        rows.append(
+            "<tr>"
+            f"<td><code>{html.escape(sid)}</code></td>"
+            f"<td>{html.escape(str(s.get('title', '')))}</td>"
+            f"<td>{html.escape(str(s.get('acceptance', '')))}</td>"
+            f"<td>{_pill(status, _SECTION_STATUS_TONE.get(status, 'muted'))}</td>"
+            "</tr>"
+        )
+    assumptions_html = f"<ul>{assumptions}</ul>" if assumptions else ""
+    return f"""
+    <section>
+      <h2>Brief</h2>
+      {assumptions_html}
+      <table class="brief-table">
+        <tr><th>section</th><th>title</th><th>acceptance bar</th><th>status</th></tr>
+        {"".join(rows)}
+      </table>
+    </section>
+    """
+
+
+def _section_dossier(dossier: str) -> str:
+    if not dossier.strip():
+        return ""
+    return f"""
+    <section>
+      <h2>Dossier</h2>
+      <div class="synth-body">{render_markdown(dossier)}</div>
+    </section>
+    """
+
+
+def _section_rounds(rounds: list[dict[str, Any]]) -> str:
+    if not rounds:
+        return ""
+    cards = []
+    for rnd in rounds:
+        results_by_item = {r.get("item_id"): r for r in rnd.get("results") or []}
+        item_blocks = []
+        for item in rnd.get("work_items") or []:
+            res = results_by_item.get(item.get("id")) or {}
+            status = str(res.get("status") or "planned")
+            run_link = ""
+            if res.get("run_id"):
+                run_link = (
+                    f' <a href="../{html.escape(str(res["run_id"]))}/feed.html">'
+                    f"{html.escape(str(res['run_id']))}</a>"
+                )
+            sections_disp = ", ".join(str(s) for s in item.get("section_ids") or [])
+            item_blocks.append(f"""
+            <div class="work-item">
+              {_pill(str(item.get("kind", "?")), "muted")}
+              <b>{html.escape(str(item.get("id", "")))}</b>
+              → {html.escape(sections_disp)}
+              {_pill(status, _status_tone("OK" if status == "ok" else "ERROR") if status in ("ok", "error") else "muted")}
+              {run_link}
+              <div class="q">{html.escape(str(item.get("question", ""))[:400])}</div>
+            </div>
+            """)
+        verdict = rnd.get("verdict") or {}
+        verdict_html = ""
+        if verdict:
+            gaps = "".join(
+                f"<li><code>{html.escape(str(g.get('id', '')))}</code> "
+                f"{html.escape(str(g.get('text', '')))}</li>"
+                for g in verdict.get("blocking_gaps") or []
+            )
+            gaps_html = f"<ul class='gap-list'>{gaps}</ul>" if gaps else "<p>No blocking gaps.</p>"
+            status_pills = "".join(
+                _pill(f"{sid}: {status}", _SECTION_STATUS_TONE.get(str(status), "muted"))
+                for sid, status in (verdict.get("section_status") or {}).items()
+            )
+            reasoning = html.escape(str(verdict.get("reasoning") or ""))
+            if not verdict.get("parsed_ok", True):
+                verdict_html = (
+                    f"<p>{_pill('judge failed', 'err')} {html.escape(str(verdict.get('error') or ''))}</p>"
+                )
+            else:
+                verdict_html = f"<div>{status_pills}</div>{gaps_html}<p>{reasoning}</p>"
+        cards.append(f"""
+        <div class="round-card">
+          <h3>Round {rnd.get("round", "?")}</h3>
+          {"".join(item_blocks)}
+          {verdict_html}
+        </div>
+        """)
+    return f"""
+    <section>
+      <h2>Rounds</h2>
+      {"".join(cards)}
+    </section>
+    """
+
+
+def _build_research_html(paths: artifacts.RunPaths, data: dict[str, Any]) -> str:
+    manifest = data["manifest"]
+    research = _load_research_data(paths, manifest)
+    title = f"consult research {paths.run_id}"
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>{html.escape(title)}</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>{_CSS}{_RESEARCH_CSS}</style>
+</head>
+<body>
+{_brand_sprite_html()}
+<main>
+{_research_header(paths.run_id, manifest)}
+{_section_brief(research["brief"], research["verdicts"])}
+{_section_dossier(research["dossier"])}
+{_section_rounds(research["rounds"])}
+{_section_prompt(data["prompt"])}
+{_section_timeline(data["events"])}
+{_section_footer(paths)}
+</main>
+</body>
+</html>
+"""
+
+
 def _build_html(paths: artifacts.RunPaths, data: dict[str, Any]) -> str:
     manifest = data["manifest"]
+    # Research runs (issue #92) have a different manifest shape — a director
+    # loop record rather than a panel — and get their own page layout.
+    if manifest.get("kind") == "research":
+        return _build_research_html(paths, data)
     # `entries` carries the augmented list (final-round manifest entries + any
     # reconstructed earlier-round entries from disk); `manifest['manifest']`
     # is the raw last-round-only list. Header status counts use the raw list
