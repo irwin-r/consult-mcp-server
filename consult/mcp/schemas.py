@@ -389,8 +389,8 @@ RESEARCH_SCHEMA = {
             "type": "string",
             "description": (
                 "Default worker tier for sub-runs (e.g. quick, standard, deep). "
-                "Defaults to standard. The director may not override it per "
-                "work item in v1."
+                "Defaults to standard. The director may override it per work "
+                "item; unknown tiers in a plan reject the whole plan."
             ),
         },
         "director": {

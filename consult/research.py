@@ -42,6 +42,7 @@ carries only director-side spend so daily ledger totals don't double-count.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import re
@@ -72,6 +73,17 @@ logger = logging.getLogger(__name__)
 # a research run is a multi-round loop, and the per-round gate (not this
 # number) is the real enforcement point. Explicit None = uncapped.
 DEFAULT_MAX_RUN_USD = 25.0
+
+# Patience floor for every model call in a research run (sub-run panellists
+# and director calls alike). Registry timeouts are sized for interactive
+# panels; a research run would rather wait hours than lose a deep model's
+# answer. None = keep registry defaults.
+DEFAULT_MODEL_TIMEOUT_FLOOR_S = 7200.0
+
+# Headroom reserved out of the cap before slicing per-item budgets, so the
+# round's judge call and the next plan can always run (review finding, #92:
+# director spend was unreserved and capped runs could overshoot).
+_DIRECTOR_RESERVE_USD = 0.50
 
 # Per-section character cap for the dossier view shown to the director.
 # Keeps a long dossier from blowing the judge's context; the on-disk
@@ -140,9 +152,14 @@ Return EXACTLY this JSON object (no commentary, no markdown fences):
 
 {{
   "items": [
-    {{"id": "<id>", "kind": "panel|consult", "question": "<self-contained question>", "section_ids": ["<brief section id>"], "rationale": "<one sentence>"}}
+    {{"id": "<id>", "kind": "panel|consult|evidence", "question": "<self-contained question>", "section_ids": ["<brief section id>"], "rationale": "<one sentence>"}}
   ]
 }}
+
+One more rule: give each panel/consult item exactly ONE section id — its \
+whole answer replaces each listed section verbatim, so multi-section items \
+duplicate one blob everywhere. Evidence items may list every section their \
+facts support. No two items may share a section id in the same round.
 """
 
 _JUDGE_PROMPT = """\
@@ -192,7 +209,7 @@ _RETRY_NUDGE = (
 
 
 async def _director_json(
-    prompt: str, alias: str, *, label: str
+    prompt: str, alias: str, *, label: str, timeout_floor_s: float | None = None
 ) -> tuple[dict[str, Any] | None, float | None, bool, str | None]:
     """One director-role JSON call: primary alias, then the configured
     synthesiser fallbacks, with one parse-failure retry per candidate.
@@ -202,12 +219,18 @@ async def _director_json(
     provider bills unparseable responses too). `data=None` means every
     candidate failed; the caller decides whether that is fail-closed
     (brief, plan) or salvage-tolerant (judge).
+
+    Calls go through the transport retry (transient errors recover on the
+    same candidate instead of burning a fallback) and the shared provider
+    semaphores, so director spend obeys the same rate-limit discipline as
+    panellist calls. `timeout_floor_s` raises the per-call ceiling for
+    patient runs.
     """
     cost: float | None = 0.0
     cost_known = True
 
     async def _attempt(
-        attempt_prompt: str, litellm_id: str, budget: int, timeout: float
+        attempt_prompt: str, litellm_id: str, budget: int, timeout: float, provider: str
     ) -> tuple[dict[str, Any] | None, str | None]:
         nonlocal cost, cost_known
         call_kwargs: dict[str, Any] = {
@@ -217,8 +240,11 @@ async def _director_json(
             "response_format": {"type": "json_object"},
         }
         provider_caps.apply_temperature(call_kwargs, litellm_id, 0.0)
+        sems = runner._get_provider_sems()
+        sem = sems.get(provider) or sems.get("default")
         try:
-            resp = cast(Any, await asyncio.wait_for(litellm.acompletion(**call_kwargs), timeout=timeout))
+            async with sem if sem is not None else contextlib.nullcontext():
+                resp = cast(Any, await runner._acompletion_with_retry(timeout=timeout, **call_kwargs))
         except Exception as e:  # noqa: BLE001 — LiteLLM raises many concrete types
             scrub_exception_attrs(e)
             logger.warning("director %s call failed: %s", label, redact_exc(e))
@@ -258,15 +284,18 @@ async def _director_json(
         if not litellm_id:
             continue
         budget = max(2000, entry.get("default_budget_tokens", 0))
-        timeout = entry.get("default_timeout_s", 180)
+        timeout = float(entry.get("default_timeout_s", 180))
+        if timeout_floor_s is not None:
+            timeout = max(timeout, timeout_floor_s)
+        provider = entry.get("provider", "")
         if idx > 0:
             logger.warning("director %s falling back to %s after: %s", label, litellm_id, last_err)
-        data, err = await _attempt(prompt, litellm_id, budget, timeout)
+        data, err = await _attempt(prompt, litellm_id, budget, timeout, provider)
         if err is not None and err != "json_parse_failed":
             last_err = err
             continue
         if data is None:
-            data, _retry_err = await _attempt(prompt + _RETRY_NUDGE, litellm_id, budget, timeout)
+            data, _retry_err = await _attempt(prompt + _RETRY_NUDGE, litellm_id, budget, timeout, provider)
         if data is not None:
             return data, cost, cost_known, None
         last_err = "json_parse_failed"
@@ -315,9 +344,11 @@ def _parse_plan(data: dict[str, Any], brief: Brief, round_num: int) -> list[Work
         logger.warning("round %d plan has no items", round_num)
         return None
     if len(raw_items) > 4:
+        logger.warning("round %d plan has %d items; truncating to 4", round_num, len(raw_items))
         raw_items = raw_items[:4]
     known_ids = brief.section_ids()
     items: list[WorkItem] = []
+    claimed_sections: set[str] = set()
     for i, raw in enumerate(raw_items, start=1):
         if not isinstance(raw, dict):
             logger.warning("round %d plan item %d is not an object; rejecting plan", round_num, i)
@@ -343,6 +374,34 @@ def _parse_plan(data: dict[str, Any], brief: Brief, round_num: int) -> list[Work
                 sorted(unknown),
             )
             return None
+        # A hallucinated tier crashed the budget gate with an UnknownModelError
+        # before validation existed (review finding, #92) — same fail-closed
+        # treatment as an unknown section id.
+        if item.tier is not None:
+            try:
+                registry.resolve_tier(item.tier)
+            except KeyError:
+                logger.warning(
+                    "round %d plan item %s names unknown tier %r; rejecting plan",
+                    round_num,
+                    item.id,
+                    item.tier,
+                )
+                return None
+        # Section ownership must be exclusive per round for panel/consult
+        # items — concurrent items sharing a section would race to
+        # last-writer-wins. Evidence items only *support* sections, so they
+        # don't claim ownership.
+        if item.kind != "evidence":
+            overlap = claimed_sections & set(item.section_ids)
+            if overlap:
+                logger.warning(
+                    "round %d plan items overlap on sections %s; rejecting plan",
+                    round_num,
+                    sorted(overlap),
+                )
+                return None
+            claimed_sections |= set(item.section_ids)
         items.append(item)
     return items
 
@@ -355,11 +414,14 @@ def _parse_verdict(
     *,
     cost_usd: float | None,
     cost_known: bool,
+    sections_with_content: set[str] | None = None,
 ) -> ResearchVerdict:
-    """Salvage-tolerant verdict parser. Unknown sections are ignored,
-    missing sections default to "draft" (never silently "accepted"), and
-    the reopen guard drops any gap whose id was previously resolved."""
+    """Salvage-tolerant verdict parser. Unknown sections are ignored, an
+    unscored section defaults to "missing" when it has no body yet and
+    "draft" when it does (never silently "accepted"), and the reopen
+    guard drops any gap whose normalised id was previously resolved."""
     known_ids = brief.section_ids()
+    has_content = sections_with_content or set()
     raw_status = data.get("section_status")
     section_status: dict[str, str] = {}
     if isinstance(raw_status, dict):
@@ -368,7 +430,7 @@ def _parse_verdict(
             if key in known_ids and status in ("missing", "draft", "accepted"):
                 section_status[key] = status
     for sid in known_ids:
-        section_status.setdefault(sid, "draft")
+        section_status.setdefault(sid, "draft" if sid in has_content else "missing")
 
     gaps: list[ResearchGap] = []
     raw_gaps = data.get("blocking_gaps")
@@ -376,7 +438,9 @@ def _parse_verdict(
         for i, raw in enumerate(raw_gaps, start=1):
             if not isinstance(raw, dict):
                 continue
-            gap_id = str(raw.get("id") or f"g{round_num}-{i}")
+            # Normalised so a judge emitting "G1-1" or " g1-1 " can't slip a
+            # resolved gap past the reopen guard (review finding, #92).
+            gap_id = _norm_id(raw.get("id")) or f"g{round_num}-{i}"
             if gap_id in resolved_gap_ids:
                 logger.info("reopen guard: dropping resolved gap %s re-raised in round %d", gap_id, round_num)
                 continue
@@ -454,8 +518,15 @@ def _render_gaps(gaps: list[ResearchGap]) -> str:
 
 
 def _journal_write(paths: artifacts.RunPaths, record: dict[str, Any]) -> None:
-    with (paths.root / "journal.jsonl").open("a") as f:
-        f.write(json.dumps(record, default=str) + "\n")
+    # Mirrors append_progress_log: a disk hiccup must not destroy a run
+    # that has already spent real money. A missing journal line degrades
+    # resume fidelity for this run; that is strictly better than losing
+    # the in-memory result AND the ledger record (review finding, #92).
+    try:
+        with (paths.root / "journal.jsonl").open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, default=str) + "\n")
+    except OSError as e:
+        logger.warning("research journal write failed (%s); continuing without it", e)
 
 
 async def _journal(paths: artifacts.RunPaths, **record: Any) -> None:
@@ -473,6 +544,7 @@ async def _execute_item(
     max_output_tokens: int | None,
     sem: asyncio.Semaphore,
     evidence_context: str = "",
+    timeout_floor_s: float | None = None,
 ) -> tuple[WorkItemResult, str, evidence.EvidencePack | None]:
     """Run one work item. Returns (result record, section body, evidence
     pack). Panel/consult items produce a body and no pack; evidence items
@@ -489,6 +561,8 @@ async def _execute_item(
                     item.question,
                     max_run_usd=max_run_usd,
                     max_output_tokens=max_output_tokens,
+                    timeout_floor_s=timeout_floor_s,
+                    tail_dropout_s=0.0,
                 )
         except Exception as e:  # noqa: BLE001 — sub-run failure must not crash the round
             scrub_exception_attrs(e)
@@ -538,6 +612,10 @@ async def _execute_item(
                 capsule_kind="decision",
                 max_run_usd=max_run_usd,
                 max_output_tokens=max_output_tokens,
+                # Patient sub-runs: no slow-tail dropout, floored timeouts —
+                # losing a deep model costs more than the wall-clock saved.
+                timeout_floor_s=timeout_floor_s,
+                tail_dropout_s=0.0,
             )
     except Exception as e:  # noqa: BLE001 — sub-run failure must not crash the round
         scrub_exception_attrs(e)
@@ -610,6 +688,7 @@ async def research(
     max_run_usd: float | None = DEFAULT_MAX_RUN_USD,
     max_parallel_items: int = 3,
     max_output_tokens: int | None = None,
+    model_timeout_floor_s: float | None = DEFAULT_MODEL_TIMEOUT_FLOOR_S,
     on_progress: ProgressCallback | None = None,
 ) -> ResearchResult:
     """Run the director loop until the dossier passes the frozen brief.
@@ -617,6 +696,14 @@ async def research(
     `max_run_usd=None` is the explicit uncapped opt-in; the default cap is
     `DEFAULT_MAX_RUN_USD`. Stall detection is always on. `tier` is the
     default worker tier; the director may override per work item.
+
+    Research runs are PATIENT by default: slow-tail dropout is disabled
+    for every sub-run and each model's per-call timeout is raised to at
+    least `model_timeout_floor_s` (default two hours), so a deep model is
+    never cancelled for being slow — losing a costly panellist mid-run
+    wastes more than the wall-clock it saves. Pass None to keep the
+    registry's interactive-scale timeouts. Heartbeats and the progress
+    log keep long waits observable.
     """
     if max_rounds < 1:
         raise ValueError("max_rounds must be >= 1")
@@ -632,7 +719,8 @@ async def research(
     )
 
     start = time.time()
-    meter = CostMeter()
+    meter = CostMeter()  # everything: director + sub-runs (the API total)
+    director_meter = CostMeter()  # director calls only (the parent manifest's spend)
 
     async def _emit(event: ProgressEvent) -> None:
         append_progress_log(paths.root, event)
@@ -652,12 +740,34 @@ async def research(
             **kwargs,
         )
 
+    def _write_parent_manifest(payload: dict[str, Any]) -> None:
+        # The parent manifest's cost fields carry DIRECTOR-ONLY spend: every
+        # sub-run wrote its own manifest, and consult-ledger sums cost_usd
+        # across all run dirs, so writing the full total here double-counted
+        # (review finding, #92). The full total ships on the API result and
+        # rides along as total_cost_usd for humans reading the file.
+        artifacts.write_manifest(
+            paths,
+            {
+                "kind": "research",
+                **payload,
+                "cost_usd": director_meter.total,
+                "cost_known": director_meter.known,
+                "total_cost_usd": meter.total,
+                "total_cost_known": meter.known,
+            },
+        )
+
     # ---- Round 0: the frozen brief ------------------------------------------
     await _emit(ResearchPhase(done=0, total=max_rounds, phase="brief", round=0))
     data, cost, cost_known, err = await _director_json(
-        _BRIEF_PROMPT.format(goal=prompt), director_alias, label="brief"
+        _BRIEF_PROMPT.format(goal=prompt),
+        director_alias,
+        label="brief",
+        timeout_floor_s=model_timeout_floor_s,
     )
     meter.add(cost or 0.0, cost_known)
+    director_meter.add(cost or 0.0, cost_known)
     brief: Brief | None = None
     if data is not None:
         try:
@@ -666,16 +776,20 @@ async def research(
             err = f"brief invalid: {e}"
     if brief is None:
         reason = f"director failed to produce a brief: {err}"
-        await _journal(paths, phase="brief_failed", error=reason)
-        return _result(
+        await _journal(paths, phase="brief_failed", error=reason, cost_usd=cost, cost_known=cost_known)
+        result = _result(
             brief=None,
             rounds_completed=0,
             partial=True,
             partial_reason=reason,
             stop_reason="director_error",
         )
+        # Even a failed brief billed a director call; the manifest must exist
+        # so the ledger sees the spend.
+        await asyncio.to_thread(_write_parent_manifest, result.model_dump(exclude={"dossier"}))
+        return result
     await asyncio.to_thread((paths.root / "brief.json").write_text, json.dumps(brief.model_dump(), indent=2))
-    await _journal(paths, phase="brief", brief=brief.model_dump())
+    await _journal(paths, phase="brief", brief=brief.model_dump(), cost_usd=cost, cost_known=cost_known)
 
     # ---- Rounds --------------------------------------------------------------
     sections: dict[str, dict[str, Any]] = {}
@@ -691,150 +805,228 @@ async def research(
     stop_reason = "max_rounds"
     partial_reason: str | None = None
     item_sem = asyncio.Semaphore(max(1, max_parallel_items))
+    loop_completed = False
 
-    for round_num in range(1, max_rounds + 1):
-        # Plan — fail-closed. The dossier state carries an evidence tally so
-        # the director knows whether grounding already happened.
-        await _emit(ResearchPhase(done=round_num - 1, total=max_rounds, phase="plan", round=round_num))
-        dossier_state = _render_dossier_state(brief, sections, statuses)
-        gathered = evidence.merged_records(packs)
-        if gathered:
-            dossier_state += f"\nEvidence gathered: {len(gathered)} web source(s) from {len(packs)} pass(es)"
-        plan_prompt = _PLAN_PROMPT.format(
-            round_num=round_num,
-            max_rounds=max_rounds,
-            brief=_render_brief(brief),
-            dossier_state=dossier_state,
-            gaps=_render_gaps(open_gaps),
-        )
-        data, cost, cost_known, err = await _director_json(plan_prompt, director_alias, label="plan")
-        meter.add(cost or 0.0, cost_known)
-        items = _parse_plan(data, brief, round_num) if data is not None else None
-        if items is None:
-            stop_reason = "director_error"
-            partial_reason = f"round {round_num} plan unusable: {err or 'failed validation'}"
-            await _journal(paths, phase="plan_failed", round=round_num, error=partial_reason)
-            break
-        await _journal(paths, phase="plan", round=round_num, items=[i.model_dump() for i in items])
-
-        # Per-round budget gate: accrued + projection, BEFORE execution.
-        if max_run_usd is not None:
-            projection, proj_known = await _project_round_cost(items, tier)
-            if not proj_known:
-                stop_reason = "budget"
-                partial_reason = (
-                    f"round {round_num} projection includes unknown pricing; refusing to spend "
-                    f"blind under a strict cap (spent ${meter.total:.2f}, cap ${max_run_usd:.2f}). "
-                    "Pass max_run_usd=None to run uncapped."
+    try:
+        for round_num in range(1, max_rounds + 1):
+            # Plan — fail-closed. The dossier state carries an evidence tally so
+            # the director knows whether grounding already happened.
+            await _emit(ResearchPhase(done=round_num - 1, total=max_rounds, phase="plan", round=round_num))
+            dossier_state = _render_dossier_state(brief, sections, statuses)
+            gathered = evidence.merged_records(packs)
+            if gathered:
+                dossier_state += (
+                    f"\nEvidence gathered: {len(gathered)} web source(s) from {len(packs)} pass(es)"
                 )
-                await _journal(paths, phase="budget_refused", round=round_num, reason=partial_reason)
-                break
-            if meter.total + projection > max_run_usd:
-                stop_reason = "budget"
-                partial_reason = (
-                    f"round {round_num} would exceed cap: spent ${meter.total:.2f}, "
-                    f"projection ${projection:.2f}, cap ${max_run_usd:.2f}"
-                )
-                await _journal(paths, phase="budget_refused", round=round_num, reason=partial_reason)
-                break
-
-        # Execute — child cap slices; failures trapped per item. Prior
-        # rounds' evidence rides along with every panel/consult question.
-        await _emit(ResearchPhase(done=round_num - 1, total=max_rounds, phase="execute", round=round_num))
-        per_item_cap = None if max_run_usd is None else max(0.0, max_run_usd - meter.total) / len(items)
-        evidence_context = evidence.render_evidence_pack(gathered) if gathered else ""
-        outcomes = await asyncio.gather(
-            *(
-                _execute_item(
-                    item,
-                    tier=tier,
-                    max_run_usd=per_item_cap,
-                    max_output_tokens=max_output_tokens,
-                    sem=item_sem,
-                    evidence_context=evidence_context,
-                )
-                for item in items
+            plan_prompt = _PLAN_PROMPT.format(
+                round_num=round_num,
+                max_rounds=max_rounds,
+                brief=_render_brief(brief),
+                dossier_state=dossier_state,
+                gaps=_render_gaps(open_gaps),
             )
-        )
-        results: list[WorkItemResult] = []
-        for item, (res, body, pack) in zip(items, outcomes, strict=True):
-            results.append(res)
-            meter.add(res.cost_usd or 0.0, res.cost_known)
-            await _journal(paths, phase="item_result", round=round_num, result=res.model_dump())
-            if res.status != "ok":
-                continue
-            if pack is not None:
-                # Evidence items feed later rounds, never the dossier —
-                # writing their empty body would clobber a real section.
-                packs.append(pack)
-                await _journal(
-                    paths, phase="evidence", round=round_num, item_id=item.id, sources=len(pack.records)
-                )
-                continue
-            for sid in item.section_ids:
-                sections[sid] = {"body": body, "run_id": res.run_id, "round": round_num}
-        await asyncio.to_thread(
-            (paths.root / "dossier.md").write_text,
-            _render_dossier(brief, sections, provenance=True, clip=False),
-        )
-        await _journal(paths, phase="assembled", round=round_num, sections=sorted(sections))
-
-        # Judge — salvage-tolerant.
-        await _emit(ResearchPhase(done=round_num - 1, total=max_rounds, phase="judge", round=round_num))
-        judge_prompt = _JUDGE_PROMPT.format(
-            round_num=round_num,
-            brief=_render_brief(brief),
-            dossier=_render_dossier(brief, sections, provenance=False, clip=True),
-            resolved=", ".join(sorted(resolved_gap_ids)) or "(none)",
-            prior_gaps=_render_gaps(open_gaps),
-        )
-        data, cost, cost_known, err = await _director_json(judge_prompt, director_alias, label="judge")
-        meter.add(cost or 0.0, cost_known)
-        if data is None:
-            verdict = ResearchVerdict(
+            data, cost, cost_known, err = await _director_json(
+                plan_prompt, director_alias, label="plan", timeout_floor_s=model_timeout_floor_s
+            )
+            meter.add(cost or 0.0, cost_known)
+            director_meter.add(cost or 0.0, cost_known)
+            items = _parse_plan(data, brief, round_num) if data is not None else None
+            if items is None:
+                stop_reason = "director_error"
+                partial_reason = f"round {round_num} plan unusable: {err or 'failed validation'}"
+                await _journal(paths, phase="plan_failed", round=round_num, error=partial_reason)
+                break
+            await _journal(
+                paths,
+                phase="plan",
                 round=round_num,
+                items=[i.model_dump() for i in items],
                 cost_usd=cost,
                 cost_known=cost_known,
-                parsed_ok=False,
-                error=err or "judge_failed",
             )
-        else:
-            verdict = _parse_verdict(
-                data, brief, round_num, resolved_gap_ids, cost_usd=cost, cost_known=cost_known
-            )
-        verdicts.append(verdict)
-        rounds.append(ResearchRound(round=round_num, work_items=items, results=results, verdict=verdict))
-        await _journal(paths, phase="verdict", round=round_num, verdict=verdict.model_dump())
 
-        if not verdict.parsed_ok:
-            judge_failures += 1
-            if judge_failures >= 2:
-                stop_reason = "director_error"
-                partial_reason = f"judge failed twice in a row (last: {verdict.error})"
+            # Per-round budget gate: accrued + projection + director reserve,
+            # BEFORE execution. Also refuses when the ACCRUED total itself has
+            # gone unknown — gating a known cap against a known-understated
+            # meter is spending blind (review finding, #92).
+            if max_run_usd is not None:
+                if not meter.known:
+                    stop_reason = "budget"
+                    partial_reason = (
+                        f"accrued spend includes unknown pricing after round {round_num - 1}; "
+                        f"refusing further rounds under a strict cap (known spend ${meter.total:.2f}, "
+                        f"cap ${max_run_usd:.2f}). Pass max_run_usd=None to run uncapped."
+                    )
+                    await _journal(paths, phase="budget_refused", round=round_num, reason=partial_reason)
+                    break
+                projection, proj_known = await _project_round_cost(items, tier)
+                if not proj_known:
+                    stop_reason = "budget"
+                    partial_reason = (
+                        f"round {round_num} projection includes unknown pricing; refusing to spend "
+                        f"blind under a strict cap (spent ${meter.total:.2f}, cap ${max_run_usd:.2f}). "
+                        "Pass max_run_usd=None to run uncapped."
+                    )
+                    await _journal(paths, phase="budget_refused", round=round_num, reason=partial_reason)
+                    break
+                if meter.total + projection + _DIRECTOR_RESERVE_USD > max_run_usd:
+                    stop_reason = "budget"
+                    partial_reason = (
+                        f"round {round_num} would exceed cap: spent ${meter.total:.2f}, "
+                        f"projection ${projection:.2f} plus ${_DIRECTOR_RESERVE_USD:.2f} director "
+                        f"reserve, cap ${max_run_usd:.2f}"
+                    )
+                    await _journal(paths, phase="budget_refused", round=round_num, reason=partial_reason)
+                    break
+
+            # Execute — child cap slices; failures trapped per item. Prior
+            # rounds' evidence rides along with every panel/consult question.
+            await _emit(ResearchPhase(done=round_num - 1, total=max_rounds, phase="execute", round=round_num))
+            if max_run_usd is None:
+                per_item_cap = None
+            else:
+                remaining = max(0.0, max_run_usd - meter.total - _DIRECTOR_RESERVE_USD)
+                per_item_cap = remaining / len(items)
+                if per_item_cap < 0.01:
+                    # A near-zero slice guarantees every sub-run refuses at its
+                    # own gate — burning latency to produce error entries. Stop
+                    # the round cleanly instead (review finding, #92).
+                    stop_reason = "budget"
+                    partial_reason = (
+                        f"round {round_num} per-item budget slice is ${per_item_cap:.4f}; "
+                        f"cap ${max_run_usd:.2f} is effectively exhausted at ${meter.total:.2f}"
+                    )
+                    await _journal(paths, phase="budget_refused", round=round_num, reason=partial_reason)
+                    break
+            evidence_context = evidence.render_evidence_pack(gathered) if gathered else ""
+            outcomes = await asyncio.gather(
+                *(
+                    _execute_item(
+                        item,
+                        tier=tier,
+                        max_run_usd=per_item_cap,
+                        max_output_tokens=max_output_tokens,
+                        sem=item_sem,
+                        evidence_context=evidence_context,
+                        timeout_floor_s=model_timeout_floor_s,
+                    )
+                    for item in items
+                )
+            )
+            results: list[WorkItemResult] = []
+            for item, (res, body, pack) in zip(items, outcomes, strict=True):
+                results.append(res)
+                meter.add(res.cost_usd or 0.0, res.cost_known)
+                await _journal(paths, phase="item_result", round=round_num, result=res.model_dump())
+                if res.status != "ok":
+                    continue
+                if pack is not None:
+                    # Evidence items feed later rounds, never the dossier —
+                    # writing their empty body would clobber a real section.
+                    packs.append(pack)
+                    await _journal(
+                        paths, phase="evidence", round=round_num, item_id=item.id, sources=len(pack.records)
+                    )
+                    continue
+                for sid in item.section_ids:
+                    sections[sid] = {"body": body, "run_id": res.run_id, "round": round_num}
+            await asyncio.to_thread(
+                (paths.root / "dossier.md").write_text,
+                _render_dossier(brief, sections, provenance=True, clip=False),
+            )
+            await _journal(paths, phase="assembled", round=round_num, sections=sorted(sections))
+
+            # Judge — salvage-tolerant.
+            await _emit(ResearchPhase(done=round_num - 1, total=max_rounds, phase="judge", round=round_num))
+            judge_prompt = _JUDGE_PROMPT.format(
+                round_num=round_num,
+                brief=_render_brief(brief),
+                dossier=_render_dossier(brief, sections, provenance=False, clip=True),
+                resolved=", ".join(sorted(resolved_gap_ids)) or "(none)",
+                prior_gaps=_render_gaps(open_gaps),
+            )
+            data, cost, cost_known, err = await _director_json(
+                judge_prompt, director_alias, label="judge", timeout_floor_s=model_timeout_floor_s
+            )
+            meter.add(cost or 0.0, cost_known)
+            director_meter.add(cost or 0.0, cost_known)
+            if data is None:
+                verdict = ResearchVerdict(
+                    round=round_num,
+                    cost_usd=cost,
+                    cost_known=cost_known,
+                    parsed_ok=False,
+                    error=err or "judge_failed",
+                )
+            else:
+                verdict = _parse_verdict(
+                    data,
+                    brief,
+                    round_num,
+                    resolved_gap_ids,
+                    cost_usd=cost,
+                    cost_known=cost_known,
+                    sections_with_content=set(sections),
+                )
+            verdicts.append(verdict)
+            rounds.append(ResearchRound(round=round_num, work_items=items, results=results, verdict=verdict))
+            await _journal(paths, phase="verdict", round=round_num, verdict=verdict.model_dump())
+
+            if not verdict.parsed_ok:
+                judge_failures += 1
+                if judge_failures >= 2:
+                    stop_reason = "director_error"
+                    partial_reason = f"judge failed twice in a row (last: {verdict.error})"
+                    break
+                continue
+            judge_failures = 0
+            statuses = dict(verdict.section_status)
+
+            # A gap the judge stopped reporting is resolved — permanently.
+            reported = {g.id for g in verdict.blocking_gaps}
+            resolved_gap_ids |= {g.id for g in open_gaps if g.id not in reported}
+            open_gaps = list(verdict.blocking_gaps)
+
+            if verdict.accepted(brief):
+                stop_reason = "accepted"
                 break
-            continue
-        judge_failures = 0
-        statuses = dict(verdict.section_status)
 
-        # A gap the judge stopped reporting is resolved — permanently.
-        reported = {g.id for g in verdict.blocking_gaps}
-        resolved_gap_ids |= {g.id for g in open_gaps if g.id not in reported}
-        open_gaps = list(verdict.blocking_gaps)
+            # Stall: no newly accepted section AND no drop in blocking gaps,
+            # two rounds running.
+            accepted_n = sum(1 for s in statuses.values() if s == "accepted")
+            progress = (accepted_n, -len(open_gaps))
+            improved = (
+                progress_prev is None or progress[0] > progress_prev[0] or progress[1] > progress_prev[1]
+            )
+            stall = 0 if improved else stall + 1
+            progress_prev = progress
+            if stall >= 2:
+                stop_reason = "stalled"
+                break
 
-        if verdict.accepted(brief):
-            stop_reason = "accepted"
-            break
-
-        # Stall: no newly accepted section AND no drop in blocking gaps,
-        # two rounds running.
-        accepted_n = sum(1 for s in statuses.values() if s == "accepted")
-        progress = (accepted_n, -len(open_gaps))
-        improved = progress_prev is None or progress[0] > progress_prev[0] or progress[1] > progress_prev[1]
-        stall = 0 if improved else stall + 1
-        progress_prev = progress
-        if stall >= 2:
-            stop_reason = "stalled"
-            break
+        loop_completed = True
+    finally:
+        if not loop_completed:
+            # Crash/cancel path: best-effort persistence so the spend still
+            # reaches the ledger and the dossier-so-far survives a mid-run
+            # exception or a task-mode cancel (review finding, #92).
+            with contextlib.suppress(Exception):
+                (paths.root / "dossier.md").write_text(
+                    _render_dossier(brief, sections, provenance=True, clip=False)
+                )
+            with contextlib.suppress(Exception):
+                (paths.root / "verdicts.json").write_text(
+                    json.dumps([v.model_dump() for v in verdicts], indent=2)
+                )
+            with contextlib.suppress(Exception):
+                _write_parent_manifest(
+                    {
+                        "run_id": paths.run_id,
+                        "rounds_completed": len(rounds),
+                        "partial": True,
+                        "partial_reason": "run aborted before finalise",
+                    }
+                )
 
     # ---- Finalise ------------------------------------------------------------
     dossier = _render_dossier(brief, sections, provenance=True, clip=False)
@@ -856,11 +1048,5 @@ async def research(
         partial=partial_reason is not None,
         partial_reason=partial_reason,
     )
-    # The parent manifest carries only director-side spend context; sub-runs
-    # wrote their own manifests, so the daily ledger never double-counts.
-    await asyncio.to_thread(
-        artifacts.write_manifest,
-        paths,
-        {"kind": "research", **result.model_dump(exclude={"dossier"})},
-    )
+    await asyncio.to_thread(_write_parent_manifest, result.model_dump(exclude={"dossier"}))
     return result

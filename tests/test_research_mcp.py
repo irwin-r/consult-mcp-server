@@ -143,3 +143,47 @@ async def test_read_resource_serves_the_dossier(monkeypatch, tmp_path):
 
     with pytest.raises(FileNotFoundError):
         await server_mod.handle_read_resource(AnyUrl("consult://runs/20260722-000000-22222/dossier/other.md"))
+
+
+@pytest.mark.asyncio
+async def test_handler_omits_dossier_uri_when_brief_failed(monkeypatch, tmp_path):
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+
+    async def fake_research(prompt, **kwargs):
+        return ResearchResult(
+            run_id="20260722-000000-33333",
+            brief=None,
+            rounds_completed=0,
+            cost_usd=0.01,
+            cost_known=True,
+            wall_ms=10,
+            partial=True,
+            partial_reason="director failed to produce a brief: junk",
+            stop_reason="director_error",
+        )
+
+    monkeypatch.setattr(research_mod, "research", fake_research)
+
+    payload = await handlers.research({"prompt": "goal"})
+
+    assert "dossier_uri" not in payload
+    assert "dossier_chars" not in payload
+
+
+@pytest.mark.asyncio
+async def test_summary_walks_back_past_parse_failed_verdict(monkeypatch, tmp_path):
+    monkeypatch.setattr(artifacts, "runs_root", lambda: tmp_path)
+    result = _fake_result()
+    result.verdicts.append(
+        ResearchVerdict(round=2, parsed_ok=False, error="judge_failed", cost_usd=None, cost_known=False)
+    )
+
+    async def fake_research(prompt, **kwargs):
+        return result
+
+    monkeypatch.setattr(research_mod, "research", fake_research)
+
+    payload = await handlers.research({"prompt": "goal"})
+
+    # The parse-failed final verdict must not erase the accepted status.
+    assert "Niche [niche]: accepted" in payload["summary"]

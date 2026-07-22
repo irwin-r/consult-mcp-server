@@ -53,7 +53,7 @@ class ScriptedDirector:
         self.queues = {"brief": [brief], "plan": list(plans), "judge": list(judges)}
         self.calls: list[str] = []
 
-    async def __call__(self, prompt, alias, *, label):
+    async def __call__(self, prompt, alias, *, label, **_kw):
         self.calls.append(label)
         queue = self.queues[label]
         data = queue.pop(0) if queue else None
@@ -72,7 +72,7 @@ def rig(tmp_path, monkeypatch):
     async def fake_consult(
         question, *, tier="standard", capsule_kind="decision", max_run_usd=None, max_output_tokens=None, **kw
     ):
-        calls.append({"question": question, "tier": tier, "max_run_usd": max_run_usd})
+        calls.append({"question": question, "tier": tier, "max_run_usd": max_run_usd, **kw})
         return SimpleNamespace(
             run_id=f"sub-{len(calls)}",
             synthesis=f"ANSWER to: {question}",
@@ -119,6 +119,16 @@ async def test_converges_when_judge_accepts(rig):
     # The judge's dossier view is provenance-free; the disk copy is not.
     assert "source: run sub-" in (run_dir / "dossier.md").read_text()
 
+    # Ledger contract: the parent manifest carries DIRECTOR-ONLY spend
+    # (sub-runs self-report), with the full total alongside for humans.
+    manifest = json.loads((run_dir / "manifest.json").read_text())
+    assert manifest["cost_usd"] == pytest.approx(0.01 * 3)
+    assert manifest["total_cost_usd"] == pytest.approx(result.cost_usd)
+
+    # Patient sub-runs: dropout off, timeouts floored at the default.
+    assert all(c["tail_dropout_s"] == 0.0 for c in rig.consult_calls)
+    assert all(c["timeout_floor_s"] == research.DEFAULT_MODEL_TIMEOUT_FLOOR_S for c in rig.consult_calls)
+
 
 @pytest.mark.asyncio
 async def test_plan_targeting_unknown_section_is_fail_closed(rig):
@@ -132,6 +142,101 @@ async def test_plan_targeting_unknown_section_is_fail_closed(rig):
     assert result.partial is True
     assert result.rounds_completed == 0
     assert rig.consult_calls == []  # nothing executed from a rejected plan
+
+
+@pytest.mark.asyncio
+async def test_plan_with_hallucinated_tier_is_fail_closed(rig):
+    """An unknown tier used to crash the budget gate with an
+    UnknownModelError instead of rejecting the plan (review finding)."""
+    bad_plan = {
+        "items": [
+            {
+                "id": "r1-1",
+                "kind": "consult",
+                "question": "q",
+                "section_ids": ["niche"],
+                "tier": "no-such-tier",
+            }
+        ]
+    }
+    director = ScriptedDirector(brief=BRIEF_DATA, plans=[bad_plan])
+    rig.monkeypatch.setattr(research, "_director_json", director)
+
+    result = await research.research("goal", max_run_usd=25.0)
+
+    assert result.stop_reason == "director_error"
+    assert result.partial is True
+    assert rig.consult_calls == []
+
+
+@pytest.mark.asyncio
+async def test_plan_with_overlapping_sections_is_fail_closed(rig):
+    overlapping = {
+        "items": [
+            {"id": "r1-1", "kind": "consult", "question": "a", "section_ids": ["niche"]},
+            {"id": "r1-2", "kind": "panel", "question": "b", "section_ids": ["niche"]},
+        ]
+    }
+    director = ScriptedDirector(brief=BRIEF_DATA, plans=[overlapping])
+    rig.monkeypatch.setattr(research, "_director_json", director)
+
+    result = await research.research("goal")
+
+    assert result.stop_reason == "director_error"
+    assert rig.consult_calls == []
+
+
+@pytest.mark.asyncio
+async def test_strict_cap_refuses_after_accrued_cost_goes_unknown(rig):
+    """Once an item's spend is unknown, gating a known cap against a
+    known-understated meter is spending blind (review finding)."""
+
+    async def unknown_cost_consult(question, **kw):
+        rig.consult_calls.append({"question": question})
+        return SimpleNamespace(
+            run_id="sub-u",
+            synthesis="ANSWER",
+            cost_usd=None,
+            cost_known=False,
+            partial=False,
+            partial_reason=None,
+        )
+
+    rig.monkeypatch.setattr(orchestrate, "consult", unknown_cost_consult)
+    judge_r1 = {
+        "section_status": {"niche": "accepted", "brand": "draft"},
+        "blocking_gaps": [{"id": "g1", "text": "brand thin", "section_id": "brand"}],
+    }
+    replan = {"items": [{"id": "r2-1", "kind": "consult", "question": "more", "section_ids": ["brand"]}]}
+    director = ScriptedDirector(brief=BRIEF_DATA, plans=[PLAN_R1, replan], judges=[judge_r1])
+    rig.monkeypatch.setattr(research, "_director_json", director)
+
+    result = await research.research("goal", max_run_usd=25.0)
+
+    assert result.stop_reason == "budget"
+    assert "accrued spend includes unknown pricing" in (result.partial_reason or "")
+    assert result.rounds_completed == 1  # round 2 never executed
+
+
+@pytest.mark.asyncio
+async def test_crash_mid_round_still_persists_manifest(rig):
+    class ExplodingDirector(ScriptedDirector):
+        async def __call__(self, prompt, alias, *, label, **kw):
+            if label == "judge":
+                raise RuntimeError("director exploded")
+            return await super().__call__(prompt, alias, label=label, **kw)
+
+    director = ExplodingDirector(brief=BRIEF_DATA, plans=[PLAN_R1])
+    rig.monkeypatch.setattr(research, "_director_json", director)
+
+    with pytest.raises(RuntimeError, match="director exploded"):
+        await research.research("goal")
+
+    run_dir = next(p for p in rig.tmp.iterdir() if (p / "journal.jsonl").exists())
+    manifest = json.loads((run_dir / "manifest.json").read_text())
+    assert manifest["partial"] is True
+    assert "aborted before finalise" in manifest["partial_reason"]
+    assert (run_dir / "dossier.md").exists()
 
 
 @pytest.mark.asyncio
@@ -236,7 +341,7 @@ async def test_reopen_guard_drops_resolved_gap(rig):
     }
     judge_r3 = {
         "section_status": {"niche": "accepted", "brand": "accepted"},
-        "blocking_gaps": [{"id": "g1-1", "text": "brand voice missing", "section_id": "brand"}],
+        "blocking_gaps": [{"id": "G1-1", "text": "brand voice missing", "section_id": "brand"}],
     }
     replan = {"items": [{"id": "rN-1", "kind": "consult", "question": "fix brand", "section_ids": ["brand"]}]}
     director = ScriptedDirector(
@@ -352,7 +457,9 @@ def test_parse_plan_truncates_to_four_items():
         {"assumptions": [], "sections": [{"id": "a", "title": "A", "goal": "g", "acceptance": "x"}]}
     )
     data = {
-        "items": [{"id": f"i{n}", "kind": "consult", "question": "q", "section_ids": ["a"]} for n in range(6)]
+        "items": [
+            {"id": f"i{n}", "kind": "evidence", "question": "q", "section_ids": ["a"]} for n in range(6)
+        ]
     }
     items = research._parse_plan(data, brief, 1)
     assert items is not None and len(items) == 4
@@ -369,9 +476,19 @@ def test_parse_verdict_defaults_unscored_sections_to_draft():
         }
     )
     verdict = research._parse_verdict(
-        {"section_status": {"a": "accepted"}}, brief, 1, set(), cost_usd=0.0, cost_known=True
+        {"section_status": {"a": "accepted"}},
+        brief,
+        1,
+        set(),
+        cost_usd=0.0,
+        cost_known=True,
+        sections_with_content={"a", "b"},
     )
     assert verdict.section_status == {"a": "accepted", "b": "draft"}
+    bare = research._parse_verdict(
+        {"section_status": {"a": "accepted"}}, brief, 1, set(), cost_usd=0.0, cost_known=True
+    )
+    assert bare.section_status == {"a": "accepted", "b": "missing"}
     assert verdict.accepted(brief) is False
 
 
