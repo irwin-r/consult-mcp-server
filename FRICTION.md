@@ -428,3 +428,30 @@ artifacts; fixes landed in this pass.
   (3) This also closes the earlier STILL OPEN note about panellists being
   dropped mid-continuation. Practical upshot: CONSULT_STREAM=1 now buys
   dropout immunity for any panellist that is actually producing tokens.
+
+## 2026-07-22 — registry refresh smoke (fable-5 / gpt-5.6 / gemini-3.6 / kimi-k3)
+
+Live smoke after adding claude-fable, gpt-terra, kimi-k3, deepseek-flash and
+bumping gemini-flash to 3.6. Five of six new IDs worked first try; total spend
+~$0.11 across two fanouts plus doctor pings.
+
+- [env] **gpt-5.6 `-pro` variants are gated on the direct OpenAI API.**
+  `openai/gpt-5.6-sol-pro` returns `model_not_found` even though OpenRouter
+  lists it; this key's `/v1/models` shows sol/terra/luna but no 5.6 pro tier.
+  `gpt-pro` stays on `openai/gpt-5.5-pro` ($30/$180) until the pro variants
+  appear in the key's model list — recheck with
+  `curl -s https://api.openai.com/v1/models` before the next bump.
+- [env] **LiteLLM's price table lagged 13 of 24 registry models**, so
+  `estimate_cost` returned `all_known=False` (cap gate degraded to
+  warn-don't-block) and fanout under-reported actual spend for those
+  panellists. FIXED: `pricing.ensure_registered()` gap-fills
+  `litellm.register_model` from new per-entry `pricing` blocks in models.json;
+  shipped tables still win when they know the model. Keep pricing blocks in
+  sync when bumping a litellm_id.
+- [bug] ~~**`consult-doctor --ping` false-failed on reasoning models**~~ —
+  RESOLVED: the 1-token grant gets burned on reasoning and OpenAI returns an
+  output-limit error, which proves the key works; doctor now counts that as
+  "ok (output-capped reasoning reply)" (doctor.py `_ping_provider`).
+- [ux] **kimi-k3 is the slow panellist of the new set** (24s for a one-line
+  answer vs 4-7s for the rest; registry timeout stays 600s like the other
+  moonshot entries). Not actionable yet, just expect it to pace wide panels.
