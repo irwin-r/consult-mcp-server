@@ -7,6 +7,65 @@ describe the loop that writes this.
 
 ---
 
+## 2026-07-23 — Uncapped research really runs uncapped
+
+**Shipped.** `research(max_run_usd=None)` is documented as the uncapped opt-in,
+but the director loop passed `per_item_cap=None` to each sub-run, and the fanout
+and orchestrate layers read `None` as a request for the registry default cap
+(~$5). So an "uncapped" run silently held every sub-run to $5. Deep-tier panels
+estimate above that, refused, and the run stalled having spent only director
+money. A test even baked the bug in (it asserted sub-runs got `None`).
+
+The fix hands sub-runs an explicit `math.inf` ceiling when the run is uncapped
+(a named `_UNCAPPED_SUBRUN_USD` sentinel with a comment on why). It also rejects
+a non-finite or negative `max_run_usd` at the `research()` boundary, since a NaN
+cap would pass every `estimate > cap` gate silently rather than error, and
+guards the two cap-formatting log warnings so an uncapped run never logs an
+`$inf` cap. The `None`-means-default footgun now carries a comment at both
+resolution points (fanout, orchestrate) and a note on `gather_evidence`.
+
+Validation (zero spend, against the real fanout gate via dry_run): at a $15.13
+deep-tier estimate, `cap=None` refuses with "exceeds cap $5.00" identical to an
+explicit `$5.0`, proving `None` resolved to the default; `cap=inf` does not
+refuse. That repro is now an automated test (`test_fanout_infinite_cap_never_refuses`).
+`evidence.gather_evidence` forwards its cap to fanout with no clamp, arithmetic,
+formatting, or persistence, so inf flows through cleanly. Full suite 584 passing
+(7 new tests), ruff clean.
+
+**Panel — plan (standard/consensus, $2.22):** unanimous on fixing this over the
+alternatives (mean confidence ~0.89). It sharpened the plan: use a named `math.inf`
+constant, audit `gather_evidence` as a hard gate (a hidden `min(cap, ...)` would
+silently re-cap inf), guard all cap-formatting sites, reject non-finite public
+input, and add capped-path regression plus a no-`Infinity`-token artifact sweep.
+Adopted all of these. Deferred the security persona's broader multi-layer input
+validation (threading NaN checks through fanout/consult/evidence signatures) as
+out of scope for a focused fix; guarded the `research()` entry only.
+
+**Panel — diff (code/code_review, $0.39):** 5/5 RISK low, MERGE yes, SHIP, no
+blockers, reviewers pinned off-family. Took its two cheap points: converted the
+out-of-band dry_run check into an automated real-path test, and added the
+`None`-vs-`inf` contract comments. Dismissed the rest: the `TypeError`-before-
+`ValueError` nit for a non-numeric cap (the MCP wire enforces `number`, the param
+is typed `float | None`); the lowercase-infinity scan (Python's json emits the
+capitalized `Infinity` token, which the test targets); the `format_budget` helper
+and public-`inf` rejection at lower layers (refactors, deferred).
+
+**Panel spend this cycle:** ~$2.61.
+
+**Considered, not done this cycle (filed as issues):**
+- Capped research runs hard-stop when a sub-run reports unknown cost (#101). The
+  higher-frequency sibling of this bug on the default path, but the impactful half
+  touches the deliberately fail-closed #92 gate, so it needs its own deliberate
+  pass. Strong next-cycle candidate.
+- Viewer renders `javascript:` URIs in markdown links, a stored XSS in the
+  file:// `feed.html` (#102).
+- Crash-resume replay can mix item results across re-planned rounds (#104) and the
+  resume machinery is under-tested (#105). Also filed: attachment path containment
+  (#103), doctor pricing false-FAILs (#106), evidence URL and footer-regex
+  hardening (#107).
+
+---
+
 ## 2026-06-16 — Empty file attachment warns instead of a blank fence
 
 **Shipped.** Issue #79, the follow-up to last cycle's #81. The empty-attachment

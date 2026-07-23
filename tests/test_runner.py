@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 
 import pytest
 from smoke_helpers import HAVE_KEYS
@@ -198,6 +199,25 @@ async def test_fanout_real_run_still_rejected_over_cap(monkeypatch):
     assert "exceeds cap $0.01" in handle.partial_reason
     assert "dry_run" not in handle.partial_reason
     assert handle.cost_usd == 0.0
+
+
+@pytest.mark.asyncio
+async def test_fanout_infinite_cap_never_refuses(monkeypatch):
+    """An infinite cap is research's "uncapped" sentinel, so the real gate must
+    treat it as no ceiling. An estimate a finite cap would reject still runs,
+    and no cap-formatting site renders an "$inf" ceiling. This locks in the
+    end-to-end behavior the uncapped-research fix relies on.
+    """
+    from consult import runner as runner_mod
+    from consult.runner import fanout
+
+    monkeypatch.setattr(runner_mod, "estimate_cost", lambda *a, **kw: (50.0, True))
+
+    specs = [ModelSpec(model="claude-haiku")]
+    handle = await fanout("any prompt", specs, dry_run=True, max_run_usd=math.inf)
+    assert handle.partial_reason.startswith("dry_run:")
+    assert "exceeds cap" not in handle.partial_reason
+    assert "inf" not in handle.partial_reason.lower()
 
 
 @pytest.mark.asyncio

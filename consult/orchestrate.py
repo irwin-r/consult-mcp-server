@@ -321,6 +321,8 @@ async def consult(
     # `max_run_usd` after the panel had already passed its own gate. When
     # the estimate can't be priced we mirror fanout's warn-don't-block
     # posture, unless spend has already reached the cap.
+    # None means the registry default cap, NOT uncapped; an uncapped caller
+    # (e.g. a research sub-run) passes math.inf so every gate here is a no-op.
     cap = max_run_usd if max_run_usd is not None else registry.default_max_run_usd()
     synth_est, synth_est_known = _estimate_synth_cost(synth_alias, handle.manifest)
     synth_over_cap = (synth_est_known and meter.total + synth_est > cap) or (

@@ -902,6 +902,8 @@ async def fanout(
     if max_output_tokens is not None:
         est_kwargs["max_output_tokens"] = max_output_tokens
     estimate, all_known = await _facade.aestimate_cost(specs, cost_input, **est_kwargs)
+    # None means the registry default cap, NOT uncapped. A caller that wants a
+    # run with no ceiling (e.g. an uncapped research sub-run) passes math.inf.
     cap = max_run_usd if max_run_usd is not None else registry.default_max_run_usd()
 
     # Don't clobber an existing manifest with the empty-manifest early-return

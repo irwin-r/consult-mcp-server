@@ -221,6 +221,9 @@ async def gather_evidence(
     ungrounded panellist would produce training-data "evidence" wearing a
     citation costume. The pass is an ordinary run: its run_id lands in the
     ledger and its bodies are readable as resources.
+
+    `max_run_usd` is forwarded to the underlying fanout unchanged: None takes
+    the registry default cap, and math.inf runs uncapped.
     """
     aliases = list(models) if models else list(DEFAULT_MODELS)
     capable = set(registry.web_capable_models())
