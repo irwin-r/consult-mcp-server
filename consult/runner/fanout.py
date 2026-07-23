@@ -977,7 +977,7 @@ async def fanout(
     # estimate covers only known-priced models), so the run may exceed the cap
     # silently. Warn rather than block — refusing every unpriced panel would be
     # too aggressive for openrouter-routed models, most of which are unpriced.
-    if max_run_usd is not None and not all_known:
+    if max_run_usd is not None and math.isfinite(max_run_usd) and not all_known:
         logger.warning(
             "max_run_usd=$%.2f set but at least one panellist has unknown pricing; "
             "the $%.2f estimate covers only known-priced models, so the cap cannot be "

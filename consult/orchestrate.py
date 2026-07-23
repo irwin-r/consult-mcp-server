@@ -13,6 +13,7 @@ Single-primitive flows (`runner.fanout`, `refine.refine`, `sequence.sequence`,
 from __future__ import annotations
 
 import logging
+import math
 from collections.abc import Awaitable, Callable
 
 import litellm
@@ -325,7 +326,7 @@ async def consult(
     synth_over_cap = (synth_est_known and meter.total + synth_est > cap) or (
         not synth_est_known and meter.total >= cap
     )
-    if not synth_est_known and not synth_over_cap:
+    if not synth_est_known and not synth_over_cap and math.isfinite(cap):
         logger.warning(
             "synth cost for %s can't be estimated; proceeding (spent $%.2f of $%.2f cap)",
             synth_alias,

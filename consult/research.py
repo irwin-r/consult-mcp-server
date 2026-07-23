@@ -47,6 +47,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import math
 import re
 import time
 from dataclasses import dataclass, field
@@ -87,6 +88,13 @@ DEFAULT_MODEL_TIMEOUT_FLOOR_S = 7200.0
 # round's judge call and the next plan can always run (review finding, #92:
 # director spend was unreserved and capped runs could overshoot).
 _DIRECTOR_RESERVE_USD = 0.50
+
+# The sub-run layers (orchestrate.consult, evidence.gather_evidence, and the
+# fanout beneath them) read max_run_usd=None as "use the registry default cap"
+# (~$5), NOT as uncapped. So an uncapped research run must hand its children an
+# explicit infinite ceiling; passing None would silently re-cap every sub-run
+# at $5 and stall deep-tier runs whose panels estimate above it.
+_UNCAPPED_SUBRUN_USD = math.inf
 
 # Per-section character cap for the dossier view shown to the director.
 # Keeps a long dossier from blowing the judge's context; the on-disk
@@ -903,9 +911,12 @@ async def research(
 ) -> ResearchResult:
     """Run the director loop until the dossier passes the frozen brief.
 
-    `max_run_usd=None` is the explicit uncapped opt-in; the default cap is
-    `DEFAULT_MAX_RUN_USD`. Stall detection is always on. `tier` is the
-    default worker tier; the director may override per work item.
+    `max_run_usd=None` is the explicit uncapped opt-in; any other value must
+    be a non-negative finite number (the default cap is `DEFAULT_MAX_RUN_USD`).
+    An uncapped run still hands each sub-run an infinite ceiling rather than
+    None, since the sub-run layers read None as the registry default cap.
+    Stall detection is always on. `tier` is the default worker tier; the
+    director may override per work item.
 
     Research runs are PATIENT by default: slow-tail dropout is disabled
     for every sub-run and each model's per-call timeout is raised to at
@@ -925,6 +936,14 @@ async def research(
     """
     if max_rounds < 1:
         raise ValueError("max_rounds must be >= 1")
+    if max_run_usd is not None and (not math.isfinite(max_run_usd) or max_run_usd < 0):
+        # None is the only uncapped opt-in. A non-finite cap (NaN, inf) would
+        # slip past every `estimate > cap` gate silently, since those
+        # comparisons are all False for a non-finite right-hand side, so an
+        # accidental NaN would disable enforcement rather than error.
+        raise ValueError(
+            f"max_run_usd must be None (uncapped) or a non-negative finite number, got {max_run_usd!r}"
+        )
     pricing.ensure_registered()
     director_alias = director or registry.default_synthesiser()
     registry.resolve_model(director_alias)
@@ -1134,7 +1153,7 @@ async def research(
             # rounds' evidence rides along with every panel/consult question.
             await _emit(ResearchPhase(done=round_num - 1, total=max_rounds, phase="execute", round=round_num))
             if max_run_usd is None:
-                per_item_cap = None
+                per_item_cap = _UNCAPPED_SUBRUN_USD
             else:
                 remaining = max(0.0, max_run_usd - meter.total - _DIRECTOR_RESERVE_USD)
                 per_item_cap = remaining / len(items)

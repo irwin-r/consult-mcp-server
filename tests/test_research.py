@@ -10,6 +10,7 @@ detection, the gap reopen guard, item-failure trapping, and the journal.
 from __future__ import annotations
 
 import json
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -303,8 +304,58 @@ async def test_uncapped_skips_the_gate_entirely(rig):
 
     assert result.converged is True
     assert len(rig.consult_calls) == 2
-    # Uncapped parent passes no child cap slice either.
-    assert all(c["max_run_usd"] is None for c in rig.consult_calls)
+    # Uncapped parent hands each sub-run an INFINITE ceiling, not None: the
+    # sub-run layers read None as the registry default cap (~$5), which would
+    # silently re-cap and stall deep-tier rounds whose panels estimate above it.
+    assert all(math.isinf(c["max_run_usd"]) for c in rig.consult_calls)
+
+
+@pytest.mark.asyncio
+async def test_capped_run_forwards_finite_slice_to_subruns(rig):
+    # The uncapped fix must not disturb the capped path: each sub-run still
+    # gets the finite per-item slice (cap - director spend - reserve) / n.
+    director = ScriptedDirector(brief=BRIEF_DATA, plans=[PLAN_R1], judges=[JUDGE_ACCEPT])
+    rig.monkeypatch.setattr(research, "_director_json", director)
+
+    result = await research.research("goal", max_run_usd=10.0)
+
+    assert result.converged is True
+    assert len(rig.consult_calls) == 2
+    # Round 1 director spend before the slice: brief + plan, each 0.01 in the
+    # scripted rig; PLAN_R1 has two items.
+    expected = (10.0 - 2 * 0.01 - research._DIRECTOR_RESERVE_USD) / 2
+    for call in rig.consult_calls:
+        assert call["max_run_usd"] == pytest.approx(expected)
+        assert math.isfinite(call["max_run_usd"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf"), -1.0])
+async def test_rejects_non_finite_or_negative_cap(bad):
+    # None is the only uncapped opt-in; a non-finite cap would slip past the
+    # `estimate > cap` gates (all False for a non-finite rhs) and disable
+    # enforcement instead of erroring, so reject it at the boundary.
+    with pytest.raises(ValueError, match="max_run_usd"):
+        await research.research("goal", max_run_usd=bad)
+
+
+@pytest.mark.asyncio
+async def test_uncapped_run_leaves_no_infinity_token_in_artifacts(rig):
+    # The infinite sub-run ceiling is an in-memory sentinel only. If it ever
+    # reached json.dumps it would serialise as the non-standard `Infinity`
+    # token; assert no run-dir artifact carries it.
+    director = ScriptedDirector(brief=BRIEF_DATA, plans=[PLAN_R1], judges=[JUDGE_ACCEPT])
+    rig.monkeypatch.setattr(research, "_director_json", director)
+
+    result = await research.research("goal", max_run_usd=None)
+
+    run_dir = rig.tmp / result.run_id
+    artifacts_scanned = 0
+    for path in run_dir.rglob("*"):
+        if path.suffix in (".json", ".jsonl") and path.is_file():
+            artifacts_scanned += 1
+            assert "Infinity" not in path.read_text()
+    assert artifacts_scanned > 0
 
 
 @pytest.mark.asyncio
